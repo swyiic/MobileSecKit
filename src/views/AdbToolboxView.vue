@@ -78,7 +78,7 @@
           <h2>eBPF 采集</h2>
           <p>App 仍直连原站 TLS。ksightd 拷 SSL_write/SSL_read 明文，把 POST/URL/头/body 和响应送进 Burp 历史，不设 VPN、iptables、系统代理。Burp Intercept 请关掉；全局 upstream 规则需排除 127.0.0.1:18081。Flutter / QUIC 以后再补。</p>
         </div>
-        <span class="device-chip" :class="{ active: mirrorRunning }">{{ mirrorBusy ? '处理中…' : !mirrorStatusKnown ? '正在确认状态…' : mirrorRunning ? 'RUNNING' : '就绪' }}</span>
+        <span class="device-chip" :class="{ active: mirrorRunning, warning: mirrorCleanupPending }">{{ mirrorBusy ? '处理中…' : !mirrorStatusKnown ? '正在确认状态…' : mirrorRunning ? 'RUNNING' : mirrorCleanupPending ? '待清理' : '就绪' }}</span>
       </div>
       <div class="mirror-grid">
         <label><span>目标包</span><input v-model.trim="mirrorPackage" :disabled="mirrorRunning" placeholder="com.icbc" /></label>
@@ -87,22 +87,23 @@
       </div>
       <div class="ks-sensor-switches mirror-flags">
         <label><input v-model="mirrorViaAdb" :disabled="mirrorRunning" type="checkbox" />ADB reverse（手机 127.0.0.1 → 本机 Burp，并 forward 18081 回放口）</label>
-        <label><input v-model="mirrorLaunch" :disabled="mirrorRunning" type="checkbox" />启动时冷启动目标包</label>
+        <label><input v-model="mirrorLaunch" :disabled="mirrorRunning" type="checkbox" />重启目标应用后采集（会先结束当前进程）</label>
       </div>
       <div class="proxy-actions">
-        <button class="primary-button" :disabled="!mirrorStatusKnown || mirrorBusy || mirrorRunning || !device || !androidAvailable || !mirrorPackage || !mirrorHost || !mirrorPort" @click="startMirror">
-          <span class="material-symbols-outlined" :class="{ 'mirror-spinner': mirrorBusy || mirrorRunning }">{{ mirrorBusy || mirrorRunning ? 'progress_activity' : 'play_arrow' }}</span>
+        <button class="primary-button" :disabled="!mirrorStatusKnown || mirrorBusy || mirrorRunning || mirrorCleanupPending || !device || !androidAvailable || !mirrorPackage || !mirrorHost || !mirrorPort" @click="startMirror">
+          <span class="material-symbols-outlined" :class="{ 'mirror-spinner': mirrorBusy }">{{ mirrorBusy ? 'progress_activity' : mirrorRunning ? 'sensors' : 'play_arrow' }}</span>
           {{ mirrorBusy && !mirrorRunning ? '正在启动…' : mirrorRunning ? '采集中…' : '开始镜像' }}
         </button>
-        <button class="ghost-button" :disabled="mirrorBusy || !mirrorRunning" @click="stopMirror">
+        <button class="ghost-button" :disabled="mirrorBusy || (!mirrorRunning && !mirrorCleanupPending)" @click="stopMirror">
           <span class="material-symbols-outlined">stop</span>
-          停止镜像
+          {{ mirrorCleanupPending && !mirrorRunning ? '清理残留' : '停止镜像' }}
         </button>
       </div>
-      <p class="safety-note">{{ mirrorRunning ? `运行中：${mirrorPackage} → ${mirrorHost}:${mirrorPort}，单次明文最多 64 KiB；响应通过 127.0.0.1:18081 回放。点停止才会结束。` : `不限时长。LAN 填 ${mirrorHost}:${mirrorPort}；ADB reverse 则 Burp 听 0.0.0.0:${mirrorPort}。若 Burp 配置了全局 upstream，请为 127.0.0.1:18081 添加直连例外，否则历史中会只有请求、没有原始响应。` }}</p>
-      <details v-if="mirrorLogs.length" class="mirror-live-log">
+      <p class="safety-note">{{ mirrorRunning ? `运行中：${mirrorPackage} → ${mirrorHost}:${mirrorPort}，单次明文最多 64 KiB；响应通过 127.0.0.1:18081 回放。点停止才会结束。` : mirrorCleanupPending ? 'ksightd 已退出，但设备上仍有 KernSight pcap 子进程；请点击“清理残留”完成会话封存。' : `不限时长。LAN 填 ${mirrorHost}:${mirrorPort}；ADB reverse 则 Burp 听 0.0.0.0:${mirrorPort}。若 Burp 配置了全局 upstream，请为 127.0.0.1:18081 添加直连例外，否则历史中会只有请求、没有原始响应。` }}</p>
+      <p v-if="mirrorStatusDetail" class="mirror-process-detail">{{ mirrorStatusDetail }}</p>
+      <details class="mirror-live-log" open>
         <summary>实时诊断日志（{{ mirrorLogs.length }}）</summary>
-        <pre>{{ mirrorLogs.join('\n') }}</pre>
+        <pre>{{ mirrorLogs.length ? mirrorLogs.join('\n') : '等待设备端启动信息…' }}</pre>
       </details>
     </section>
 
@@ -220,6 +221,8 @@ watch(mirrorViaAdb, value => localStorage.setItem('mobilee.adb.mirrorViaAdb', va
 const mirrorLaunch = ref(localStorage.getItem('mobilee.adb.mirrorLaunch') === '1')
 watch(mirrorLaunch, value => localStorage.setItem('mobilee.adb.mirrorLaunch', value ? '1' : '0'), { flush: 'sync' })
 const mirrorRunning = ref(false)
+const mirrorCleanupPending = ref(false)
+const mirrorStatusDetail = ref('')
 const mirrorBusy = ref(false)
 const mirrorStatusKnown = ref(false)
 const mirrorLogs = ref<string[]>([])
@@ -250,16 +253,19 @@ function uninstallApk() { if (uninstallPackage.value) emit('run', { action: 'uni
 function pullDumps() { if (pullRemote.value && pullLocal.value) emit('pull', { remote: pullRemote.value, local: pullLocal.value }) }
 function pushFile() { if (pushLocal.value) emit('push', pushLocal.value) }
 async function refreshMirrorStatus() {
-  if (mirrorChecking || mirrorBusy.value) return
+  if (mirrorChecking) return
   mirrorChecking = true
   try {
-    const status = await monitoringBackend.kernSightMirrorStatus()
+    const status = await monitoringBackend.kernSightMirrorStatus(props.device?.serial)
     mirrorRunning.value = !!status.running
+    mirrorCleanupPending.value = !!status.cleanupPending
+    mirrorStatusDetail.value = status.detail || ''
     mirrorLogs.value = status.logs || []
     mirrorStatusKnown.value = true
     if (status.package) mirrorPackage.value = status.package
-  } catch {
+  } catch (cause) {
     mirrorStatusKnown.value = false
+    mirrorStatusDetail.value = `状态检查失败：${String(cause)}`
   } finally {
     mirrorChecking = false
   }
@@ -271,7 +277,7 @@ onMounted(() => {
 onUnmounted(() => { if (mirrorPolling) clearInterval(mirrorPolling) })
 
 async function startMirror() {
-  if (mirrorBusy.value || mirrorChecking || mirrorRunning.value || !mirrorStatusKnown.value || !mirrorPackage.value || !mirrorHost.value || !mirrorPort.value || !props.device?.serial) return
+  if (mirrorBusy.value || mirrorChecking || mirrorRunning.value || mirrorCleanupPending.value || !mirrorStatusKnown.value || !mirrorPackage.value || !mirrorHost.value || !mirrorPort.value || !props.device?.serial) return
   mirrorBusy.value = true
   const target = `${mirrorHost.value}:${mirrorPort.value}`
   try {
@@ -289,7 +295,7 @@ async function startMirror() {
       sched: false,
       includeThreads: false,
       inspectTls: true,
-      inspectJni: true,
+      inspectJni: false,
       inspectLinker: false,
       inspectAdapter: null,
       hideDebug: false,
@@ -301,6 +307,7 @@ async function startMirror() {
       mirrorViaAdb: mirrorViaAdb.value,
     })
     mirrorRunning.value = true
+    mirrorCleanupPending.value = false
     emit('log', {
       command: result.commandPreview || `ksightd --mirror-burp ${target}`,
       output: result.stdout || '镜像已启动',
@@ -318,13 +325,17 @@ async function stopMirror() {
   if (mirrorBusy.value) return
   mirrorBusy.value = true
   try {
-    await monitoringBackend.stopKernSightMirror()
+    const status = await monitoringBackend.stopKernSightMirror(props.device?.serial, mirrorViaAdb.value ? mirrorPort.value : undefined)
     mirrorRunning.value = false
-    emit('log', { command: 'stop mirror', output: '已停止镜像并清理 ksightd capture', success: true })
+    mirrorCleanupPending.value = !!status.cleanupPending
+    mirrorStatusDetail.value = status.detail || ''
+    emit('log', { command: 'stop mirror', output: status.detail || '已停止镜像并清理设备端采集进程', success: true })
   } catch (cause) {
+    mirrorStatusDetail.value = String(cause)
     emit('log', { command: 'stop mirror', output: String(cause), success: false })
   } finally {
     mirrorBusy.value = false
+    await refreshMirrorStatus()
   }
 }
 </script>

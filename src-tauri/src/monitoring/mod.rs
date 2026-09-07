@@ -14,9 +14,9 @@ use std::process::Stdio;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tauri::State;
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
-use tokio::time::{timeout, Duration};
+use tokio::time::{timeout, Duration, Instant};
 use uuid::Uuid;
 
 const KSIGHT_AGENT: &str = "/data/local/tmp/ksight/ksightd";
@@ -32,25 +32,104 @@ const KSIGHT_RELEASES_API: &str =
 const KSIGHT_RELEASE_ASSET: &str = "ksightd-android-arm64";
 const MAX_AGENT_DOWNLOAD_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_INSPECT_PLAINTEXT_BYTES: u32 = 64 * 1024;
+const MIRROR_STATUS_TIMEOUT: Duration = Duration::from_secs(4);
+const MIRROR_CONTROL_TIMEOUT: Duration = Duration::from_secs(8);
+const MIRROR_STOP_TIMEOUT: Duration = Duration::from_secs(18);
 
-const KILL_KSIGHTD_CAPTURE: &str = r#"
-for pid in /proc/[0-9]*; do
-  cmd=$(tr '\0' ' ' < "$pid/cmdline" 2>/dev/null) || continue
+const DEVICE_MIRROR_PROCESS_STATUS: &str = r#"
+capture_count=0
+pcap_count=0
+for pid in $(pidof ksightd 2>/dev/null); do
+  cmd=$(tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null) || continue
   case "$cmd" in
-    *ksightd*capture*)
-      kill "${pid##*/}" 2>/dev/null || true
+    '/data/local/tmp/ksight/ksightd capture '*|*'/ksightd capture '*) capture_count=$((capture_count + 1)) ;;
+  esac
+done
+for pid in $(pidof tcpdump 2>/dev/null); do
+  cmd=$(tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null) || continue
+  case "$cmd" in
+    'tcpdump '*'/data/local/tmp/ksight/spool/forensics/'*'/traffic.pcap '*|*'/tcpdump '*'/data/local/tmp/ksight/spool/forensics/'*'/traffic.pcap '*) pcap_count=$((pcap_count + 1)) ;;
+  esac
+done
+echo "capture_count=$capture_count"
+echo "pcap_count=$pcap_count"
+"#;
+
+const STOP_KSIGHTD_CAPTURE: &str = r#"
+capture_pids=''
+for pid in $(pidof ksightd 2>/dev/null); do
+  cmd=$(tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null) || continue
+  case "$cmd" in
+    '/data/local/tmp/ksight/ksightd capture '*|*'/ksightd capture '*) capture_pids="$capture_pids $pid" ;;
+  esac
+done
+[ -z "$capture_pids" ] || kill $capture_pids 2>/dev/null || true
+
+# Give ksightd enough time to stop its helpers and seal the durable session.
+attempt=0
+while [ "$attempt" -lt 24 ]; do
+  alive=''
+  for pid in $capture_pids; do
+    [ -d "/proc/$pid" ] && alive="$alive $pid"
+  done
+  [ -z "$alive" ] && break
+  sleep 0.5
+  attempt=$((attempt + 1))
+done
+for pid in $capture_pids; do
+  [ ! -d "/proc/$pid" ] || kill -9 "$pid" 2>/dev/null || true
+done
+
+# A killed collector cannot reap std::process::Child. Only touch tcpdump
+# processes whose output is inside KernSight's own forensics spool.
+pcap_pids=''
+for pid in $(pidof tcpdump 2>/dev/null); do
+  cmd=$(tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null) || continue
+  case "$cmd" in
+    'tcpdump '*'/data/local/tmp/ksight/spool/forensics/'*'/traffic.pcap '*|*'/tcpdump '*'/data/local/tmp/ksight/spool/forensics/'*'/traffic.pcap '*)
+      pcap_pids="$pcap_pids $pid"
       ;;
   esac
 done
-sleep 0.2
-for pid in /proc/[0-9]*; do
-  cmd=$(tr '\0' ' ' < "$pid/cmdline" 2>/dev/null) || continue
+[ -z "$pcap_pids" ] || kill $pcap_pids 2>/dev/null || true
+sleep 0.5
+for pid in $pcap_pids; do
+  [ ! -d "/proc/$pid" ] || kill -9 "$pid" 2>/dev/null || true
+done
+
+capture_count=0
+pcap_count=0
+for pid in $(pidof ksightd 2>/dev/null); do
+  cmd=$(tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null) || continue
   case "$cmd" in
-    *ksightd*capture*)
-      kill -9 "${pid##*/}" 2>/dev/null || true
-      ;;
+    '/data/local/tmp/ksight/ksightd capture '*|*'/ksightd capture '*) capture_count=$((capture_count + 1)) ;;
   esac
 done
+for pid in $(pidof tcpdump 2>/dev/null); do
+  cmd=$(tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null) || continue
+  case "$cmd" in
+    'tcpdump '*'/data/local/tmp/ksight/spool/forensics/'*'/traffic.pcap '*|*'/tcpdump '*'/data/local/tmp/ksight/spool/forensics/'*'/traffic.pcap '*) pcap_count=$((pcap_count + 1)) ;;
+  esac
+done
+echo "capture_count=$capture_count"
+echo "pcap_count=$pcap_count"
+"#;
+
+const FORCE_STOP_KSIGHTD_CAPTURE: &str = r#"
+for pid in $(pidof ksightd 2>/dev/null); do
+  cmd=$(tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null) || continue
+  case "$cmd" in
+    '/data/local/tmp/ksight/ksightd capture '*|*'/ksightd capture '*) kill -9 "$pid" 2>/dev/null || true ;;
+  esac
+done
+for pid in $(pidof tcpdump 2>/dev/null); do
+  cmd=$(tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null) || continue
+  case "$cmd" in
+    'tcpdump '*'/data/local/tmp/ksight/spool/forensics/'*'/traffic.pcap '*|*'/tcpdump '*'/data/local/tmp/ksight/spool/forensics/'*'/traffic.pcap '*) kill -9 "$pid" 2>/dev/null || true ;;
+  esac
+done
+echo 'capture_count=0'
+echo 'pcap_count=0'
 "#;
 
 /// Host-side handle for one long-running Burp mirror capture.
@@ -60,6 +139,7 @@ pub struct MirrorSessionState {
     child: tokio::sync::Mutex<Option<Child>>,
     serial: tokio::sync::Mutex<Option<String>>,
     package: tokio::sync::Mutex<Option<String>>,
+    reverse_port: tokio::sync::Mutex<Option<u16>>,
     logs: Arc<tokio::sync::Mutex<VecDeque<String>>>,
 }
 
@@ -68,9 +148,74 @@ pub struct MirrorSessionState {
 #[serde(rename_all = "camelCase")]
 pub struct KernSightMirrorStatus {
     running: bool,
+    cleanup_pending: bool,
     package: Option<String>,
     serial: Option<String>,
+    detail: Option<String>,
     logs: Vec<String>,
+}
+
+#[derive(Debug, Default)]
+struct DeviceMirrorProcessStatus {
+    capture_count: u32,
+    pcap_count: u32,
+}
+
+fn sanitize_mirror_log(line: &str) -> Option<String> {
+    let line = line.trim();
+    if line.is_empty() {
+        return None;
+    }
+    let sensitive_markers = [
+        " preview=",
+        " payload=",
+        " plaintext=",
+        " body=",
+        " needle=",
+        "\"preview\":",
+        "\"payload\":",
+        "\"plaintext\":",
+        "\"body\":",
+    ];
+    let cutoff = sensitive_markers
+        .iter()
+        .filter_map(|marker| line.find(marker))
+        .min();
+    let mut sanitized = match cutoff {
+        Some(index) => format!("{} [载荷已从运行日志中省略]", line[..index].trim_end()),
+        None => line.to_owned(),
+    };
+    if sanitized.len() > 2_048 {
+        sanitized.truncate(2_048);
+        sanitized.push_str("…");
+    }
+    Some(sanitized)
+}
+
+fn collect_mirror_logs<R>(stream: R, logs: Arc<tokio::sync::Mutex<VecDeque<String>>>)
+where
+    R: AsyncRead + Unpin + Send + 'static,
+{
+    tokio::spawn(async move {
+        let mut reader = BufReader::new(stream);
+        let mut line = String::new();
+        loop {
+            line.clear();
+            match reader.read_line(&mut line).await {
+                Ok(0) | Err(_) => break,
+                Ok(_) => {
+                    let Some(entry) = sanitize_mirror_log(&line) else {
+                        continue;
+                    };
+                    let mut logs = logs.lock().await;
+                    while logs.len() >= 200 {
+                        logs.pop_front();
+                    }
+                    logs.push_back(entry);
+                }
+            }
+        }
+    });
 }
 
 const PROBE_SCRIPT: &str = r#"
@@ -1329,24 +1474,160 @@ pub async fn start_kernsight_capture(
     })
 }
 
-async fn kill_device_capture(serial: &str) -> Result<(), String> {
-    let _ = run_device_root_script(serial, KILL_KSIGHTD_CAPTURE).await;
-    Ok(())
+fn parse_device_mirror_process_status(output: &str) -> DeviceMirrorProcessStatus {
+    let values = parse_probe_output(output);
+    DeviceMirrorProcessStatus {
+        capture_count: values
+            .get("capture_count")
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(0),
+        pcap_count: values
+            .get("pcap_count")
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(0),
+    }
 }
 
-async fn stop_mirror_child(state: &MirrorSessionState) -> Result<(), String> {
-    let serial = state.serial.lock().await.clone();
-    if let Some(mut child) = state.child.lock().await.take() {
-        let _ = child.start_kill();
-        let _ = timeout(Duration::from_secs(2), child.wait()).await;
+async fn mirror_root_command(
+    serial: &str,
+    script: &str,
+    limit: Duration,
+    operation: &str,
+) -> Result<crate::RawOutput, String> {
+    timeout(limit, run_device_root_script(serial, script))
+        .await
+        .map_err(|_| format!("{operation}超时（{} 秒）", limit.as_secs()))?
+}
+
+async fn mirror_adb_command(
+    serial: &str,
+    tail: &[&str],
+    operation: &str,
+) -> Result<crate::RawOutput, String> {
+    timeout(MIRROR_CONTROL_TIMEOUT, run_device_adb(serial, tail))
+        .await
+        .map_err(|_| format!("{operation}超时（{} 秒）", MIRROR_CONTROL_TIMEOUT.as_secs()))?
+}
+
+async fn device_mirror_process_status(serial: &str) -> Result<DeviceMirrorProcessStatus, String> {
+    let output = mirror_root_command(
+        serial,
+        DEVICE_MIRROR_PROCESS_STATUS,
+        MIRROR_STATUS_TIMEOUT,
+        "检查设备采集进程",
+    )
+    .await?;
+    if output.code != Some(0) {
+        return Err(format!(
+            "无法检查设备端镜像进程：{}",
+            if output.stderr.is_empty() {
+                output.stdout
+            } else {
+                output.stderr
+            }
+        ));
     }
+    Ok(parse_device_mirror_process_status(&output.stdout))
+}
+
+async fn stop_device_capture(serial: &str) -> Result<DeviceMirrorProcessStatus, String> {
+    let graceful = mirror_root_command(
+        serial,
+        STOP_KSIGHTD_CAPTURE,
+        MIRROR_STOP_TIMEOUT,
+        "停止设备采集进程",
+    )
+    .await;
+    let graceful_status = graceful.as_ref().ok().and_then(|output| {
+        (output.code == Some(0)).then(|| parse_device_mirror_process_status(&output.stdout))
+    });
+    let requires_force = graceful_status
+        .as_ref()
+        .is_none_or(|status| status.capture_count != 0 || status.pcap_count != 0);
+    let status = if requires_force {
+        let forced = mirror_root_command(
+            serial,
+            FORCE_STOP_KSIGHTD_CAPTURE,
+            MIRROR_CONTROL_TIMEOUT,
+            "强制清理设备采集进程",
+        )
+        .await?;
+        if forced.code != Some(0) {
+            return Err(format!(
+                "强制清理设备采集进程失败：{}",
+                if forced.stderr.is_empty() {
+                    forced.stdout
+                } else {
+                    forced.stderr
+                }
+            ));
+        }
+        parse_device_mirror_process_status(&forced.stdout)
+    } else {
+        graceful_status.unwrap_or_default()
+    };
+
+    // New agents expose an explicit repair operation. Older agents reject it;
+    // process cleanup still succeeds and the next compatible agent startup repairs the manifest.
+    let _ = mirror_root_command(
+        serial,
+        &format!("{KSIGHT_AGENT} spool --root {KSIGHT_SPOOL} repair"),
+        MIRROR_CONTROL_TIMEOUT,
+        "修复会话状态",
+    )
+    .await;
+    Ok(status)
+}
+
+async fn stop_mirror_child(
+    state: &MirrorSessionState,
+    fallback_serial: Option<&str>,
+    fallback_reverse_port: Option<u16>,
+) -> Result<(), String> {
+    let mut cleanup_error = None;
+    let serial = state
+        .serial
+        .lock()
+        .await
+        .clone()
+        .or_else(|| fallback_serial.map(str::to_owned));
     if let Some(serial) = serial.as_deref() {
-        kill_device_capture(serial).await?;
-        let _ = run_device_adb(serial, &["forward", "--remove", "tcp:18081"]).await;
+        // Stop the device collector before its host-side adb transport. This
+        // allows the signal handler to reap tcpdump and seal session.json.
+        if let Err(error) = stop_device_capture(serial).await {
+            cleanup_error = Some(error);
+        }
+        let _ = mirror_adb_command(
+            serial,
+            &["forward", "--remove", "tcp:18081"],
+            "清理回放端口",
+        )
+        .await;
+        let reverse_port = state
+            .reverse_port
+            .lock()
+            .await
+            .take()
+            .or(fallback_reverse_port);
+        if let Some(port) = reverse_port {
+            let remote = format!("tcp:{port}");
+            let _ =
+                mirror_adb_command(serial, &["reverse", "--remove", &remote], "清理反向端口").await;
+        }
+    }
+    if let Some(mut child) = state.child.lock().await.take() {
+        match timeout(Duration::from_secs(2), child.wait()).await {
+            Ok(_) => {}
+            Err(_) => {
+                let _ = child.start_kill();
+                let _ = timeout(Duration::from_secs(2), child.wait()).await;
+            }
+        }
     }
     *state.serial.lock().await = None;
     *state.package.lock().await = None;
-    Ok(())
+    *state.reverse_port.lock().await = None;
+    cleanup_error.map_or(Ok(()), Err)
 }
 
 #[tauri::command]
@@ -1380,11 +1661,24 @@ pub async fn start_kernsight_mirror(
             .filter(|value| !value.is_empty())
             .ok_or("必须指定 Burp host:port")?,
     )?;
-    stop_mirror_child(&state).await?;
-    kill_device_capture(&request.serial).await?;
-    state.logs.lock().await.clear();
+    stop_mirror_child(
+        &state,
+        Some(&request.serial),
+        request.mirror_via_adb.then_some(mirror.1),
+    )
+    .await?;
+    {
+        let mut logs = state.logs.lock().await;
+        logs.clear();
+        logs.push_back("正在建立设备采集进程并校验运行状态…".to_owned());
+    }
 
-    let forward = run_device_adb(&request.serial, &["forward", "tcp:18081", "tcp:18081"]).await?;
+    let forward = mirror_adb_command(
+        &request.serial,
+        &["forward", "tcp:18081", "tcp:18081"],
+        "建立回放端口",
+    )
+    .await?;
     if forward.code.is_some_and(|code| code != 0) {
         return Err(format!(
             "adb forward tcp:18081 失败：{}",
@@ -1397,9 +1691,10 @@ pub async fn start_kernsight_mirror(
     }
     if request.mirror_via_adb {
         let port = mirror.1;
-        let reverse = run_device_adb(
+        let reverse = mirror_adb_command(
             &request.serial,
             &["reverse", &format!("tcp:{port}"), &format!("tcp:{port}")],
+            "建立反向端口",
         )
         .await?;
         if reverse.code.is_some_and(|code| code != 0) {
@@ -1419,7 +1714,7 @@ pub async fn start_kernsight_mirror(
         format!("{}:{}", mirror.0, mirror.1)
     };
     let mut capture_command = format!(
-        "{KSIGHT_AGENT} capture --object /data/local/tmp/ksight/process_lifecycle.bpf.o --file-object /data/local/tmp/ksight/file_open.bpf.o --network-object /data/local/tmp/ksight/network_connect.bpf.o --memory-object /data/local/tmp/ksight/memory_regions.bpf.o --binder-object /data/local/tmp/ksight/binder_transaction.bpf.o --sched-object /data/local/tmp/ksight/sched_wakeup.bpf.o --uprobe-object /data/local/tmp/ksight/uprobe_regs.bpf.o --duration-seconds 0 --sample-one-in 1 --spool-dir /data/local/tmp/ksight/spool --spool-max-mib 64 --batch-events 64 --quiet --network --inspect-tls --package {package} --inspect-max-secs 0 --inspect-max-bytes {MAX_INSPECT_PLAINTEXT_BYTES} --inspect-max-hits 1000000 --mirror-burp {burp}"
+        "{KSIGHT_AGENT} capture --object /data/local/tmp/ksight/process_lifecycle.bpf.o --file-object /data/local/tmp/ksight/file_open.bpf.o --network-object /data/local/tmp/ksight/network_connect.bpf.o --memory-object /data/local/tmp/ksight/memory_regions.bpf.o --binder-object /data/local/tmp/ksight/binder_transaction.bpf.o --sched-object /data/local/tmp/ksight/sched_wakeup.bpf.o --uprobe-object /data/local/tmp/ksight/uprobe_regs.bpf.o --duration-seconds 0 --sample-one-in 1 --spool-dir /data/local/tmp/ksight/spool --spool-max-mib 64 --batch-events 64 --quiet --package {package} --inspect-max-bytes {MAX_INSPECT_PLAINTEXT_BYTES} --mirror-burp {burp}"
     );
     if request.launch_after_attach {
         capture_command = format!(
@@ -1430,38 +1725,85 @@ pub async fn start_kernsight_mirror(
     let remote = format!("su -c \"{capture_command}\"");
     let mut child = Command::new("adb")
         .args(["-s", &request.serial, "shell", &remote])
-        .stdout(Stdio::null())
+        .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(false)
         .spawn()
         .map_err(|error| format!("无法启动镜像采集：{error}"))?;
+    if let Some(stdout) = child.stdout.take() {
+        collect_mirror_logs(stdout, Arc::clone(&state.logs));
+    }
     if let Some(stderr) = child.stderr.take() {
-        let logs = Arc::clone(&state.logs);
-        tokio::spawn(async move {
-            let mut reader = BufReader::new(stderr);
-            let mut line = String::new();
-            loop {
-                line.clear();
-                match reader.read_line(&mut line).await {
-                    Ok(0) | Err(_) => break,
-                    Ok(_) => {
-                        let entry = line.trim_end().to_owned();
-                        if entry.is_empty() {
-                            continue;
-                        }
-                        let mut logs = logs.lock().await;
-                        while logs.len() >= 200 {
-                            logs.pop_front();
-                        }
-                        logs.push_back(entry);
-                    }
+        collect_mirror_logs(stderr, Arc::clone(&state.logs));
+    }
+
+    // `spawn()` only proves that adb itself started. Do not announce RUNNING
+    // until the device-side collector is visible; this also detects a blocked
+    // root prompt or an adb shell that stays alive after the command failed.
+    let startup_deadline = Instant::now() + Duration::from_secs(6);
+    let startup_failure = loop {
+        if let Some(status) = child
+            .try_wait()
+            .map_err(|error| format!("无法确认镜像启动状态：{error}"))?
+        {
+            break Some(format!("adb shell: {status}"));
+        }
+        match device_mirror_process_status(&request.serial).await {
+            Ok(status) if status.capture_count > 0 => break None,
+            Ok(_) => {}
+            Err(error) => {
+                if Instant::now() >= startup_deadline {
+                    break Some(format!("无法确认设备进程：{error}"));
                 }
             }
-        });
+        }
+        if Instant::now() >= startup_deadline {
+            break Some("6 秒内未发现设备端采集进程".to_owned());
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    };
+    if let Some(reason) = startup_failure {
+        let _ = child.start_kill();
+        let _ = timeout(Duration::from_secs(2), child.wait()).await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let lines = state
+            .logs
+            .lock()
+            .await
+            .iter()
+            .rev()
+            .take(12)
+            .cloned()
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect::<Vec<_>>();
+        let _ = mirror_adb_command(
+            &request.serial,
+            &["forward", "--remove", "tcp:18081"],
+            "清理回放端口",
+        )
+        .await;
+        if request.mirror_via_adb {
+            let remote = format!("tcp:{}", mirror.1);
+            let _ = mirror_adb_command(
+                &request.serial,
+                &["reverse", "--remove", &remote],
+                "清理反向端口",
+            )
+            .await;
+        }
+        let detail = if lines.is_empty() {
+            "设备进程未输出诊断信息".to_owned()
+        } else {
+            lines.join("\n")
+        };
+        return Err(format!("镜像采集启动失败（{reason}）\n{detail}"));
     }
     *state.child.lock().await = Some(child);
     *state.serial.lock().await = Some(request.serial.clone());
     *state.package.lock().await = Some(package.to_owned());
+    *state.reverse_port.lock().await = request.mirror_via_adb.then_some(mirror.1);
     Ok(KernSightCaptureResult {
         session_id: None,
         started_unix_ms: now_millis(),
@@ -1477,13 +1819,20 @@ pub async fn start_kernsight_mirror(
 #[tauri::command]
 pub async fn stop_kernsight_mirror(
     state: State<'_, MirrorSessionState>,
+    serial: Option<String>,
+    reverse_port: Option<u16>,
 ) -> Result<KernSightMirrorStatus, String> {
     let _operation = state.operation.lock().await;
-    stop_mirror_child(&state).await?;
+    if let Some(value) = serial.as_deref() {
+        validate_serial(value)?;
+    }
+    stop_mirror_child(&state, serial.as_deref(), reverse_port).await?;
     Ok(KernSightMirrorStatus {
         running: false,
+        cleanup_pending: false,
         package: None,
         serial: None,
+        detail: Some("设备端 ksightd、KernSight pcap 子进程与会话状态已完成清理".into()),
         logs: state.logs.lock().await.iter().cloned().collect(),
     })
 }
@@ -1491,28 +1840,54 @@ pub async fn stop_kernsight_mirror(
 #[tauri::command]
 pub async fn kernsight_mirror_status(
     state: State<'_, MirrorSessionState>,
+    serial: Option<String>,
 ) -> Result<KernSightMirrorStatus, String> {
-    let _operation = state.operation.lock().await;
-    let mut running = false;
+    if let Some(value) = serial.as_deref() {
+        validate_serial(value)?;
+    }
+    let mut host_running = false;
     {
         let mut child = state.child.lock().await;
         if let Some(handle) = child.as_mut() {
             match handle.try_wait() {
-                Ok(None) => running = true,
+                Ok(None) => host_running = true,
                 Ok(Some(_)) | Err(_) => {
                     *child = None;
                 }
             }
         }
     }
-    if !running {
+    let known_serial = state.serial.lock().await.clone().or_else(|| serial.clone());
+    let device = if let Some(value) = known_serial.as_deref() {
+        Some(device_mirror_process_status(value).await?)
+    } else {
+        None
+    };
+    let device_running = device
+        .as_ref()
+        .is_some_and(|status| status.capture_count > 0);
+    let cleanup_pending = device
+        .as_ref()
+        .is_some_and(|status| status.pcap_count > 0 && status.capture_count == 0);
+    let running = host_running || device_running;
+    if !running && !cleanup_pending {
         *state.serial.lock().await = None;
         *state.package.lock().await = None;
     }
+    let detail = device.as_ref().map(|status| {
+        format!(
+            "host_adb={} ksightd={} kernsight_tcpdump={}",
+            u8::from(host_running),
+            status.capture_count,
+            status.pcap_count
+        )
+    });
     Ok(KernSightMirrorStatus {
         running,
+        cleanup_pending,
         package: state.package.lock().await.clone(),
-        serial: state.serial.lock().await.clone(),
+        serial: known_serial,
+        detail,
         logs: state.logs.lock().await.iter().cloned().collect(),
     })
 }
@@ -2266,5 +2641,24 @@ mod tests {
             checksum_for_asset("not-a-sha  ksightd-android-arm64", KSIGHT_RELEASE_ASSET),
             None
         );
+    }
+
+    #[test]
+    fn parses_device_mirror_process_counts() {
+        let status = parse_device_mirror_process_status("capture_count=1\npcap_count=2\n");
+        assert_eq!(status.capture_count, 1);
+        assert_eq!(status.pcap_count, 2);
+    }
+
+    #[test]
+    fn mirror_log_keeps_diagnostics_and_omits_payload_values() {
+        assert_eq!(
+            sanitize_mirror_log("attached adapter offset=0x10").as_deref(),
+            Some("attached adapter offset=0x10")
+        );
+        let line = sanitize_mirror_log("event pid=42 preview=private-value").unwrap();
+        assert!(line.starts_with("event pid=42"));
+        assert!(line.contains("载荷已从运行日志中省略"));
+        assert!(!line.contains("private-value"));
     }
 }

@@ -122,8 +122,10 @@ export interface KernSightCaptureRequest {
 
 export interface KernSightMirrorStatus {
   running: boolean
+  cleanupPending: boolean
   package?: string | null
   serial?: string | null
+  detail?: string | null
   logs: string[]
 }
 

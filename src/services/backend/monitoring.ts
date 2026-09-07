@@ -30,8 +30,8 @@ export const monitoringBackend = {
     invoke<KernSightCaptureResult>('start_kernsight_capture', { request }),
   startKernSightMirror: (request: KernSightCaptureRequest) =>
     invoke<KernSightCaptureResult>('start_kernsight_mirror', { request }),
-  stopKernSightMirror: () => invoke<KernSightMirrorStatus>('stop_kernsight_mirror'),
-  kernSightMirrorStatus: () => invoke<KernSightMirrorStatus>('kernsight_mirror_status'),
+  stopKernSightMirror: (serial?: string, reversePort?: number) => invoke<KernSightMirrorStatus>('stop_kernsight_mirror', { serial, reversePort }),
+  kernSightMirrorStatus: (serial?: string) => invoke<KernSightMirrorStatus>('kernsight_mirror_status', { serial }),
   dumpKernSightPackage: (serial: string, packageName: string, hideDebug = false, preferLive = false) =>
     invoke<KernSightCaptureResult>('dump_kernsight_package', { serial, package: packageName, hideDebug, preferLive }),
   kernSightPackageDumps: (serial: string) =>
