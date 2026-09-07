@@ -11,6 +11,13 @@ node_modules
 dist
 dist-ssr
 *.local
+*.bak
+*.mskcase
+*.mobileecase
+__pycache__/
+*.py[cod]
+src-tauri/target/
+Me-Dumps/
 
 # Editor directories and files
 .vscode/*

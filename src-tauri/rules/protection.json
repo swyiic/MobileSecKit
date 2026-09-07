@@ -1,0 +1,17 @@
+[
+  { "label": "梆梆/娜迦类", "scope": "archive", "triggerSignals": ["libjiagu", "libsecexe", "libprotectclass"] },
+  { "label": "腾讯乐固类", "scope": "archive", "triggerSignals": ["libshell", "libtup", "libtosprotection"] },
+  { "label": "360 加固类", "scope": "archive", "triggerSignals": ["libjiagu_a", "lib360", "libprotect"] },
+  { "label": "爱加密类", "scope": "archive", "triggerSignals": ["ijiami", "libexecmain", "libexec"] },
+  { "label": "JMCodeProtect / iJiami iOS CodeProtect", "scope": "archive", "triggerSignals": ["jmcodeprotectkit.framework", "ipacodeprotecttwosdk_arm64_filter.json", "ipacodeprotecttwosdk_coderesources", "ipacodeprotecttwosdk_libs"], "indicator": "命中 JMCodeProtect / iJiami iOS CodeProtect 文件特征；这是第三方代码保护线索，与 Apple FairPlay cryptid 状态是两件事。" },
+  { "label": "DexGuard/Guard 类", "scope": "archive", "triggerSignals": ["dexguard", "libdexhelper", "libdexguard"] },
+  { "label": "通用自定义壳线索", "scope": "archive", "triggerSignals": ["assets/shell", "assets/secneo", "classes2.dex", "classes3.dex"] },
+  { "label": "360 加固 / StubApp", "scope": "manifest", "triggerSignals": ["com.stub.stubapp", "com.qihoo.util.stubapplication"] },
+  { "label": "梆梆 / SecNeo", "scope": "manifest", "triggerSignals": ["com.secneo.apkwrapper", "com.secneo.guard"] },
+  { "label": "腾讯乐固", "scope": "manifest", "triggerSignals": ["com.tencent.stub", "tencent.legu"] },
+  { "label": "爱加密", "scope": "manifest", "triggerSignals": ["com.ijiami", "s.h.e.l.l.s"] },
+  { "label": "阿里聚安全", "scope": "manifest", "triggerSignals": ["com.ali.mobisecenhance", "com.alibaba.wireless.security"] },
+  { "label": "网易易盾", "scope": "manifest", "triggerSignals": ["com.netease.nis.wrapper", "com.netease.nis"] },
+  { "label": "百度加固", "scope": "manifest", "triggerSignals": ["com.baidu.protect", "com.baidu.mobstat.stub"] },
+  { "label": "通用 ProxyApplication 壳", "scope": "manifest", "triggerSignals": ["proxyapplication", "shellapplication"] }
+]

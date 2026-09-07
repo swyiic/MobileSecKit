@@ -1,9 +1,13 @@
-import { createApp } from "vue";
-import './assets/global.css';
-// import router from './router'
-import App from "./App.vue";
+import { createApp } from 'vue'
+import './assets/global.css'
+import './assets/analyzer.css'
+import App from './App.vue'
+import './assets/light-theme.css'
+import { loadAppConfig } from '@/services/config'
 
+async function bootstrap() {
+  await loadAppConfig()
+  createApp(App).mount('#app')
+}
 
-const app = createApp(App)
-// app.use(router)                      
-app.mount('#app')
+void bootstrap()

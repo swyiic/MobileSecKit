@@ -5,7 +5,10 @@
 1. 把 APK/IPA 拖到 App Analyzer，或选择本机绝对路径。
 2. 先看平台、包名/Bundle ID、版本、签名和架构；`frameworks` 会根据包内特征给出 Flutter、React Native、Unity、Cordova/WebView、Xamarin/.NET 或 Native 线索。
 3. Android 的 `AndroidManifest.xml` 会优先尝试本机 AXMLPrinter/AXML decoder；即使没有外部工具，内置 Rust AXML 回退也会生成可读 XML，并从中提取权限和组件。
-4. 查看 Sensitive information / location 表。它只显示类别和路径，不回显匹配到的值。
+4. 先看 Scan Coverage。`PARTIAL` 表示归档索引、深度二进制或最终结果触发了预算上限；报告会列出实际扫描数量。
+5. 查看 Sensitive information / location。普通线索显示实际值、地址和上下文；完整私钥不会写入 HTML、Data Boundaries 或 AI Context，只能在本机详情中显式复制/导出。
+6. 在 MASVS 验证矩阵中按步骤补充运行时验证，并选择“确认存在风险 / 误报 / 不适用 / 已验证通过”。
+7. 保存 `.mskcase` 项目快照；分析新版本后使用“基线对比”查看新增与已消失的 Finding、敏感线索和第三方库。
 
 ## 线索分类
 
@@ -15,6 +18,14 @@
 - 文件与存储：SharedPreferences、数据库/SQLite/Realm、WebView/IndexedDB/Cookies、Keychain/Keystore、证书和 provisioning profile。
 
 这些是静态线索，不代表已经确认泄漏；应回到源码、运行时日志和测试数据中复核。
+
+## MASVS 状态
+
+- `not-assessed`：没有足够证据，不代表通过。
+- `static-candidate`：静态配置、字符串、类/方法或文件命中，只能作为测试入口。
+- `runtime-observed`：已关联运行时日志或静态/动态共同证据，仍需评估实际影响。
+
+HTML 报告会包含 Scan Coverage、MASVS 验证步骤、人工结论和复核备注。项目快照还会保存 App 文件 SHA-256，便于确认基线是否对应同一构建。
 
 ## Frida 入门流程
 

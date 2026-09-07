@@ -1,8 +1,8 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "Mobile Security Kits",
-  "version": "0.1.0",
-  "identifier": "com.swyiic.me",
+  "productName": "MobileE",
+  "version": "2.2.1",
+  "identifier": "com.swyiic.mobilee",
   "build": {
     "beforeDevCommand": "yarn dev",
     "devUrl": "http://localhost:1420",
@@ -12,9 +12,9 @@
   "app": {
     "windows": [
       {
-        "title": "Mobile Security Kits",
-        "width": 900,
-        "height": 1000,
+        "title": "MobileE",
+        "width": 1000,
+        "height": 1020,
         "decorations": true, 
         "transparent": false,
         "resizable": true,
@@ -30,12 +30,13 @@
   "bundle": {
     "active": true,
     "targets": "all",
+    "resources": ["rules/*.json"],
+    "macOS": {
+      "signingIdentity": "-"
+    },
     "icon": [
-      "icons/32x32.png",
-      "icons/128x128.png",
-      "icons/128x128@2x.png",
-      "icons/icon.icns",
-      "icons/icon.ico"
+      "icons/icon.png",
+      "icons/icon.icns"
     ]
   }
 }

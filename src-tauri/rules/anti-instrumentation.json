@@ -1,0 +1,33 @@
+[
+  { "label": "Frida 注入组件文件", "scope": "archive", "triggerSignals": ["libfrida", "frida-agent", "frida-gadget", "frida-server", "frida-inject", "frida_helper"] },
+  { "label": "Frida 运行时线程/进程特征", "scope": "content", "triggerSignals": ["gum-js-loop", "gmain", "linjector", "gdbus", "gum-js"] },
+  { "label": "Frida 默认端口探测", "scope": "content", "triggerSignals": ["27042", "27043"] },
+  { "label": "/proc/self 内存与 TracerPid 检测", "scope": "content", "triggerSignals": ["/proc/self/maps", "/proc/self/task", "/proc/self/status", "TracerPid", "stat/"] },
+  { "label": "Dobby Hook 框架", "scope": "archive", "triggerSignals": ["libdobby", "dobby_hook", "dobby_disable_hook"] },
+  { "label": "Substrate / Cydia 类", "scope": "archive", "triggerSignals": ["libsubstrate", "libsubstituted", "cycript", "substrate.h", "MSHookFunction"] },
+  { "label": "Xposed / LSPosed 类", "scope": "content", "triggerSignals": ["de.robv.android.xposed", "lsposed", "edxposed", "xposedmodule"] },
+  { "label": "ptrace 反调试", "scope": "content", "triggerSignals": ["PT_DENY_ATTACH", "PTRACE_TRACEME", "ptrace("] },
+  { "label": "sysctl / 异常端口反调试", "scope": "content", "triggerSignals": ["task_get_exception_ports", "exception_ports", "sysctl("] },
+  { "label": "dyld 镜像拦截", "scope": "content", "triggerSignals": ["dyld-interpose", "_dyld_register_func_for_add_image", "DYLD_INSERT_LIBRARIES"] },
+  { "label": "内联系统调用（不可 Hook）", "scope": "content", "triggerSignals": ["__syscall", "__raw_syscall", "svc #0x80"] },
+  { "label": "FishHook 检测", "scope": "content", "triggerSignals": ["fishhook", "rebind_symbols"] },
+  { "label": "越狱/Root 环境路径", "scope": "archive", "triggerSignals": ["cydia.app", "sileo.app", "/var/jb", "libhooker", "unc0ver", "checkra1n"] },
+  { "label": "完整性/调试标记", "scope": "content", "triggerSignals": ["getTaskAllow", "debuggable", "csops", "amfi"] },
+  {
+    "label": "类加载器接管 / 整体加固 / 热修复线索",
+    "scope": "content",
+    "triggerSignals": [
+      "currentActivityThread",
+      "mPackages",
+      "LoadedApk",
+      "mClassLoader",
+      "DexPathList",
+      "dexElements",
+      "combineDexElements",
+      "getClassNameList",
+      "attachBaseContext",
+      "InMemoryDexClassLoader"
+    ],
+    "indicator": "review：普通热修复框架也可能命中；仅提示疑似类加载器接管，需用 inspect_classloader 运行时确认。"
+  }
+]

@@ -1,0 +1,89 @@
+[
+  {
+    "exclusionId": "excl-format-placeholder-version",
+    "appliesToKind": "ip",
+    "excludeSignals": [
+      "%d",
+      "%p",
+      "%ld",
+      "%02x",
+      "SocksSelectMethod",
+      "FindFriendByLocalIp"
+    ],
+    "excludePatterns": [
+      "(?i)version(?:name|code)?\\s*[:=]"
+    ],
+    "reason": "格式化日志模板或版本文本，不是有效 IP",
+    "verifiedIn": []
+  },
+  {
+    "exclusionId": "excl-sm9-threshsign-log",
+    "appliesToKind": "token",
+    "excludeSignals": [
+      "ThreshSign",
+      "signerdata",
+      "%d"
+    ],
+    "excludePatterns": [
+      "(?i)client token:",
+      "(?i)server token:"
+    ],
+    "reason": "SM9 门限签名日志文案，非硬编码凭据",
+    "verifiedIn": [
+      "com.asiainfo.ima.base"
+    ]
+  },
+  {
+    "exclusionId": "excl-frontend-static-cdn-url",
+    "appliesToKind": "url",
+    "excludeSignals": [
+      "cdnjs.cloudflare.com",
+      "fonts.googleapis.com",
+      "fonts.gstatic.com",
+      "unpkg.com",
+      "cdn.jsdelivr.net",
+      "static.cloudflareinsights.com"
+    ],
+    "excludePatterns": [
+      "(?i)https?://(?:[^/]+\\.)?(?:cdnjs\\.cloudflare\\.com|fonts\\.googleapis\\.com|fonts\\.gstatic\\.com|unpkg\\.com|cdn\\.jsdelivr\\.net|static\\.cloudflareinsights\\.com)(?:/|$)"
+    ],
+    "reason": "前端公共 CDN/字体/遥测依赖 URL，不是业务接口或应用私有服务端点",
+    "verifiedIn": []
+  },
+  {
+    "exclusionId": "excl-frontend-template-endpoint",
+    "appliesToKind": "api-endpoint",
+    "excludeSignals": [
+      "${baseUrl}",
+      "${base_url}",
+      "{baseUrl}",
+      "{base_url}",
+      "<baseUrl>",
+      "<base_url>"
+    ],
+    "excludePatterns": [
+      "(?i)(?:api[_-]?base|base[_-]?url|endpoint)\\s*[:=]"
+    ],
+    "reason": "前端模板中的可替换 Base URL/endpoint 占位符，不是已解析的真实接口",
+    "verifiedIn": []
+  },
+  {
+    "exclusionId": "excl-frontend-placeholder-credential",
+    "appliesToKind": "credential",
+    "excludeSignals": [
+      "example",
+      "sample",
+      "dummy",
+      "placeholder",
+      "changeme",
+      "replace_me",
+      "your_key",
+      "your_secret"
+    ],
+    "excludePatterns": [
+      "(?i)(?:api[_-]?key|secret|token|password)\\s*[:=]\\s*[\"\\']?(?:example|sample|dummy|placeholder|changeme|replace[_-]?me|your[_-]?(?:key|secret|token))[\"\\']?"
+    ],
+    "reason": "前端示例配置或占位凭据，不是实际密钥材料",
+    "verifiedIn": []
+  }
+]

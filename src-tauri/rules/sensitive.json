@@ -1,0 +1,187 @@
+[
+  {
+    "label": "URL / API endpoint",
+    "kind": "url",
+    "severity": "review",
+    "pattern": "(?i)\\b(?:https?|wss?)://[A-Za-z0-9](?:[A-Za-z0-9.-]{0,251}[A-Za-z0-9])?(?::[0-9]{1,5})?(?:/[^\\s\"'<>]*)?",
+    "excludeSignals": [
+      "${",
+      "%@",
+      "%s",
+      "<baseUrl>",
+      "<base_url>",
+      "\\\\x",
+      "{domain}",
+      "{host}"
+    ]
+  },
+  {
+    "label": "API 相对路径",
+    "kind": "api-endpoint",
+    "severity": "review",
+    "pattern": "(?i)[\"'`](?:/|\\./|\\.\\./)(?:api|rest|graphql|oauth|openapi|gateway|auth|v[0-9]+)(?:/|\\?)[A-Za-z0-9_./?&=%{}:+$-]{2,}",
+    "excludeSignals": [
+      "${baseUrl}",
+      "${base_url}",
+      "{baseUrl}",
+      "{base_url}"
+    ]
+  },
+  {
+    "label": "IPv4 地址",
+    "kind": "ip",
+    "severity": "review",
+    "pattern": "\\b(?:25[0-5]|2[0-4][0-9]|1?[0-9]{1,2})(?:\\.(?:25[0-5]|2[0-4][0-9]|1?[0-9]{1,2})){3}\\b",
+    "excludeSignals": [
+      "0.0.0.0",
+      "127.0.0.1",
+      "255.255.255.255",
+      "%d",
+      "%p",
+      "%ld",
+      "%02x"
+    ],
+    "excludePatterns": [
+      "(?i)(?:version|sdk|release|build)[^\\n]{0,32}[0-9]+\\.[0-9]+\\.[0-9]+\\.[0-9]+",
+      "(?i)0x[0-9a-f]{4,}",
+      "(?:^|[^0-9])0[0-9]{1,2}(?:\\.[0-9]{1,3}){3}"
+    ]
+  },
+  {
+    "label": "邮箱地址",
+    "kind": "email",
+    "severity": "review",
+    "pattern": "(?i)\\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\\.[A-Z]{2,}\\b",
+    "excludeSignals": [
+      "@1x",
+      "@2x",
+      "@3x",
+      "%@",
+      "\\\\x"
+    ]
+  },
+  {
+    "label": "手机号格式",
+    "kind": "phone",
+    "severity": "review",
+    "pattern": "\\b1[3-9][0-9]{9}\\b"
+  },
+  {
+    "label": "身份证号格式",
+    "kind": "identity",
+    "severity": "high",
+    "pattern": "\\b[1-9][0-9]{5}(?:19|20)[0-9]{2}(?:0[1-9]|1[0-2])(?:0[1-9]|[12][0-9]|3[01])[0-9]{3}[0-9Xx]\\b"
+  },
+  {
+    "label": "AWS Access Key",
+    "kind": "access-key",
+    "severity": "high",
+    "pattern": "\\bAKIA[0-9A-Z]{16}\\b"
+  },
+  {
+    "label": "AWS Secret Access Key",
+    "kind": "secret",
+    "severity": "high",
+    "pattern": "(?i)aws[_-]?secret(?:_access)?[_-]?key\\s*[:=]\\s*[\\\"']?[A-Za-z0-9/+=]{40}\\b"
+  },
+  {
+    "label": "Google API Key",
+    "kind": "api-key",
+    "severity": "high",
+    "pattern": "\\bAIza[0-9A-Za-z_-]{35}\\b"
+  },
+  {
+    "label": "Google Service Account 私钥 ID",
+    "kind": "secret",
+    "severity": "high",
+    "pattern": "(?i)private_key_id[\\\"']?\\s*:\\s*[\\\"'][0-9a-f]{20,}"
+  },
+  {
+    "label": "Firebase Database URL",
+    "kind": "url",
+    "severity": "high",
+    "pattern": "(?i)https://[a-z0-9-]+\\.(?:firebaseio\\.com|firebasedatabase\\.app)[^\\s\\\"'<>]*"
+  },
+  {
+    "label": "OAuth Client Secret",
+    "kind": "secret",
+    "severity": "high",
+    "pattern": "(?i)client[_-]?secret\\s*[:=]\\s*[\\\"']?[A-Za-z0-9._~+/=-]{12,}"
+  },
+  {
+    "label": "Bearer Token",
+    "kind": "token",
+    "severity": "high",
+    "pattern": "(?i)bearer\\s+[A-Za-z0-9._~+/=-]{16,}"
+  },
+  {
+    "label": "GitHub Token",
+    "kind": "token",
+    "severity": "high",
+    "pattern": "\\bgh[opusr]_[A-Za-z0-9]{30,255}\\b"
+  },
+  {
+    "label": "Slack Token",
+    "kind": "token",
+    "severity": "high",
+    "pattern": "\\bxox[baprs]-[A-Za-z0-9-]{10,}\\b"
+  },
+  {
+    "label": "Stripe Secret Key",
+    "kind": "secret",
+    "severity": "high",
+    "pattern": "\\bsk_(?:live|test)_[A-Za-z0-9]{16,}\\b"
+  },
+  {
+    "label": "数据库连接串",
+    "kind": "credential",
+    "severity": "high",
+    "pattern": "(?i)\\b(?:postgres(?:ql)?|mysql|mongodb(?:\\+srv)?|redis)://[^\\s\\\"'<>]{8,}"
+  },
+  {
+    "label": "JWT Token",
+    "kind": "token",
+    "severity": "high",
+    "pattern": "\\beyJ[A-Za-z0-9_-]{10,}\\.[A-Za-z0-9_-]{10,}\\.[A-Za-z0-9_-]{5,}\\b"
+  },
+  {
+    "label": "私钥内容",
+    "kind": "private-key",
+    "severity": "high",
+    "pattern": "-----BEGIN (?:RSA |EC |OPENSSH |ENCRYPTED )?PRIVATE KEY-----"
+  },
+  {
+    "label": "硬编码凭据字段",
+    "kind": "credential",
+    "severity": "high",
+    "pattern": "(?i)(?:[\"'`](?:api[_-]?key|access[_-]?key|access[_-]?token|secret[_-]?key|client[_-]?secret|aes[_-]?key|auth[_-]?token|refresh[_-]?token|password|passwd|token)[\"'`]\\s*[:=]\\s*|(?:api[_-]?key|access[_-]?key|access[_-]?token|secret[_-]?key|client[_-]?secret|aes[_-]?key|auth[_-]?token|refresh[_-]?token|password|passwd|token)\\s*[:=]\\s*)[\"'`]?[A-Za-z0-9_./+=:-]{8,}[\"'`]?",
+    "excludeSignals": [
+      "%02x",
+      "%d",
+      "%ld",
+      "%p",
+      "ThreshSign",
+      "showText",
+      "signerdata",
+      "swizzleActionWithTitleMethod"
+    ],
+    "excludePatterns": [
+      "(?i)(?:client|server) token:\\s*%",
+      "(?i)password:\\s*(?:show|hide|set|get|swizzle)[A-Za-z]+"
+    ]
+  },
+  {
+    "label": "弱加密算法调用",
+    "kind": "weak-crypto",
+    "severity": "review",
+    "pattern": "(?i)md5WithRSAEncryption|PBE-MD2-DES|RSA-MD5|AES/(?:ECB|DES)|DESede|MD5withRSA",
+    "requireContext": [
+      "getInstance",
+      "MessageDigest",
+      "Cipher",
+      "KeyGenerator",
+      "CCCrypt",
+      "SecKey"
+    ]
+  }
+]

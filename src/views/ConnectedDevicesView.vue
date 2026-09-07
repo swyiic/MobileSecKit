@@ -2,9 +2,9 @@
   <div class="page-stack">
     <section v-if="!devices.length" class="empty-state panel">
       <span class="material-symbols-outlined">phonelink_off</span>
-      <h2>没有发现 Android 设备</h2>
+      <h2>没有发现移动设备</h2>
       <p>请连接 Android 或已配对的 iPhone；Android 需要 USB 调试，iOS 需要 libimobiledevice / Frida 工具链。</p>
-      <button class="primary-button" @click="$emit('refresh')">重新检测</button>
+      <button class="primary-button" @click="$emit('refresh-devices')">刷新设备列表</button>
     </section>
 
     <template v-else>
@@ -25,10 +25,10 @@
                 {{ device.model }} · {{ device.serial }}
               </option>
             </select>
-            <p>{{ details?.manufacturer || selectedDevice?.product || 'Android' }} · {{ selectedDevice?.status }}</p>
+            <p>{{ details?.manufacturer || iosDetails?.productType || selectedDevice?.product || selectedDevice?.platform || '移动设备' }} · {{ selectedDevice?.transportId || 'unknown transport' }} · {{ selectedDevice?.status }}</p>
           </div>
           <div v-if="details?.batteryLevel != null" class="battery-pill">
-            <span class="material-symbols-outlined">battery_android_frame_4</span>
+            <span class="material-symbols-outlined">{{ batteryIcon(details.batteryLevel) }}</span>
             {{ details.batteryLevel }}%
           </div>
         </div>
@@ -45,7 +45,7 @@
           <div><span>ABI List</span><strong>{{ details.abiList.join(', ') || '—' }}</strong></div>
           <div><span>Security Patch</span><strong>{{ details.securityPatch }}</strong></div>
           <div><span>Brand</span><strong>{{ details.brand }}</strong></div>
-          <div><span>Frida Server</span><details class="summary-details"><summary :class="details.fridaServerVersion ? 'safe' : 'danger'">{{ details.fridaServerVersion || 'Not detected' }}</summary><p>{{ details.fridaServerVersion || '未在 /data/local/tmp/frida-server 检测到版本；可到 Frida Toolbox 自动部署。' }}</p></details></div>
+          <div class="wide"><span>Frida Server</span><details class="summary-details"><summary :class="details.fridaServerVersion ? 'safe' : 'danger'">{{ details.fridaServerVersion || 'Not detected' }}</summary><p>{{ details.fridaServerVersion || '未在 /data/local/tmp/frida-server 检测到版本；可到 Frida Toolbox 自动部署。' }}</p></details></div>
           <div class="wide"><span>Kernel</span><strong>{{ details.kernelVersion }}</strong></div>
         </div>
         <div v-else-if="iosDetails" class="spec-grid">
@@ -61,46 +61,6 @@
         <div v-else class="inline-state">
           {{ selectedDevice?.platform === 'ios' ? '已识别 iOS：ADB 不可用；请在 Frida Toolbox 中进行运行时观测。' : selectedDevice?.status === 'unauthorized' ? '请在手机上点击“允许 USB 调试”' : '设备暂不可读取' }}
         </div>
-      </section>
-
-      <section class="bridge-panel panel">
-        <div class="section-title">
-          <div>
-            <div class="eyebrow">ANDROID → RUST → VUE</div>
-            <h2>Signal Bridge</h2>
-            <p>接收手机 JSON 信号，由 Rust 规则判断并实时返回。</p>
-          </div>
-          <span class="live-pill" :class="{ online: bridgeStatus?.running }">
-            {{ bridgeStatus?.running ? 'LISTENING' : 'STOPPED' }}
-          </span>
-        </div>
-        <div class="bridge-actions">
-          <div class="endpoint">
-            <span class="material-symbols-outlined">lan</span>
-            {{ bridgeStatus?.endpoint || '127.0.0.1:7878' }}
-          </div>
-          <button class="primary-button" :disabled="selectedDevice?.platform !== 'android' || selectedDevice?.status !== 'device' || bridgeStatus?.running" @click="$emit('start-bridge')">
-            <span class="material-symbols-outlined">sensors</span>
-            {{ bridgeStatus?.running ? '服务已启动' : '启动信号服务' }}
-          </button>
-        </div>
-
-        <div v-if="signals.length" class="signal-list">
-          <article v-for="event in signals.slice(0, 6)" :key="`${event.decision.signalId}-${event.decision.receivedAt}`" class="signal-row">
-            <span class="decision-icon" :class="event.decision.decision">
-              <span class="material-symbols-outlined">{{ decisionIcon(event.decision.decision) }}</span>
-            </span>
-            <div>
-              <strong>{{ event.signal.kind }}</strong>
-              <p>{{ event.decision.message }}</p>
-            </div>
-            <div class="signal-meta">
-              <span :class="`risk-${event.decision.riskLevel}`">{{ event.decision.decision }}</span>
-              <time>{{ formatTime(event.decision.receivedAt) }}</time>
-            </div>
-          </article>
-        </div>
-        <div v-else class="empty-inline">启动后，等待安卓端发送第一条信号。</div>
       </section>
 
       <section class="process-panel panel">
@@ -140,7 +100,15 @@
 
 <script setup lang="ts">
 import { computed, ref } from 'vue'
-import type { BridgeStatus, DeviceDetails, DeviceSummary, IosDeviceDetails, ProcessInfo, SignalEvent } from '@/types'
+import type { DeviceDetails, DeviceSummary, IosDeviceDetails, ProcessInfo } from '@/types'
+
+function batteryIcon(level: number) {
+  if (level >= 90) return 'battery_android_full'
+  if (level >= 70) return 'battery_android_frame_6'
+  if (level >= 50) return 'battery_android_frame_4'
+  if (level >= 25) return 'battery_android_frame_2'
+  return 'battery_android_alert'
+}
 
 const props = defineProps<{
   devices: DeviceSummary[]
@@ -148,15 +116,13 @@ const props = defineProps<{
   details: DeviceDetails | null
   iosDetails: IosDeviceDetails | null
   processes: ProcessInfo[]
-  signals: SignalEvent[]
   loading: boolean
-  bridgeStatus: BridgeStatus | null
 }>()
 
 defineEmits<{
   'select-device': [serial: string]
   refresh: []
-  'start-bridge': []
+  'refresh-devices': []
   'inspect-process': [process: ProcessInfo]
 }>()
 
@@ -174,10 +140,6 @@ function formatMemory(memoryKb: number) {
   return memoryKb ? `${(memoryKb / 1024).toFixed(memoryKb > 10240 ? 0 : 1)} MB` : '—'
 }
 
-function formatTime(timestamp: number) {
-  return new Intl.DateTimeFormat('zh-CN', { hour: '2-digit', minute: '2-digit', second: '2-digit' }).format(timestamp)
-}
-
 function tone(value: string) {
   const normalized = value.toLowerCase()
   if (normalized.includes('not detected') || normalized.includes('enforcing') || normalized.includes('locked')) return 'safe'
@@ -185,11 +147,4 @@ function tone(value: string) {
   return ''
 }
 
-function decisionIcon(decision: string) {
-  return decision === 'block' || decision === 'reject'
-    ? 'block'
-    : decision === 'review'
-      ? 'warning'
-      : 'check_circle'
-}
 </script>

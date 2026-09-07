@@ -1,29 +1,46 @@
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
-use std::{
-    collections::HashMap,
-    sync::{
-        atomic::{AtomicBool, Ordering},
-        Arc,
-    },
-    time::{SystemTime, UNIX_EPOCH},
-};
-use tauri::{AppHandle, Emitter, State};
+use std::collections::HashMap;
+use std::sync::OnceLock;
 use tokio::{
-    io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
-    net::{TcpListener, TcpStream},
     process::Command,
+    sync::Mutex,
     time::{timeout, Duration},
 };
 
 mod advanced;
+mod config;
+mod monitoring;
 
-pub(crate) const BRIDGE_PORT: u16 = 7878;
 pub(crate) const ADB_TIMEOUT: Duration = Duration::from_secs(20);
+static ADB_COMMAND_GATE: OnceLock<Mutex<()>> = OnceLock::new();
 
-#[derive(Default)]
-struct BridgeState {
-    running: Arc<AtomicBool>,
+fn adb_command_gate() -> &'static Mutex<()> {
+    ADB_COMMAND_GATE.get_or_init(|| Mutex::new(()))
+}
+
+fn prewarm_adb_server() -> Result<(), String> {
+    let output = std::process::Command::new("adb")
+        .arg("start-server")
+        .output()
+        .map_err(|error| format!("无法启动 adb server：{error}"))?;
+    if output.status.success() {
+        return Ok(());
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    Err(if stderr.is_empty() { stdout } else { stderr })
+}
+
+async fn bounded_command_output(
+    program: &str,
+    args: &[&str],
+) -> Result<std::process::Output, String> {
+    let mut command = Command::new(program);
+    command.args(args).kill_on_drop(true);
+    timeout(ADB_TIMEOUT, command.output())
+        .await
+        .map_err(|_| format!("{program} 操作超时"))?
+        .map_err(|error| format!("无法启动 {program}：{error}"))
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -104,61 +121,60 @@ struct CommandResult {
     exit_code: Option<i32>,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct PhoneSignal {
-    #[serde(default)]
-    id: String,
-    #[serde(default)]
-    device_id: String,
-    kind: String,
-    #[serde(default)]
-    value: String,
-    #[serde(default)]
-    timestamp: Option<u64>,
-    #[serde(default)]
-    payload: Value,
-}
-
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct SignalDecision {
-    signal_id: String,
-    accepted: bool,
-    decision: String,
-    risk_level: String,
-    message: String,
-    received_at: u64,
-}
-
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct SignalEvent {
-    signal: PhoneSignal,
-    decision: SignalDecision,
-}
-
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct BridgeStatus {
-    running: bool,
-    port: u16,
-    endpoint: String,
-}
-
 pub(crate) struct RawOutput {
     pub(crate) stdout: String,
     pub(crate) stderr: String,
     pub(crate) code: Option<i32>,
 }
 
-pub(crate) async fn run_adb(args: &[String]) -> Result<RawOutput, String> {
+async fn run_adb_once(args: &[String]) -> Result<std::process::Output, String> {
     let mut command = Command::new("adb");
     command.args(args).kill_on_drop(true);
-    let output = timeout(ADB_TIMEOUT, command.output())
+    timeout(ADB_TIMEOUT, command.output())
         .await
         .map_err(|_| "ADB 操作超时，请检查手机连接状态".to_string())?
-        .map_err(|error| format!("无法启动 adb：{error}。请先安装 Android platform-tools"))?;
+        .map_err(|error| format!("无法启动 adb：{error}。请先安装 Android platform-tools"))
+}
+
+fn is_adb_daemon_failure(output: &std::process::Output) -> bool {
+    let message = format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    )
+    .to_ascii_lowercase();
+    message.contains("server didn't ack")
+        || message.contains("cannot connect to daemon")
+        || message.contains("failed to check server version")
+        || message.contains("protocol fault")
+}
+
+pub(crate) async fn run_adb(args: &[String]) -> Result<RawOutput, String> {
+    // If the daemon is absent, every concurrent adb client otherwise tries to
+    // become the server. macOS then reports USB interface ownership failures
+    // and none of the competing daemons survives. Keep the complete command
+    // behind one process-wide gate; normal adb calls are short and the device
+    // detail fan-out remains fast enough while startup/restart stays reliable.
+    let _guard = adb_command_gate().lock().await;
+    let mut output = run_adb_once(args).await?;
+    if !output.status.success() && is_adb_daemon_failure(&output) {
+        // Recovery is deliberately limited to daemon-transport failures. Do
+        // not restart a healthy server for ordinary device/command errors.
+        let _ = Command::new("adb")
+            .arg("kill-server")
+            .kill_on_drop(true)
+            .output()
+            .await;
+        let start = Command::new("adb")
+            .arg("start-server")
+            .kill_on_drop(true)
+            .output()
+            .await
+            .map_err(|error| format!("ADB daemon 自动恢复失败：{error}"))?;
+        if start.status.success() {
+            output = run_adb_once(args).await?;
+        }
+    }
 
     Ok(RawOutput {
         stdout: String::from_utf8_lossy(&output.stdout).trim().to_string(),
@@ -281,18 +297,18 @@ async fn idevice_info(serial: &str) -> Result<HashMap<String, String>, String> {
 #[tauri::command]
 async fn get_ios_device_details(serial: String) -> Result<IosDeviceDetails, String> {
     let info = idevice_info(&serial).await.unwrap_or_default();
-    let frida_label = Command::new("frida-ls-devices")
-        .output()
+    let frida_label = bounded_command_output("frida-ls-devices", &[])
         .await
         .ok()
         .filter(|output| output.status.success())
         .and_then(|output| {
             String::from_utf8_lossy(&output.stdout)
                 .lines()
-                .skip(1)
+                .skip(2)
                 .find_map(|line| {
-                    let mut fields = line.split_whitespace();
-                    (fields.next()? == serial).then(|| fields.skip(1).collect::<Vec<_>>().join(" "))
+                    let fields = line.split_whitespace().collect::<Vec<_>>();
+                    (fields.first().copied()? == serial && fields.len() >= 3)
+                        .then(|| fields[2..].join(" "))
                 })
         });
     let battery_level = info
@@ -322,7 +338,10 @@ async fn get_ios_device_details(serial: String) -> Result<IosDeviceDetails, Stri
             .cloned()
             .unwrap_or_else(|| "Frida reachable".into()),
         battery_level,
-        architecture: "ARM64 / Apple mobile".into(),
+        architecture: info
+            .get("CPUArchitecture")
+            .cloned()
+            .unwrap_or_else(|| "arm64 / Apple mobile".into()),
         jailbreak_hint: if info.contains_key("UniqueChipID") {
             "标准设备信息可用；越狱状态请通过 Frida 诊断确认".into()
         } else {
@@ -369,12 +388,23 @@ async fn probe_frida_device(serial: &str) -> (bool, bool) {
 
 #[tauri::command]
 async fn list_devices() -> Result<Vec<DeviceSummary>, String> {
-    let adb_stdout = run_adb(&["devices".into(), "-l".into()])
-        .await
-        .ok()
-        .filter(|output| output.code == Some(0))
-        .map(|output| output.stdout)
-        .unwrap_or_default();
+    let adb = run_adb(&["devices".into(), "-l".into()]).await?;
+    if adb.code != Some(0) {
+        let detail = if adb.stderr.is_empty() {
+            adb.stdout
+        } else {
+            adb.stderr
+        };
+        return Err(format!(
+            "ADB 设备扫描失败：{}。MobileE 已限制并发启动；请确认 USB 连接后再次刷新。",
+            if detail.is_empty() {
+                "adb 未返回错误详情"
+            } else {
+                detail.as_str()
+            }
+        ));
+    }
+    let adb_stdout = adb.stdout;
     let mut devices: Vec<DeviceSummary> = adb_stdout
         .lines()
         .skip(1)
@@ -405,8 +435,8 @@ async fn list_devices() -> Result<Vec<DeviceSummary>, String> {
     // Only retain a physical USB/remote endpoint that answers Frida probing;
     // this avoids showing Local System, Local Socket and non-jailbroken phones
     // that merely advertise a Developer Disk Image transport.
-    let mut ios_candidates: HashMap<String, (String, String)> = HashMap::new();
-    if let Ok(ios) = Command::new("idevice_id").args(["-l"]).output().await {
+    let mut wired_ios = Vec::new();
+    if let Ok(ios) = bounded_command_output("idevice_id", &["-l"]).await {
         if ios.status.success() {
             for serial in String::from_utf8_lossy(&ios.stdout)
                 .lines()
@@ -414,19 +444,31 @@ async fn list_devices() -> Result<Vec<DeviceSummary>, String> {
                 .filter(|line| !line.is_empty())
             {
                 let info = idevice_info(serial).await.unwrap_or_default();
-                ios_candidates.insert(
-                    serial.to_string(),
-                    (
-                        info.get("DeviceName")
-                            .cloned()
-                            .unwrap_or_else(|| "iPhone / iOS".into()),
-                        "usb".into(),
-                    ),
-                );
+                wired_ios.push(DeviceSummary {
+                    platform: "ios".into(),
+                    serial: serial.to_string(),
+                    status: "device".into(),
+                    model: info
+                        .get("DeviceName")
+                        .cloned()
+                        .unwrap_or_else(|| "iPhone / iOS".into()),
+                    product: info
+                        .get("ProductType")
+                        .cloned()
+                        .unwrap_or_else(|| "iOS".into()),
+                    device: "iphone".into(),
+                    transport_id: Some("usb".into()),
+                });
             }
         }
     }
-    if let Ok(frida_devices) = Command::new("frida-ls-devices").output().await {
+    // A real usbmuxd device is authoritative even when frida-server is absent or
+    // version-mismatched. Device inventory must not disappear merely because a
+    // runtime instrumentation channel is temporarily unavailable.
+    if !wired_ios.is_empty() {
+        devices.extend(wired_ios);
+    } else if let Ok(frida_devices) = bounded_command_output("frida-ls-devices", &[]).await {
+        let mut ios_candidates: HashMap<String, (String, String)> = HashMap::new();
         if frida_devices.status.success() {
             for line in String::from_utf8_lossy(&frida_devices.stdout)
                 .lines()
@@ -447,26 +489,26 @@ async fn list_devices() -> Result<Vec<DeviceSummary>, String> {
                     .or_insert((name, fields[1].to_string()));
             }
         }
-    }
-    for (serial, (model, transport)) in ios_candidates {
-        let (reachable, mismatch) = probe_frida_device(&serial).await;
-        if !reachable {
-            continue;
+        for (serial, (model, transport)) in ios_candidates {
+            let (reachable, mismatch) = probe_frida_device(&serial).await;
+            if !reachable {
+                continue;
+            }
+            let model = if mismatch {
+                format!("{model} · Frida 版本需对齐")
+            } else {
+                model
+            };
+            devices.push(DeviceSummary {
+                platform: "ios".into(),
+                serial,
+                status: "frida".into(),
+                model,
+                product: "iOS".into(),
+                device: "iphone".into(),
+                transport_id: Some(transport),
+            });
         }
-        let model = if mismatch {
-            format!("{model} · Frida 版本需对齐")
-        } else {
-            model
-        };
-        devices.push(DeviceSummary {
-            platform: "ios".into(),
-            serial,
-            status: "frida".into(),
-            model,
-            product: "iOS".into(),
-            device: "iphone".into(),
-            transport_id: Some(transport),
-        });
     }
     // A wired Android connection has priority over wireless Frida/iOS
     // discovery. This prevents stale remote iOS entries from being selected
@@ -696,6 +738,16 @@ async fn run_adb_action(request: AdbActionRequest) -> Result<CommandResult, Stri
                 "f",
             ]
         }
+        "install_apk" => {
+            if argument.is_empty() {
+                return Err("请选择要安装的 APK 文件".into());
+            }
+            vec!["install", "-r", argument.as_str()]
+        }
+        "uninstall_apk" => {
+            validate_package_name(&argument)?;
+            vec!["uninstall", argument.as_str()]
+        }
         _ => return Err("不支持该操作；后端只执行预定义的安全 ADB 指令".into()),
     };
     let root_script = match request.action.as_str() {
@@ -705,11 +757,6 @@ async fn run_adb_action(request: AdbActionRequest) -> Result<CommandResult, Stri
     };
     let output = if let Some(script) = root_script {
         run_device_root_script(&request.serial, script).await?
-    } else if tail.first() == Some(&"shell")
-        && request.action != "reboot"
-        && request.action != "recovery"
-    {
-        run_device_root(&request.serial, &tail[1..]).await?
     } else {
         run_device_adb(&request.serial, &tail).await?
     };
@@ -722,15 +769,6 @@ async fn run_adb_action(request: AdbActionRequest) -> Result<CommandResult, Stri
     };
     let command_display = if let Some(script) = root_script {
         format!("adb -s {} shell \"su -c '{}'\"", request.serial, script)
-    } else if tail.first() == Some(&"shell")
-        && request.action != "reboot"
-        && request.action != "recovery"
-    {
-        format!(
-            "adb -s {} shell \"su -c '{}'\"",
-            request.serial,
-            tail[1..].join(" ")
-        )
     } else {
         format!("adb -s {} {}", request.serial, tail.join(" "))
     };
@@ -746,242 +784,137 @@ async fn run_adb_action(request: AdbActionRequest) -> Result<CommandResult, Stri
     })
 }
 
-fn now_millis() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PullFilesRequest {
+    serial: String,
+    remote_path: String,
+    local_dir: String,
 }
 
-fn signal_value(signal: &PhoneSignal) -> String {
-    signal
-        .payload
-        .get("status")
-        .or_else(|| signal.payload.get("value"))
-        .and_then(Value::as_str)
-        .unwrap_or(&signal.value)
-        .trim()
-        .to_ascii_lowercase()
-}
-
-fn evaluate_signal(signal: &PhoneSignal) -> SignalDecision {
-    let kind = signal.kind.trim().to_ascii_lowercase();
-    let value = signal_value(signal);
-    let signal_id = if signal.id.is_empty() {
-        format!("sig-{}", now_millis())
-    } else {
-        signal.id.clone()
-    };
-
-    let (accepted, decision, risk_level, message) = match kind.as_str() {
-        "heartbeat" => (true, "allow", "info", "设备心跳正常".to_string()),
-        "integrity"
-            if ["rooted", "tampered", "compromised", "failed"].contains(&value.as_str()) =>
-        {
-            (
-                false,
-                "block",
-                "critical",
-                format!("设备完整性异常：{value}"),
-            )
-        }
-        "integrity" => (true, "allow", "low", "设备完整性检查通过".to_string()),
-        "risk_score" => {
-            let score = signal
-                .payload
-                .get("score")
-                .and_then(Value::as_f64)
-                .or_else(|| signal.value.parse::<f64>().ok())
-                .unwrap_or(0.0);
-            if score >= 80.0 {
-                (
-                    false,
-                    "block",
-                    "critical",
-                    format!("风险分 {score:.0}，已阻断"),
-                )
-            } else if score >= 50.0 {
-                (
-                    true,
-                    "review",
-                    "medium",
-                    format!("风险分 {score:.0}，需要复核"),
-                )
-            } else {
-                (true, "allow", "low", format!("风险分 {score:.0}，允许继续"))
-            }
-        }
-        "alert" => (
-            true,
-            "review",
-            "medium",
-            if signal.value.is_empty() {
-                "收到安卓告警".into()
-            } else {
-                signal.value.clone()
-            },
-        ),
-        "event" | "app_event" => (true, "allow", "info", "应用事件已接收".to_string()),
-        _ => (
-            true,
-            "record",
-            "info",
-            format!("已记录信号类型：{}", signal.kind),
-        ),
-    };
-
-    SignalDecision {
-        signal_id,
-        accepted,
-        decision: decision.into(),
-        risk_level: risk_level.into(),
-        message,
-        received_at: now_millis(),
-    }
-}
-
-async fn handle_signal_client(stream: TcpStream, app: AppHandle) -> Result<(), String> {
-    let peer = stream.peer_addr().ok();
-    let (reader, mut writer) = stream.into_split();
-    let mut reader = BufReader::new(reader);
-    let mut buffer = String::new();
-
-    loop {
-        buffer.clear();
-        let bytes = (&mut reader)
-            .take(65_537)
-            .read_line(&mut buffer)
-            .await
-            .map_err(|error| error.to_string())?;
-        if bytes == 0 {
-            break;
-        }
-        let response = if bytes > 65_536 {
-            SignalDecision {
-                signal_id: String::new(),
-                accepted: false,
-                decision: "reject".into(),
-                risk_level: "high".into(),
-                message: "单条信号不能超过 64KB".into(),
-                received_at: now_millis(),
-            }
-        } else {
-            match serde_json::from_str::<PhoneSignal>(buffer.trim()) {
-                Ok(mut signal) => {
-                    if signal.device_id.is_empty() {
-                        signal.device_id = peer.map(|value| value.to_string()).unwrap_or_default();
-                    }
-                    let decision = evaluate_signal(&signal);
-                    let event = SignalEvent {
-                        signal,
-                        decision: decision.clone(),
-                    };
-                    let _ = app.emit("phone-signal", event);
-                    decision
-                }
-                Err(error) => SignalDecision {
-                    signal_id: String::new(),
-                    accepted: false,
-                    decision: "reject".into(),
-                    risk_level: "high".into(),
-                    message: format!("JSON 格式错误：{error}"),
-                    received_at: now_millis(),
-                },
-            }
-        };
-        let mut encoded = serde_json::to_vec(&response).map_err(|error| error.to_string())?;
-        encoded.push(b'\n');
-        writer
-            .write_all(&encoded)
-            .await
-            .map_err(|error| error.to_string())?;
-        if bytes > 65_536 {
-            break;
-        }
-    }
-    Ok(())
-}
-
-async fn serve_signal_bridge(listener: TcpListener, app: AppHandle, running: Arc<AtomicBool>) {
-    loop {
-        match listener.accept().await {
-            Ok((stream, _)) => {
-                let app = app.clone();
-                tauri::async_runtime::spawn(async move {
-                    let _ = handle_signal_client(stream, app).await;
-                });
-            }
-            Err(_) => {
-                running.store(false, Ordering::SeqCst);
-                break;
-            }
-        }
-    }
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PushFileRequest {
+    serial: String,
+    local_path: String,
 }
 
 #[tauri::command]
-async fn start_signal_bridge(
-    serial: String,
-    app: AppHandle,
-    state: State<'_, BridgeState>,
-) -> Result<BridgeStatus, String> {
-    ensure_success(
-        run_device_adb(
-            &serial,
-            &[
-                "reverse",
-                &format!("tcp:{BRIDGE_PORT}"),
-                &format!("tcp:{BRIDGE_PORT}"),
-            ],
-        )
-        .await?,
-    )?;
-
-    if state
-        .running
-        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-        .is_ok()
-    {
-        let listener = TcpListener::bind(("127.0.0.1", BRIDGE_PORT))
-            .await
-            .map_err(|error| {
-                state.running.store(false, Ordering::SeqCst);
-                format!("无法启动信号服务：{error}")
-            })?;
-        let app = app.clone();
-        let running = Arc::clone(&state.running);
-        tauri::async_runtime::spawn(serve_signal_bridge(listener, app, running));
+async fn pull_device_files(request: PullFilesRequest) -> Result<CommandResult, String> {
+    if request.remote_path.trim().is_empty() {
+        return Err("远程路径不能为空".into());
     }
-
-    Ok(BridgeStatus {
-        running: true,
-        port: BRIDGE_PORT,
-        endpoint: format!("127.0.0.1:{BRIDGE_PORT}"),
+    if request.local_dir.trim().is_empty() {
+        return Err("本地目录不能为空".into());
+    }
+    std::fs::create_dir_all(&request.local_dir)
+        .map_err(|error| format!("无法创建本地目录 {}：{error}", request.local_dir))?;
+    let mut command = Command::new("adb");
+    command
+        .args([
+            "-s",
+            request.serial.as_str(),
+            "pull",
+            request.remote_path.as_str(),
+            request.local_dir.as_str(),
+        ])
+        .kill_on_drop(true);
+    let output = timeout(Duration::from_secs(300), command.output())
+        .await
+        .map_err(|_| "拉取超时（300 秒）".to_string())?
+        .map_err(|error| format!("无法启动 adb：{error}"))?;
+    let success = output.status.success();
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    let text = match (stdout.is_empty(), stderr.is_empty()) {
+        (false, false) => format!("{stdout}\n{stderr}"),
+        (false, true) => stdout,
+        (true, false) => stderr,
+        (true, true) => String::new(),
+    };
+    Ok(CommandResult {
+        success,
+        command: format!(
+            "adb -s {} pull {} {}",
+            request.serial, request.remote_path, request.local_dir
+        ),
+        output: if text.is_empty() {
+            "拉取完成".into()
+        } else {
+            text
+        },
+        exit_code: output.status.code(),
     })
 }
 
 #[tauri::command]
-fn get_bridge_status(state: State<'_, BridgeState>) -> BridgeStatus {
-    BridgeStatus {
-        running: state.running.load(Ordering::SeqCst),
-        port: BRIDGE_PORT,
-        endpoint: format!("127.0.0.1:{BRIDGE_PORT}"),
+async fn push_device_file(request: PushFileRequest) -> Result<CommandResult, String> {
+    let local_path = std::path::Path::new(request.local_path.trim());
+    if !local_path.is_file() {
+        return Err("请选择一个存在的本地文件".into());
     }
+    let file_name = local_path
+        .file_name()
+        .and_then(std::ffi::OsStr::to_str)
+        .filter(|value| !value.is_empty())
+        .ok_or("无法解析本地文件名")?;
+    let remote_path = format!("/storage/emulated/0/Download/{file_name}");
+    let mut command = Command::new("adb");
+    command
+        .args([
+            "-s",
+            request.serial.as_str(),
+            "push",
+            request.local_path.as_str(),
+            remote_path.as_str(),
+        ])
+        .kill_on_drop(true);
+    let output = timeout(Duration::from_secs(300), command.output())
+        .await
+        .map_err(|_| "推送超时（300 秒）".to_string())?
+        .map_err(|error| format!("无法启动 adb：{error}"))?;
+    let success = output.status.success();
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    let text = match (stdout.is_empty(), stderr.is_empty()) {
+        (false, false) => format!("{stdout}\n{stderr}"),
+        (false, true) => stdout,
+        (true, false) => stderr,
+        (true, true) => String::new(),
+    };
+    Ok(CommandResult {
+        success,
+        command: format!(
+            "adb -s {} push {} {}",
+            request.serial, request.local_path, remote_path
+        ),
+        output: if text.is_empty() {
+            format!("已推送到 {remote_path}")
+        } else {
+            text
+        },
+        exit_code: output.status.code(),
+    })
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let _ = advanced::initialize_host_environment(None);
+    if let Err(error) = prewarm_adb_server() {
+        eprintln!("MobileE ADB prewarm failed: {error}");
+    }
     tauri::Builder::default()
-        .manage(BridgeState::default())
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
+        .manage(monitoring::MirrorSessionState::default())
         .invoke_handler(tauri::generate_handler![
             list_devices,
             get_ios_device_details,
             get_device_details,
             list_processes,
             run_adb_action,
+            pull_device_files,
+            push_device_file,
             advanced::inspect_environment,
             advanced::configure_host_environment,
             advanced::run_shell,
@@ -991,6 +924,7 @@ pub fn run() {
             advanced::list_frida_processes,
             advanced::list_frida_scripts,
             advanced::run_frida_script,
+            advanced::confirm_anti_instrumentation,
             advanced::run_dex_dump,
             advanced::run_so_dump,
             advanced::run_ios_dump,
@@ -1000,8 +934,46 @@ pub fn run() {
             advanced::open_environment_terminal,
             advanced::mount_ios_developer_image,
             advanced::analyze_app,
-            start_signal_bridge,
-            get_bridge_status,
+            advanced::export_analysis_html,
+            advanced::export_analysis_html_compact,
+            advanced::export_sensitive_value,
+            advanced::save_analysis_case,
+            advanced::load_analysis_case,
+            advanced::compare_analysis_case,
+            advanced::list_ai_task_templates,
+            advanced::list_task_templates,
+            advanced::list_knowledge,
+            advanced::add_pattern,
+            advanced::merge_pattern,
+            advanced::export_knowledge,
+            advanced::import_knowledge,
+            advanced::list_rules,
+            advanced::list_exclusions,
+            advanced::merge_exclusion,
+            advanced::build_ai_context_pack,
+            advanced::export_ai_context_pack,
+            advanced::validate_ai_analysis_result,
+            advanced::test_ai_provider,
+            advanced::run_ai_security_review,
+            config::load_app_config,
+            config::save_app_config,
+            monitoring::probe_android_monitor_capabilities,
+            monitoring::provision_latest_kernsight_agent,
+            monitoring::get_kernsight_overview,
+            monitoring::get_kernsight_session_report,
+            monitoring::cleanup_kernsight_session,
+            monitoring::get_kernsight_session_events,
+            monitoring::start_kernsight_capture,
+            monitoring::start_kernsight_mirror,
+            monitoring::stop_kernsight_mirror,
+            monitoring::kernsight_mirror_status,
+            monitoring::dump_kernsight_package,
+            monitoring::list_kernsight_package_dumps,
+            monitoring::read_kernsight_package_file,
+            monitoring::import_kernsight_evidence_directory,
+            monitoring::pull_kernsight_package_evidence,
+            monitoring::read_local_kernsight_evidence_file,
+            monitoring::cleanup_kernsight_package_dump,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
@@ -1010,18 +982,6 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::json;
-
-    fn signal(kind: &str, value: &str, payload: Value) -> PhoneSignal {
-        PhoneSignal {
-            id: "test-1".into(),
-            device_id: "pixel".into(),
-            kind: kind.into(),
-            value: value.into(),
-            timestamp: None,
-            payload,
-        }
-    }
 
     #[test]
     fn parses_android_properties() {
@@ -1064,21 +1024,5 @@ mod tests {
             "{}",
             output.stdout
         );
-    }
-
-    #[test]
-    fn blocks_compromised_integrity() {
-        let decision = evaluate_signal(&signal("integrity", "rooted", Value::Null));
-        assert!(!decision.accepted);
-        assert_eq!(decision.decision, "block");
-        assert_eq!(decision.risk_level, "critical");
-    }
-
-    #[test]
-    fn sends_medium_score_to_review() {
-        let decision = evaluate_signal(&signal("risk_score", "", json!({ "score": 67 })));
-        assert!(decision.accepted);
-        assert_eq!(decision.decision, "review");
-        assert_eq!(decision.risk_level, "medium");
     }
 }

@@ -2,7 +2,9 @@
 'use strict';
 
 const TARGET_PACKAGE = '__ME_PACKAGE__';
-const OUTPUT_DIR = `/data/user/0/${TARGET_PACKAGE}/files/dump_so_${TARGET_PACKAGE}`;
+// Use the app's scoped external directory so recovery still works when an
+// enforcing SELinux policy blocks Magisk root from reading /data/data.
+const OUTPUT_DIR = `/sdcard/Android/data/${TARGET_PACKAGE}/files/dump_so_${TARGET_PACKAGE}`;
 const dumped = new Set();
 
 function libcFunction(name, returnType, argumentTypes) {
@@ -33,7 +35,11 @@ function dumpModule(module) {
   ensureDirectory(OUTPUT_DIR);
   const prefix = `${OUTPUT_DIR}/${safeName(module.name)}_${module.base}_${module.size}`;
   try {
-    const ranges = module.enumerateRanges('r--');
+    // ELF code normally lives in r-x mappings. Capture every readable mapping
+    // so PT_LOAD reconstruction has both headers/data and executable .text.
+    const ranges = ['r--', 'r-x', 'rw-', 'rwx'].flatMap(function (protection) {
+      try { return module.enumerateRanges(protection); } catch (_) { return []; }
+    }).sort(function (left, right) { return left.base.compare(right.base); });
     const manifest = { name: module.name, path: module.path, base: module.base.toString(), size: module.size, ranges: [] };
     ranges.forEach((range, index) => {
       const relativeOffset = range.base.sub(module.base).toString();

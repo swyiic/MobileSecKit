@@ -1,0 +1,831 @@
+/*
+ * Codex light theme.
+ *
+ * MobileE was originally designed as a dark-only interface, so a number of
+ * feature views still carry dark surface colours in scoped styles. Keep the
+ * light palette in one final cascade layer instead of scattering overrides
+ * through every view.
+ */
+:root[data-theme='light'] {
+  color-scheme: light;
+  --bg: #f5f7fa;
+  --surface: #ffffff;
+  --surface-soft: #f3f6fa;
+  --surface-glass: rgba(255, 255, 255, 0.94);
+  --line: #d8e0ea;
+  --line-strong: #b9c5d3;
+  --text: #182230;
+  --muted: #536176;
+  --primary: #175cd3;
+  --primary-soft: #e8f0ff;
+  --green: #067647;
+  --amber: #8a4b00;
+  --red: #b42318;
+  background: var(--bg);
+  color: var(--text);
+}
+
+:root[data-theme='light'] body {
+  color: var(--text);
+  background: #f5f7fa;
+}
+
+:root[data-theme='light'] .app-header,
+:root[data-theme='light'] .workspace-sidebar {
+  background: #ffffff;
+}
+
+:root[data-theme='light'] .workspace-main {
+  background: #f5f7fa;
+}
+
+:root[data-theme='light'] .panel {
+  color: var(--text);
+  border-color: var(--line);
+  background: #ffffff;
+  box-shadow: 0 12px 32px rgba(15, 23, 42, 0.07);
+}
+
+/* Navigation uses its own stronger text scale in daylight. */
+:root[data-theme='light'] .workspace-context span,
+:root[data-theme='light'] .eyebrow {
+  color: #45617f;
+}
+
+:root[data-theme='light'] .nav-parent {
+  color: #344054;
+}
+
+:root[data-theme='light'] .nav-parent > .material-symbols-outlined {
+  color: #3e628f;
+}
+
+:root[data-theme='light'] .nav-parent > span small,
+:root[data-theme='light'] .nav-children button {
+  color: #5d6b7e;
+}
+
+:root[data-theme='light'] .nav-parent:hover,
+:root[data-theme='light'] .nav-parent.active,
+:root[data-theme='light'] .nav-children button:hover,
+:root[data-theme='light'] .nav-children button.active {
+  color: #123d73;
+  background: #eaf1fc;
+}
+
+:root[data-theme='light'] .nav-cluster.active {
+  border-color: #d7e2f0;
+  background: #f5f8fc;
+}
+
+:root[data-theme='light'] .nav-parent > b,
+:root[data-theme='light'] .nav-parent > em {
+  color: #184f98;
+  background: #e2edff;
+}
+
+:root[data-theme='light'] .runtime-nav .nav-parent > em {
+  color: #067647;
+  background: #e5f6ee;
+}
+
+/* Controls must not inherit black fields or pale dark-theme text. */
+:root[data-theme='light'] input,
+:root[data-theme='light'] select,
+:root[data-theme='light'] textarea,
+:root[data-theme='light'] .form-grid input,
+:root[data-theme='light'] .form-grid select,
+:root[data-theme='light'] .proxy-grid input,
+:root[data-theme='light'] .mirror-grid input,
+:root[data-theme='light'] .certificate-row input,
+:root[data-theme='light'] .shell-row input,
+:root[data-theme='light'] .collect-row input,
+:root[data-theme='light'] .analyzer-path-row input,
+:root[data-theme='light'] .settings-field input,
+:root[data-theme='light'] .settings-field select,
+:root[data-theme='light'] .settings-field textarea {
+  color: #182230;
+  border-color: #b9c5d3;
+  background: #ffffff;
+}
+
+:root[data-theme='light'] input::placeholder,
+:root[data-theme='light'] textarea::placeholder {
+  color: #697586;
+  opacity: 1;
+}
+
+:root[data-theme='light'] select option,
+:root[data-theme='light'] select optgroup {
+  color: #182230;
+  background: #ffffff;
+}
+
+:root[data-theme='light'] .search-box,
+:root[data-theme='light'] .rule-search {
+  background: #ffffff;
+}
+
+:root[data-theme='light'] .ghost-button {
+  color: #344054;
+  border-color: #d0d8e3;
+  background: #ffffff;
+}
+
+:root[data-theme='light'] button:disabled {
+  opacity: 1;
+}
+
+:root[data-theme='light'] .primary-button:disabled {
+  color: #667085;
+  border-color: #d0d8e3;
+  border-style: dashed;
+  background: #f8fafc;
+  box-shadow: none;
+}
+
+:root[data-theme='light'] .ghost-button:disabled {
+  color: #66758a;
+  border-color: #d0d8e3;
+  border-style: dashed;
+  background: #f8fafc;
+}
+
+/* Daylight surfaces: remove dark translucent blocks and flat grey fields. */
+:root[data-theme='light'] .quick-action-grid button {
+  color: #243247;
+  border-color: #ced8e5;
+  background: #ffffff;
+}
+
+:root[data-theme='light'] .quick-action-grid button:disabled {
+  color: #526176;
+  border-color: #d7dee8;
+  background: #ffffff;
+}
+
+:root[data-theme='light'] .drop-zone > .material-symbols-outlined,
+:root[data-theme='light'] .quick-action-grid button > .material-symbols-outlined {
+  color: #175cd3;
+}
+
+:root[data-theme='light'] .transfer-workflows > article,
+:root[data-theme='light'] .analyzer-placeholder,
+:root[data-theme='light'] .runtime-readiness,
+:root[data-theme='light'] .runtime-step-button,
+:root[data-theme='light'] .configured-path,
+:root[data-theme='light'] .analyzer-config-summary,
+:root[data-theme='light'] .settings-toggle,
+:root[data-theme='light'] .coverage-grid > div,
+:root[data-theme='light'] .verification-recipes > article,
+:root[data-theme='light'] .masvs-grid > article,
+:root[data-theme='light'] .anti-candidate-group,
+:root[data-theme='light'] .analyzer-flow-preview article {
+  color: #243247;
+  border-color: #d8e0ea;
+  background: #f8fafc;
+}
+
+:root[data-theme='light'] .file-facts > div,
+:root[data-theme='light'] .spec-grid > div,
+:root[data-theme='light'] .app-summary-grid > div,
+:root[data-theme='light'] .probe-facts > span,
+:root[data-theme='light'] .ks-report-summary > span {
+  color: #243247;
+  background: #f8fafc;
+}
+
+:root[data-theme='light'] .spec-grid strong,
+:root[data-theme='light'] .spec-grid code,
+:root[data-theme='light'] .app-summary-grid strong,
+:root[data-theme='light'] .configured-path code,
+:root[data-theme='light'] .analyzer-config-summary code {
+  color: #263b56;
+}
+
+:root[data-theme='light'] .summary-details {
+  color: #263b56;
+}
+
+:root[data-theme='light'] .summary-details summary {
+  color: #263b56;
+  background: transparent;
+}
+
+:root[data-theme='light'] .summary-details p {
+  color: #344054;
+  border-color: #cbd5e1;
+  background: #f2f6fb;
+}
+
+/* Runtime and analysis results contain scoped dark-only cards. */
+:root[data-theme='light'] .content-area article,
+:root[data-theme='light'] .content-area details,
+:root[data-theme='light'] .ks-data-table article,
+:root[data-theme='light'] .ks-event-list details,
+:root[data-theme='light'] .ks-lifecycle-grid article,
+:root[data-theme='light'] .ks-dns-list article,
+:root[data-theme='light'] .ks-dump-summary-list > article,
+:root[data-theme='light'] .ks-artifact-table > div,
+:root[data-theme='light'] .ks-dex-set-list > article,
+:root[data-theme='light'] .ks-plaintext-list article,
+:root[data-theme='light'] .ks-edge-list article,
+:root[data-theme='light'] .ks-intelligence-grid article,
+:root[data-theme='light'] .review-patterns article,
+:root[data-theme='light'] .rule-card,
+:root[data-theme='light'] .anti-panel,
+:root[data-theme='light'] .ks-runtime-join,
+:root[data-theme='light'] .ks-runtime-facts > article,
+:root[data-theme='light'] .anti-candidate-group {
+  color: #243247;
+  border-color: #d8e0ea;
+  background: #ffffff;
+}
+
+:root[data-theme='light'] .ks-runtime-join {
+  background: #f3f7fd;
+}
+
+:root[data-theme='light'] .ks-runtime-facts code,
+:root[data-theme='light'] .candidate-signal {
+  color: #174ea6;
+}
+
+:root[data-theme='light'] .anti-evidence pre {
+  color: #263b56;
+  border-color: #cbd5e1;
+  background: #f3f6fa;
+}
+
+:root[data-theme='light'] .content-area p,
+:root[data-theme='light'] .content-area small,
+:root[data-theme='light'] .content-area dt,
+:root[data-theme='light'] .content-area label > span,
+:root[data-theme='light'] .settings-body p,
+:root[data-theme='light'] .settings-body small {
+  color: #526176;
+}
+
+:root[data-theme='light'] .content-area h1,
+:root[data-theme='light'] .content-area h2,
+:root[data-theme='light'] .content-area h3,
+:root[data-theme='light'] .content-area strong,
+:root[data-theme='light'] .settings-drawer h2,
+:root[data-theme='light'] .settings-drawer h3,
+:root[data-theme='light'] .settings-drawer strong {
+  color: #182230;
+}
+
+/* Device tools and Frida controls use clean surfaces instead of grey blocks. */
+:root[data-theme='light'] .proxy-actions,
+:root[data-theme='light'] .frida-form-grid,
+:root[data-theme='light'] .dex-workflow {
+  color: #243247;
+}
+
+:root[data-theme='light'] .frida-form-grid input,
+:root[data-theme='light'] .frida-form-grid select,
+:root[data-theme='light'] .dex-workflow input {
+  color: #182230;
+  border-color: #b9c5d3;
+  background: #ffffff;
+}
+
+:root[data-theme='light'] .dex-workflow {
+  border-color: #a9dcc7;
+  background: #f3fbf7;
+}
+
+:root[data-theme='light'] .so-workflow {
+  border-color: #b7cef2;
+  background: #f3f7fd;
+}
+
+:root[data-theme='light'] .dex-workflow strong {
+  color: #075e3b;
+}
+
+:root[data-theme='light'] .so-workflow strong {
+  color: #174ea6;
+}
+
+/* Expanded sensitive evidence remains a light surface in the light theme. */
+:root[data-theme='light'] .sensitive-detail,
+:root[data-theme='light'] .sensitive-detail-row {
+  color: #243247;
+  border-color: #cbd5e1;
+  background: #ffffff;
+}
+
+:root[data-theme='light'] .sensitive-detail header strong {
+  color: #182230;
+}
+
+:root[data-theme='light'] .sensitive-detail header code,
+:root[data-theme='light'] .sensitive-context summary {
+  color: #31557e;
+}
+
+:root[data-theme='light'] .sensitive-detail p {
+  color: #526176;
+}
+
+:root[data-theme='light'] .sensitive-detail-actions span {
+  color: #7a4200;
+}
+
+:root[data-theme='light'] .sensitive-detail pre,
+:root[data-theme='light'] .sensitive-detail .sensitive-full-value,
+:root[data-theme='light'] .sensitive-context pre {
+  color: #263b56;
+  border-color: #cbd5e1;
+  background: #f3f6fa;
+}
+
+:root[data-theme='light'] .sensitive-detail .icon-button {
+  color: #344054;
+  border-color: #b9c5d3;
+  background: #ffffff;
+}
+
+:root[data-theme='light'] .sensitive-detail .icon-button:hover {
+  color: #123d73;
+  background: #edf4ff;
+}
+
+/* Data Flow filter bar. */
+:root[data-theme='light'] .flow-toolbar {
+  border-color: #cbd5e1;
+  background: #ffffff;
+}
+
+:root[data-theme='light'] .flow-toolbar label,
+:root[data-theme='light'] .flow-toolbar select {
+  color: #243247;
+  border-color: #cbd5e1;
+  background: #f8fafc;
+}
+
+:root[data-theme='light'] .flow-toolbar input {
+  color: #182230;
+}
+
+:root[data-theme='light'] .flow-toolbar-note {
+  color: #526176;
+}
+
+/* KernSight probe and capture controls. */
+:root[data-theme='light'] .capability-check-grid article,
+:root[data-theme='light'] .ks-presets button,
+:root[data-theme='light'] .ks-sensor-switches label,
+:root[data-theme='light'] .ks-capture-plan > div,
+:root[data-theme='light'] .ks-capture-plan > details,
+:root[data-theme='light'] .ks-integrity-strip article,
+:root[data-theme='light'] .ks-network-summary span,
+:root[data-theme='light'] .ks-semantic-list dl > div,
+:root[data-theme='light'] .ks-dump-summary-list dl > div {
+  color: #243247;
+  border-color: #d8e0ea;
+  background: #ffffff;
+}
+
+:root[data-theme='light'] .ks-backbone-list article,
+:root[data-theme='light'] .ks-command-card,
+:root[data-theme='light'] .ks-forensic-grid > article,
+:root[data-theme='light'] .ks-command-catalog,
+:root[data-theme='light'] .ks-command-grid > article,
+:root[data-theme='light'] .ks-evidence-policy > article,
+:root[data-theme='light'] .ks-backbone-note,
+:root[data-theme='light'] .ks-evidence-browser,
+:root[data-theme='light'] .ks-evidence-file-list button,
+:root[data-theme='light'] .ks-evidence-preview,
+:root[data-theme='light'] .ks-chain-rail > button,
+:root[data-theme='light'] .ks-chain-stage,
+:root[data-theme='light'] .ks-dump-join > article,
+:root[data-theme='light'] .ks-token-chips span {
+  color: #243247;
+  border-color: #d8e0ea;
+  background: #ffffff;
+}
+
+:root[data-theme='light'] .ks-chain-rail > button:hover,
+:root[data-theme='light'] .ks-chain-rail > button.active {
+  color: #174ea6;
+  border-color: #8fb3e8;
+  background: #edf4ff;
+}
+
+:root[data-theme='light'] .ks-chain-rail > button > small,
+:root[data-theme='light'] .ks-dump-join small,
+:root[data-theme='light'] .ks-dump-join span {
+  color: #526176;
+}
+
+:root[data-theme='light'] .ks-gap-stage {
+  border-color: #ead7a6;
+  background: #fff8e8;
+}
+
+:root[data-theme='light'] .ks-gap-list {
+  color: #7a4200;
+}
+
+:root[data-theme='light'] .ks-path > li,
+:root[data-theme='light'] .ks-path-more,
+:root[data-theme='light'] .ks-case-head,
+:root[data-theme='light'] .ks-flow-card {
+  color: #243247;
+  border-color: #d8e0ea;
+  background: #ffffff;
+}
+
+:root[data-theme='light'] .ks-flow-card dd {
+  color: #344054;
+}
+
+:root[data-theme='light'] .ks-flow-card code {
+  color: #8a4b00;
+}
+
+:root[data-theme='light'] .ks-path > li.prio-focus,
+:root[data-theme='light'] .ks-analyzable-list > button.prio-focus,
+:root[data-theme='light'] .ks-evidence-file-list > button.prio-focus,
+:root[data-theme='light'] .ks-plaintext-list > article.prio-focus {
+  border-color: #e3b341;
+  background: #fff8e1;
+}
+
+:root[data-theme='light'] .ks-path-legend {
+  color: #526176;
+}
+
+:root[data-theme='light'] .ks-workspace-switcher > button,
+:root[data-theme='light'] .ks-code-evidence,
+:root[data-theme='light'] .ks-analyzable-list > button,
+:root[data-theme='light'] .ks-artifact-focus,
+:root[data-theme='light'] .ks-artifact-focus dl > div,
+:root[data-theme='light'] .ks-artifact-chain article,
+:root[data-theme='light'] .ks-selected-package-bar {
+  color: #243247;
+  border-color: #d8e0ea;
+  background: #ffffff;
+}
+
+:root[data-theme='light'] .ks-workspace-switcher > button:hover,
+:root[data-theme='light'] .ks-workspace-switcher > button.active,
+:root[data-theme='light'] .ks-analyzable-list > button:hover,
+:root[data-theme='light'] .ks-analyzable-list > button.active,
+:root[data-theme='light'] .ks-forensic-grid > article:hover,
+:root[data-theme='light'] .ks-forensic-grid > article.active {
+  color: #174ea6;
+  border-color: #8fb3e8;
+  background: #edf4ff;
+}
+
+:root[data-theme='light'] .ks-workspace-switcher small,
+:root[data-theme='light'] .ks-code-evidence header small,
+:root[data-theme='light'] .ks-analyzable-list span small,
+:root[data-theme='light'] .ks-analyzable-list em,
+:root[data-theme='light'] .ks-selected-package-bar span {
+  color: #526176;
+}
+
+:root[data-theme='light'] .ks-command-grid code,
+:root[data-theme='light'] .ks-backbone-list code,
+:root[data-theme='light'] .ks-forensic-grid small {
+  color: #31557e;
+}
+
+:root[data-theme='light'] .ks-evidence-file-list button:hover,
+:root[data-theme='light'] .ks-evidence-file-list button.active {
+  color: #174ea6;
+  border-color: #8fb3e8;
+  background: #edf4ff;
+}
+
+:root[data-theme='light'] .ks-evidence-preview pre {
+  color: #263b56;
+  border-color: #cbd5e1;
+  background: #f3f6fa;
+}
+
+:root[data-theme='light'] .ks-presets button:hover,
+:root[data-theme='light'] .ks-sensor-switches label:has(input:checked) {
+  color: #174ea6;
+  border-color: #8fb3e8;
+  background: #edf4ff;
+}
+
+:root[data-theme='light'] .ks-presets small,
+:root[data-theme='light'] .ks-sensor-switches label,
+:root[data-theme='light'] .ks-capture-plan small,
+:root[data-theme='light'] .probe-facts small {
+  color: #526176;
+}
+
+:root[data-theme='light'] .probe-facts strong,
+:root[data-theme='light'] .ks-capture-plan strong {
+  color: #182230;
+}
+
+:root[data-theme='light'] .ks-capture-form input,
+:root[data-theme='light'] .ks-capture-form select,
+:root[data-theme='light'] .ks-event-toolbar input,
+:root[data-theme='light'] .ks-event-toolbar select,
+:root[data-theme='light'] .ks-graph-toolbar input,
+:root[data-theme='light'] .ks-graph-toolbar select {
+  color: #182230;
+  border-color: #b9c5d3;
+  background: #ffffff;
+}
+
+:root[data-theme='light'] pre,
+:root[data-theme='light'] .code-detail,
+:root[data-theme='light'] .code-detail pre,
+:root[data-theme='light'] .rule-json pre,
+:root[data-theme='light'] .rule-code code,
+:root[data-theme='light'] .ks-plaintext-list pre,
+:root[data-theme='light'] .ks-ai-context,
+:root[data-theme='light'] .ks-event-list pre {
+  color: #263b56;
+  border-color: #ccd6e2;
+  background: #f3f6fa;
+}
+
+:root[data-theme='light'] code {
+  color: #31557e;
+}
+
+/* Terminal output remains visually distinct without becoming a black island. */
+:root[data-theme='light'] .terminal-panel,
+:root[data-theme='light'] .terminal-body {
+  color: #263b56;
+  border-color: #cbd5e1;
+  background: #f4f7fb;
+  box-shadow: none;
+}
+
+:root[data-theme='light'] .terminal-panel > header {
+  color: #344054;
+  border-bottom-color: #cbd5e1;
+  background: #e8edf3;
+}
+
+:root[data-theme='light'] .terminal-body pre,
+:root[data-theme='light'] .terminal-command {
+  color: #263b56;
+}
+
+/* Dialogs and drawers are true light surfaces. */
+:root[data-theme='light'] .settings-drawer,
+:root[data-theme='light'] .rule-drawer,
+:root[data-theme='light'] .knowledge-drawer,
+:root[data-theme='light'] .external-result-dialog {
+  color: #182230;
+  border-color: #cbd5e1;
+  background: #ffffff;
+  box-shadow: -20px 0 56px rgba(15, 23, 42, 0.15);
+}
+
+/* AI workbench has a purple dark-theme surface of its own. */
+:root[data-theme='light'] .ai-hero {
+  color: #182230;
+  border-color: #d5cef4;
+  background:
+    radial-gradient(circle at 92% 0, rgba(112, 83, 255, 0.10), transparent 38%),
+    #ffffff;
+}
+
+:root[data-theme='light'] .ai-state-legend,
+:root[data-theme='light'] .ai-config-panel,
+:root[data-theme='light'] .ai-main-panel,
+:root[data-theme='light'] .ai-result-lab,
+:root[data-theme='light'] .ai-source-strip > div,
+:root[data-theme='light'] .ai-pack-stats article,
+:root[data-theme='light'] .ai-evidence-card,
+:root[data-theme='light'] .ai-claims-grid > section,
+:root[data-theme='light'] .ai-next-observations,
+:root[data-theme='light'] .knowledge-stats article,
+:root[data-theme='light'] .knowledge-pattern-card {
+  color: #243247;
+  border-color: #d8e0ea;
+  background: #ffffff;
+}
+
+:root[data-theme='light'] .ai-state-legend {
+  background: #f7f6fc;
+}
+
+:root[data-theme='light'] .ai-state-legend span,
+:root[data-theme='light'] .ai-field,
+:root[data-theme='light'] .ai-inline-option,
+:root[data-theme='light'] .ai-provider-hint,
+:root[data-theme='light'] .ai-evidence-card p,
+:root[data-theme='light'] .ai-evidence-card dd {
+  color: #526176;
+}
+
+:root[data-theme='light'] .ai-field select,
+:root[data-theme='light'] .ai-field input[type='number'],
+:root[data-theme='light'] .ai-result-lab textarea,
+:root[data-theme='light'] .knowledge-toolbar label,
+:root[data-theme='light'] .knowledge-toolbar select {
+  color: #243247;
+  border-color: #b9c5d3;
+  background: #ffffff;
+}
+
+:root[data-theme='light'] .ai-evidence-card li,
+:root[data-theme='light'] .ai-chunk-tabs button,
+:root[data-theme='light'] .knowledge-pattern-card pre {
+  color: #40536b;
+  background: #f3f6fa;
+}
+
+:root[data-theme='light'] .settings-footer {
+  background: #f7f9fc;
+}
+
+:root[data-theme='light'] .header-menu {
+  color: #243247;
+  border-color: #cbd5e1;
+  background: #ffffff;
+  box-shadow: 0 18px 40px rgba(15, 23, 42, 0.14);
+}
+
+:root[data-theme='light'] .header-menu button {
+  color: #344054;
+}
+
+:root[data-theme='light'] .header-menu button:hover {
+  color: #123d73;
+  background: #edf4ff;
+}
+
+/* Semantic messages need darker foregrounds than their dark-theme variants. */
+:root[data-theme='light'] .notice {
+  color: #912018;
+  border-color: #e7aaa5;
+  background: #fcebea;
+}
+
+:root[data-theme='light'] .environment-startup-notice,
+:root[data-theme='light'] .runtime-guidance {
+  color: #174ea6;
+  border-color: #a9c7ef;
+  background: #edf4ff;
+}
+
+:root[data-theme='light'] .frida-notice {
+  color: #7a4200;
+  border-color: #e4bf83;
+  background: #fff6e5;
+}
+
+:root[data-theme='light'] .certificate-result {
+  color: #075e3b;
+  border-color: #9fd4bd;
+  background: #e9f7f0;
+}
+
+:root[data-theme='light'] .live-pill,
+:root[data-theme='light'] .battery-pill,
+:root[data-theme='light'] .device-chip {
+  color: #46566c;
+  background: #f3f6fa;
+}
+
+:root[data-theme='light'] .risk-critical,
+:root[data-theme='light'] .risk-high,
+:root[data-theme='light'] .status-blocked,
+:root[data-theme='light'] .runtime-blocked {
+  color: #b42318;
+}
+
+:root[data-theme='light'] .risk-medium,
+:root[data-theme='light'] .status-pending,
+:root[data-theme='light'] .runtime-pending {
+  color: #8a4b00;
+}
+
+:root[data-theme='light'] .risk-low,
+:root[data-theme='light'] .risk-info,
+:root[data-theme='light'] .status-passed,
+:root[data-theme='light'] .runtime-passed {
+  color: #067647;
+}
+
+/* Static Analysis leftovers that still hardcode dark-only surfaces. */
+:root[data-theme='light'] .help-dot {
+  color: #175cd3;
+  border-color: #a9c3eb;
+  background: #edf4ff;
+}
+
+:root[data-theme='light'] .inline-help,
+:root[data-theme='light'] .content-area .inline-help {
+  color: #344054;
+  border-color: #d8e0ea;
+  background: #f3f6fa;
+}
+
+:root[data-theme='light'] .analyzer-more-actions > div {
+  color: #243247;
+  border-color: #cbd5e1;
+  background: #ffffff;
+  box-shadow: 0 14px 36px rgba(15, 23, 42, 0.12);
+}
+
+:root[data-theme='light'] .analyzer-disclosure {
+  background: #ffffff;
+}
+
+:root[data-theme='light'] .analyzer-disclosure-body {
+  border-top-color: #e6edf5;
+}
+
+:root[data-theme='light'] .analyzer-disclosure-summary p,
+:root[data-theme='light'] .analyzer-disclosure-summary h3 small,
+:root[data-theme='light'] .disclosure-chevron {
+  color: #526176;
+}
+
+:root[data-theme='light'] .tag-list em,
+:root[data-theme='light'] .static-surface-grid em {
+  color: #66758a;
+}
+
+:root[data-theme='light'] .tag-list .risk-tag-high {
+  color: #b42318;
+  border-color: #e7aaa5;
+  background: #fcebea;
+}
+
+:root[data-theme='light'] .tag-list .risk-tag-review {
+  color: #8a4b00;
+  border-color: #e4bf83;
+  background: #fff6e5;
+}
+
+:root[data-theme='light'] .tag-list .risk-tag-normal {
+  color: #344054;
+  border-color: #d8e0ea;
+  background: #f8fafc;
+}
+
+:root[data-theme='light'] .analyzer-settings,
+:root[data-theme='light'] .analyzer-settings textarea {
+  color: #182230;
+  border-color: #d8e0ea;
+  background: #ffffff;
+}
+
+:root[data-theme='light'] .analyzer-settings summary {
+  color: #174ea6;
+}
+
+:root[data-theme='light'] .analysis-progress-bar {
+  background: #e8eef6;
+}
+
+:root[data-theme='light'] .analysis-progress strong {
+  color: #174ea6;
+}
+
+:root[data-theme='light'] .analysis-progress small,
+:root[data-theme='light'] .tool-behavior-note,
+:root[data-theme='light'] .tool-used-line {
+  color: #526176;
+}
+
+:root[data-theme='light'] .analyzer-flow-preview {
+  border-color: #c5d7f2;
+  background: #f3f7fd;
+}
+
+:root[data-theme='light'] .analyzer-flow-preview article {
+  color: #243247;
+  border-color: #d8e0ea;
+  background: #ffffff;
+}
+
+:root[data-theme='light'] .analyzer-flow-preview article span,
+:root[data-theme='light'] .analyzer-flow-preview header small,
+:root[data-theme='light'] .analyzer-flow-preview p {
+  color: #526176;
+}
+
+:root[data-theme='light'] .analyzer-flow-preview article strong {
+  color: #174ea6;
+}
+
+:root[data-theme='light'] .masvs-card-head b.manual-verdict {
+  color: #174ea6;
+  background: #edf4ff;
+}
+
+:root[data-theme='light'] .assessment-unsaved {
+  color: #8a4b00;
+  border-color: #e4bf83;
+  background: #fff6e5;
+}

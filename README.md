@@ -1,5 +1,7 @@
 # MobileE
+
 > 老工具图形化重制版 · 一站式移动端逆向辅助工具箱
+
 MobileE 是面向小团队内部测试的本地 Android / iOS 安全工作台。前端使用 Vue 3，桌面与后端使用 Tauri 2 + Rust；分析、设备命令和报告默认在本机完成。
 
 ## 当前能力
@@ -11,6 +13,7 @@ MobileE 是面向小团队内部测试的本地 Android / iOS 安全工作台。
 - IPA：Info.plist、ATS、Entitlements、Mach-O 架构/cryptid、Objective-C metadata、IMP/模块偏移和 JMCodeProtect 映射。
 - DEX、SO、Mach-O、Flutter AOT、React Native/JS Bundle 的敏感信息、Endpoint、SDK 和代码入口扫描。
 - 静态与运行时数据边界关联、MASVS 验证矩阵、运行时验证计划和 AI Evidence Context Pack。
+- KernSight Dev Root 协议握手、点击式全设备/单包 capture、durable session 清单与重放、原始事件分页、关系图、DEX/SO/VMA、明文 preview 和版本化包取证清单。
 - HTML 报告、项目快照（`.mskcase`）和版本基线对比。
 
 > `cryptid=0` 只表示主程序没有 Apple FairPlay 加密或已经解密，不代表不存在 JMCodeProtect 等第三方代码保护。
@@ -22,6 +25,7 @@ MobileE 是面向小团队内部测试的本地 Android / iOS 安全工作台。
 - macOS 为主要 iOS 测试与打包平台；Android 功能也支持 Windows/macOS 主机。
 - 动态能力按需安装 ADB、Frida；APK 深度源码分析可选配置 JADX/Apktool。
 - iOS 动态测试需要可访问的测试设备、对应的 usbmux 工具和兼容的 Frida 环境。
+- KernSight Rust 依赖固定到经过审计的 `v0.2.10` Git 标签，全新环境不需要预先创建同级 KernSight 源码目录。
 
 ## 常用命令
 
@@ -34,6 +38,19 @@ npm run tauri build
 ```
 
 `npm run check` 会执行 Vue/TypeScript 类型检查、Rust 格式检查和 Rust 单元测试。
+
+## Android Runtime / KernSight
+
+在 `Android Runtime` 页面连接 KernSight 后，可以直接选择：
+
+- 全设备 Observe：Process、File、Network、Memory、Binder 的低语义层事实；
+- 单包 TLS：在经过校验的 `SSL_write` 边界保留 bounded 明文 preview 和 SHA-256；
+- 单包 SO：记录 Linker load boundary，再与 mmap、proc maps 和 package dump 关联；
+- Hide debug lab：按固定时长暂时断开 ADB，设备 watchdog 恢复后自动读取 session。
+
+采集完成会自动选中新 session。详情页将确定性报告拆为总览/壳、明文、进程、网络、Binder、路径、数据链路、原始事件和 AI-ready Evidence JSON。原始事件支持传感器、关键词与分页过滤；`correlated` 边始终与 `confirmed` 分开显示。AI-ready JSON 保留明文 preview，但不会把 dump、静态特征或时间邻近关系自动提升成已确认因果。
+
+KernSight `package-dump/v2` 会在不改写原始文件的前提下按 SHA-256 聚合逻辑 DEX Set，展示每份相同内容的路径、PID、VMA 与映射来源，并提供 bounded 类/方法名索引和类冲突。原生 SO 通过版本化规则库区分壳/加固候选与密码框架候选；文件名规则命中只表示候选，仍需结合运行时 load、mmap 和调用证据确认。
 
 ## 分析结果如何理解
 
@@ -60,7 +77,7 @@ docs/                        使用与分析说明
 
 ## 贡献
 
-Android/IOS-Runtime获取参考hooker项目，感谢
+Android/IOS-Runtime 获取参考 hooker 项目，感谢。
 
 ## 免责声明
 

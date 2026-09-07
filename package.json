@@ -1,11 +1,14 @@
 {
-  "name": "me",
+  "name": "mobilee",
   "private": true,
-  "version": "0.1.0",
+  "version": "2.2.1",
   "type": "module",
   "scripts": {
     "dev": "vite",
+    "typecheck": "vue-tsc --noEmit",
     "build": "vue-tsc --noEmit && vite build",
+    "test:rust": "cargo test --manifest-path src-tauri/Cargo.toml --lib",
+    "check": "npm run typecheck && cargo fmt --manifest-path src-tauri/Cargo.toml --all -- --check && npm run test:rust",
     "preview": "vite preview",
     "tauri": "tauri"
   },
@@ -13,8 +16,7 @@
     "@tauri-apps/api": "2.9.1",
     "@tauri-apps/plugin-dialog": "2.6.0",
     "@tauri-apps/plugin-opener": "2.5.3",
-    "vue": "^3.5.13",
-    "vue-router": "^4.6.4"
+    "vue": "^3.5.13"
   },
   "devDependencies": {
     "@tailwindcss/vite": "^4.1.18",
