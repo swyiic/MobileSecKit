@@ -117,7 +117,7 @@ pub fn save(request: SaveAnalysisCaseRequest) -> Result<String, String> {
     let file_name = path
         .file_name()
         .and_then(|value| value.to_str())
-        .unwrap_or("analysis.mskcase");
+        .unwrap_or("analysis.mec");
     let temp = path.with_file_name(format!(".{file_name}.{}.tmp", std::process::id()));
     let write_result = (|| -> Result<(), String> {
         let mut file = File::create(&temp).map_err(|error| format!("创建临时快照失败：{error}"))?;

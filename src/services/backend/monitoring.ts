@@ -40,8 +40,14 @@ export const monitoringBackend = {
     invoke<KernSightEvidenceFileContent>('read_kernsight_package_file', { serial, package: packageName, relativePath, maxBytes }),
   importKernSightEvidenceDirectory: (path: string) =>
     invoke<KernSightLocalEvidenceBundle>('import_kernsight_evidence_directory', { path }),
+  importKernSightEvidenceArchive: (path: string) =>
+    invoke<KernSightLocalEvidenceBundle>('import_kernsight_evidence_archive', { path }),
+  exportKernSightEvidenceArchive: (root: string, outputPath: string) =>
+    invoke<string>('export_kernsight_evidence_archive', { root, outputPath }),
   pullKernSightPackageEvidence: (serial: string, packageName: string, destination: string) =>
     invoke<KernSightLocalEvidenceBundle>('pull_kernsight_package_evidence', { serial, package: packageName, destination }),
+  pullKernSightPackageArchive: (serial: string, packageName: string, outputPath: string) =>
+    invoke<KernSightLocalEvidenceBundle>('pull_kernsight_package_archive', { serial, package: packageName, outputPath }),
   localKernSightEvidenceFile: (root: string, packageName: string, relativePath: string, maxBytes = 1_048_576) =>
     invoke<KernSightEvidenceFileContent>('read_local_kernsight_evidence_file', { root, package: packageName, relativePath, maxBytes }),
   cleanupKernSightPackageDump: (serial: string, packageName: string) =>

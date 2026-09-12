@@ -1,7 +1,7 @@
 import { computed, ref, type Ref } from 'vue'
 import { deviceBackend, readableError } from '@/services/backend'
 import type { TerminalEntry } from '@/types/common'
-import type { DeviceDetails, DeviceSummary, IosDeviceDetails, ProcessInfo } from '@/types/device'
+import type { DeviceDetails, DeviceSummary, InstalledAppInfo, IosDeviceDetails } from '@/types/device'
 import type { EnvironmentReport } from '@/types/environment'
 
 interface DeviceManagerContext {
@@ -15,7 +15,7 @@ export function useDeviceManager(context: DeviceManagerContext) {
   const selectedSerial = ref('')
   const details = ref<DeviceDetails | null>(null)
   const iosDetails = ref<IosDeviceDetails | null>(null)
-  const processes = ref<ProcessInfo[]>([])
+  const installedApps = ref<InstalledAppInfo[]>([])
   const loading = ref(false)
   let connectionCheckRunning = false
 
@@ -35,12 +35,12 @@ export function useDeviceManager(context: DeviceManagerContext) {
     if (!device) {
       details.value = null
       iosDetails.value = null
-      processes.value = []
+      installedApps.value = []
       return
     }
     if (device.platform === 'ios') {
       details.value = null
-      processes.value = []
+      installedApps.value = []
       if (['device', 'frida'].includes(device.status)) {
         try {
           iosDetails.value = await deviceBackend.iosDetails(device.serial)
@@ -55,17 +55,17 @@ export function useDeviceManager(context: DeviceManagerContext) {
     if (device.status !== 'device') {
       details.value = null
       iosDetails.value = null
-      processes.value = []
+      installedApps.value = []
       return
     }
     iosDetails.value = null
     try {
-      const [deviceDetails, deviceProcesses] = await Promise.all([
+      const [deviceDetails, deviceApps] = await Promise.all([
         deviceBackend.details(device.serial),
-        deviceBackend.processes(device.serial),
+        deviceBackend.installedApps(device.serial),
       ])
       details.value = deviceDetails
-      processes.value = deviceProcesses
+      installedApps.value = deviceApps
     } catch (cause) {
       context.error.value = readableError(cause)
     }
@@ -86,7 +86,7 @@ export function useDeviceManager(context: DeviceManagerContext) {
     } catch (cause) {
       context.error.value = readableError(cause)
       details.value = null
-      processes.value = []
+      installedApps.value = []
     } finally {
       loading.value = false
     }
@@ -124,7 +124,7 @@ export function useDeviceManager(context: DeviceManagerContext) {
         selectedSerial.value = latest[0]?.serial || ''
         details.value = null
         iosDetails.value = null
-        processes.value = []
+        installedApps.value = []
         context.environment.value = null
         if (selectedSerial.value) await refreshSelected()
       }
@@ -148,7 +148,7 @@ export function useDeviceManager(context: DeviceManagerContext) {
     selectedSerial,
     details,
     iosDetails,
-    processes,
+    installedApps,
     loading,
     selectedDevice,
     isConnected,

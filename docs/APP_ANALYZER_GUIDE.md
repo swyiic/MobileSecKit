@@ -8,7 +8,7 @@
 4. 先看 Scan Coverage。`PARTIAL` 表示归档索引、深度二进制或最终结果触发了预算上限；报告会列出实际扫描数量。
 5. 查看 Sensitive information / location。普通线索显示实际值、地址和上下文；完整私钥不会写入 HTML、Data Boundaries 或 AI Context，只能在本机详情中显式复制/导出。
 6. 在 MASVS 验证矩阵中按步骤补充运行时验证，并选择“确认存在风险 / 误报 / 不适用 / 已验证通过”。
-7. 保存 `.mskcase` 项目快照；分析新版本后使用“基线对比”查看新增与已消失的 Finding、敏感线索和第三方库。
+7. 保存 `.mec` 分析案例；KernSight 运行时证据使用 `.mee`。分析新版本后使用“基线对比”查看新增与已消失的 Finding、敏感线索和第三方库。旧版 `.mecase`、`.meevidence`、`.mobileecase`、`.mobileevidence` 与 `.mskcase` 仍可打开。
 
 ## 线索分类
 

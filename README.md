@@ -14,7 +14,7 @@ MobileE 是面向小团队内部测试的本地 Android / iOS 安全工作台。
 - DEX、SO、Mach-O、Flutter AOT、React Native/JS Bundle 的敏感信息、Endpoint、SDK 和代码入口扫描。
 - 静态与运行时数据边界关联、MASVS 验证矩阵、运行时验证计划和 AI Evidence Context Pack。
 - KernSight Dev Root 协议握手、点击式全设备/单包 capture、durable session 清单与重放、原始事件分页、关系图、DEX/SO/VMA、明文 preview 和版本化包取证清单。
-- HTML 报告、项目快照（`.mskcase`）和版本基线对比。
+- HTML 报告、分析案例（`.mec`）、运行时证据（`.mee`）和版本基线对比；兼容旧版 `.mecase`、`.meevidence`、`.mobileecase`、`.mobileevidence` 与 `.mskcase`。
 
 > `cryptid=0` 只表示主程序没有 Apple FairPlay 加密或已经解密，不代表不存在 JMCodeProtect 等第三方代码保护。
 

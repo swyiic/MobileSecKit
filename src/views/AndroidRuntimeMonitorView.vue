@@ -7,9 +7,12 @@
         <p>按进程实例把内核事实、用户态 Inspect 和显式 dump 串成一条可核验的链：进程身份 → DNS / Handshake SNI → Binder token → TLS / Parcel → DEX / SO / CE·DE。这不是整机仪表盘；confirmed、correlated、inferred 不会被界面升级。</p>
         <div class="runtime-hero-actions">
           <button v-if="!androidReady" class="primary-button" @click="$emit('open-devices')"><span class="material-symbols-outlined">devices</span>选择 Android 设备</button>
-          <button v-else class="primary-button" :disabled="probing" @click="runCapabilityProbe"><span class="material-symbols-outlined" :class="{ spinning: probing }">{{ probing ? 'sync' : 'fact_check' }}</span>{{ probing ? '正在探测…' : capabilityProbe ? '重新探测能力' : '检测设备能力' }}</button>
-          <button v-if="androidReady" class="ghost-button" :disabled="provisioning" title="从 swyiic/KernSight 的最新 GitHub Release 下载、校验并安装" @click="provisionKernSight"><span class="material-symbols-outlined" :class="{ spinning: provisioning }">{{ provisioning ? 'sync' : 'system_update_alt' }}</span>{{ provisioning ? '正在下载并安装…' : kernSight ? '从 GitHub 检查更新' : '从 GitHub 安装 Agent' }}</button>
-          <button v-if="androidReady" class="ghost-button" :disabled="loadingKernSight" @click="loadKernSight"><span class="material-symbols-outlined" :class="{ spinning: loadingKernSight }">{{ loadingKernSight ? 'sync' : 'hub' }}</span>{{ loadingKernSight ? '正在握手…' : kernSight ? '刷新 KernSight' : '连接 KernSight' }}</button>
+          <button v-else-if="!capabilityProbe" class="primary-button" :disabled="probing" @click="runCapabilityProbe"><span class="material-symbols-outlined" :class="{ spinning: probing }">{{ probing ? 'sync' : 'fact_check' }}</span>{{ probing ? '正在探测…' : '检测设备能力' }}</button>
+          <template v-else-if="kernSight">
+            <button class="ghost-button" :disabled="probing" @click="runCapabilityProbe"><span class="material-symbols-outlined" :class="{ spinning: probing }">{{ probing ? 'sync' : 'fact_check' }}</span>{{ probing ? '正在探测…' : '重新检测环境' }}</button>
+            <button class="ghost-button" :disabled="provisioning" title="从 swyiic/KernSight 的最新 GitHub Release 下载、校验并安装" @click="provisionKernSight"><span class="material-symbols-outlined" :class="{ spinning: provisioning }">{{ provisioning ? 'sync' : 'system_update_alt' }}</span>{{ provisioning ? '正在下载并安装…' : '检查 Agent 更新' }}</button>
+            <button class="ghost-button" :disabled="loadingKernSight" @click="loadKernSight"><span class="material-symbols-outlined" :class="{ spinning: loadingKernSight }">{{ loadingKernSight ? 'sync' : 'refresh' }}</span>{{ loadingKernSight ? '正在握手…' : '刷新会话与证据' }}</button>
+          </template>
         </div>
       </div>
       <div class="runtime-readiness" :class="readinessTone">
@@ -29,6 +32,7 @@
       <button :class="{ active: workspaceMode === 'evidence' }" @click="workspaceMode = 'evidence'"><span class="material-symbols-outlined">account_tree</span><strong>证据链</strong><small>先选包，再看 L0/L1 session 与 L2 dump</small></button>
       <button :class="{ active: workspaceMode === 'capture' }" @click="workspaceMode = 'capture'"><span class="material-symbols-outlined">radio_button_checked</span><strong>新建采集</strong><small>L0 内核事实 · 可选 L1 Inspect</small></button>
       <button class="import-local" :disabled="importingLocal" @click="importLocalEvidence"><span class="material-symbols-outlined">folder_open</span><strong>{{ importingLocal ? '正在索引…' : '导入本地证据' }}</strong><small>选择包含 dump-report.json 的包目录</small></button>
+      <button class="import-local" :disabled="importingLocal" @click="importEvidenceArchive"><span class="material-symbols-outlined">folder_zip</span><strong>{{ importingLocal ? '正在载入…' : '打开证据' }}</strong><small>.mee · 兼容旧格式</small></button>
     </section>
 
     <section v-if="probeError" class="notice error-notice runtime-probe-error" role="alert"><span class="material-symbols-outlined">error</span><span>{{ probeError }}</span><button @click="probeError = ''">关闭</button></section>
@@ -314,7 +318,7 @@
     </section>
 
     <section v-if="workspaceMode === 'evidence'" class="panel ks-package-panel">
-      <div class="section-title compact"><div><div class="eyebrow">L2 DUMP LIBRARY</div><h2>包证据</h2><p>独立于 Session。证据文件不提供单项删除；手机端证据只能按整个 com 包删除。</p></div><div class="ks-title-actions"><button v-if="selectedPackage" class="ghost-button" title="关闭当前包工作区，不删除数据" @click="closePackageWorkspace">关闭当前包</button><template v-if="selectedPackage && selectedEvidenceSource === 'device'"><button v-if="pendingDeletePackage" class="ghost-button" :disabled="deletingPackage" @click="pendingDeletePackage = false">取消</button><button v-if="pendingDeletePackage" class="ghost-button danger-button" :disabled="deletingPackage" @click="confirmDeleteCurrentPackageEvidence">{{ deletingPackage ? '删除中…' : '确认删除整个包证据' }}</button><button v-else class="ghost-button danger-button" :disabled="deletingPackage" @click="pendingDeletePackage = true">删除整个包证据</button></template><span class="device-chip">MAC {{ localEvidenceBundles.length }} · DEVICE {{ devicePackageNames.size }}</span></div></div>
+      <div class="section-title compact"><div><div class="eyebrow">PACKAGE EVIDENCE</div><h2>包证据</h2><p>MobileE 自动整理手机端已存会话、内存与文件证据；不提供单项删除，只能按整个 com 包管理。</p></div><div class="ks-title-actions"><button v-if="selectedPackage" class="ghost-button" title="关闭当前包工作区，不删除数据" @click="closePackageWorkspace">关闭当前包</button><template v-if="selectedPackage && selectedEvidenceSource === 'device'"><button v-if="pendingDeletePackage" class="ghost-button" :disabled="deletingPackage" @click="pendingDeletePackage = false">取消</button><button v-if="pendingDeletePackage" class="ghost-button danger-button" :disabled="deletingPackage" @click="confirmDeleteCurrentPackageEvidence">{{ deletingPackage ? '删除中…' : '确认删除整个包证据' }}</button><button v-else class="ghost-button danger-button" :disabled="deletingPackage" @click="pendingDeletePackage = true">删除整个包证据</button></template><span class="device-chip">MAC {{ localEvidenceBundles.length }} · DEVICE {{ devicePackageNames.size }}</span></div></div>
       <div class="ks-package-list">
         <article v-for="dump in packageDumps" :key="dump.package" :class="{ selected: selectedPackage === dump.package }" @click="selectPackage(dump.package)">
           <div><strong>{{ dump.package }}</strong><small class="ks-source-badges"><b v-for="source in evidenceSources(dump.package)" :key="source.kind" :class="`source-${source.kind}`">{{ source.label }}</b></small><small>{{ evidenceLocationLabel(dump.package) }} · {{ dump.schema_version || 'legacy schema · 建议 recatalog' }}</small></div>
@@ -331,14 +335,33 @@
     </section>
 
     <section v-if="workspaceMode === 'evidence' && selectedPackageDump" class="panel ks-package-evidence-panel">
-      <div class="section-title compact"><div><div class="eyebrow">L2 FORENSIC DUMP</div><h2>{{ selectedPackage }} · 产物与私有文件</h2><p>安装包 DEX 常常只是 stub；可读 DEX、runtime SO、堆明文和 CE/DE 才是取证主干。与上方 session 只通过 overlaps_mmap 等 correlated 边连接，文件存在不证明本会话执行或外发。</p></div><span class="device-chip">{{ evidenceFiles.length.toLocaleString() }} FILES · {{ formatBytes(Number(selectedLocalBundle?.totalBytes ?? selectedPackageDump.total_bytes ?? 0)) }}</span></div>
+      <div class="section-title compact"><div><div class="eyebrow">FORENSIC EVIDENCE</div><h2>{{ selectedPackage }} · 产物与私有文件</h2><p>MobileE 会在载入后自动整理文件、内存、会话与映射关系；文件存在本身不代表本次运行已经执行或外发。</p></div><span class="device-chip">{{ evidenceFiles.length.toLocaleString() }} FILES · {{ formatBytes(Number(selectedPackageDump.physical_bytes ?? selectedLocalBundle?.totalBytes ?? selectedPackageDump.total_bytes ?? 0)) }}</span></div>
       <template v-if="selectedPackageDump">
-      <div class="ks-selected-package-bar"><button v-if="device && selectedEvidenceSource === 'device'" class="primary-button" :disabled="pullingPackage" @click="pullSelectedPackageEvidence">{{ pullingPackage ? '正在拉取…' : '拉回全部情报到本地' }}</button><b :class="`source-${selectedEvidenceSource}`">{{ selectedEvidenceSource === 'local' ? 'MAC 本地证据' : '手机端证据' }}</b><span>Dump {{ selectedPackageDump.dump_id || 'legacy' }}</span><span>{{ selectedPackageDump.launched ? '已执行 launch harvest' : '未执行 launch harvest' }}</span><span>{{ formatBytes(Number(selectedLocalBundle?.totalBytes ?? selectedPackageDump.total_bytes ?? 0)) }}</span></div>
+      <div class="ks-selected-package-bar"><button v-if="device && selectedEvidenceSource === 'device'" class="primary-button" :disabled="pullingPackage" @click="pullSelectedPackageEvidence">{{ pullingPackage ? '正在拉取并解析…' : '拉取全部信息' }}</button><button v-else-if="selectedLocalBundle" class="ghost-button" :disabled="pullingPackage" @click="exportSelectedEvidenceArchive">{{ pullingPackage ? '正在封装…' : '导出 .mee' }}</button><b :class="`source-${selectedEvidenceSource}`">{{ selectedEvidenceSource === 'local' ? 'MAC 本地证据' : '手机端证据' }}</b><span>Dump {{ selectedPackageDump.dump_id || 'legacy' }}</span><span>{{ selectedPackageDump.launched ? '已执行 launch harvest' : '未执行 launch harvest' }}</span><span>物理 {{ formatBytes(Number(selectedPackageDump.physical_bytes ?? selectedLocalBundle?.totalBytes ?? selectedPackageDump.total_bytes ?? 0)) }}</span><span v-if="selectedPackageDump.deduplicated_bytes">去重节省 {{ formatBytes(Number(selectedPackageDump.deduplicated_bytes)) }}</span></div>
+      <section v-if="evidenceError" class="notice error-notice ks-pull-notice" role="alert"><span class="material-symbols-outlined">error</span><span>{{ evidenceError }}</span><button @click="evidenceError = ''">关闭</button></section>
+      <section v-if="evidenceMessage" class="notice ks-pull-notice" role="status"><span class="material-symbols-outlined">task_alt</span><span>{{ evidenceMessage }}</span><button @click="evidenceMessage = ''">关闭</button></section>
+      <section class="ks-dex-ownership">
+        <header><div><strong>DEX 业务归属</strong><small>{{ dexOwnershipAvailable ? 'ksightd 类级确定性分类；AI 只需复核混合与未知' : '旧版报告没有归属索引，请重新执行 L2 采集' }}</small></div><b>{{ dexOwnershipEntries.length }} UNIQUE DEX</b></header>
+        <div v-if="dexOwnershipAvailable" class="ks-dex-ownership-summary">
+          <button v-for="item in dexOwnershipCards" :key="item.key" type="button" :class="[`ownership-${item.key}`, { active: selectedDexOwnership === item.key }]" @click="selectedDexOwnership = selectedDexOwnership === item.key ? '' : item.key"><b>{{ item.count }}</b><span>{{ item.label }}</span></button>
+        </div>
+        <p v-if="dexOwnershipPackageSummary" class="ks-dex-ownership-package"><b>{{ selectedPackageDump.dex_ownership?.package || selectedPackage }}</b><span>{{ dexOwnershipPackageSummary }}</span></p>
+        <p v-if="dexOwnershipSeeds.length" class="ks-dex-ownership-seeds">动态内部种子：<b v-for="seed in dexOwnershipSeeds" :key="seed.namespace" :title="seed.reason">{{ seed.namespace.split('/').join('.') }} · {{ seed.registered_components }} 组件 / {{ seed.sampled_classes }} 类</b></p>
+        <div v-if="dexOwnershipAvailable" class="ks-dex-ownership-list">
+          <article v-for="entry in visibleDexOwnershipEntries" :key="entry.sha256" :class="`ownership-${entry.category}`">
+            <div><strong>{{ dexOwnershipLabel(entry.category) }} · {{ entry.confidence }}%</strong><code>{{ entry.canonical_relative_path }}</code></div>
+            <span>{{ entry.sampled_classes }} 类 · 业务 {{ entry.business_classes }} · 内部 {{ entry.internal_classes }} · SDK {{ entry.third_party_classes }} · 未知 {{ entry.unknown_classes }}</span>
+            <small>{{ entry.dominant_namespaces.join(' · ') || '没有可发布命名空间' }}</small>
+            <p>{{ entry.reasons.join('；') }}</p>
+          </article>
+          <button v-if="filteredDexOwnershipEntries.length > dexOwnershipVisibleCount" type="button" class="ghost-button ks-load-more" @click="dexOwnershipVisibleCount += 30">继续显示 {{ Math.min(30, filteredDexOwnershipEntries.length - dexOwnershipVisibleCount) }} 个 DEX</button>
+        </div>
+      </section>
       <div class="ks-forensic-grid">
         <article v-for="surface in forensicSurfaces" :key="surface.key" :class="{ active: selectedEvidenceCategory === surface.key }" @click="openEvidenceCategory(surface.key)"><span class="material-symbols-outlined">{{ surface.icon }}</span><div><strong>{{ surface.label }}</strong><small>{{ surface.path }}</small><p>{{ surface.detail }}</p></div><b>{{ surface.count }}</b></article>
       </div>
       <section ref="evidenceBrowserRef" class="ks-evidence-browser">
-        <header><div><strong>L2 文件证据浏览器{{ selectedEvidenceCategoryLabel ? ` · ${selectedEvidenceCategoryLabel}` : '' }}</strong><small>上方分类只筛选此浏览器。DEX/SO 的语义、映射链也在选中文件后展示；证据文件不能在这里单独删除。</small></div><div><b>{{ evidenceFiles.length }} catalogued</b><button v-if="selectedEvidenceCategory" class="ghost-button" @click="openEvidenceCategory('')">显示全部</button></div></header>
+        <header><div><strong>文件证据浏览器{{ selectedEvidenceCategoryLabel ? ` · ${selectedEvidenceCategoryLabel}` : '' }}</strong><small>上方分类只筛选此浏览器。DEX/SO 的语义、映射链也在选中文件后展示；证据文件不能在这里单独删除。</small></div><div><b>{{ evidenceFiles.length }} catalogued</b><button v-if="selectedEvidenceCategory" class="ghost-button" @click="openEvidenceCategory('')">显示全部</button></div></header>
         <div class="ks-evidence-file-list"><button v-for="file in visibleEvidenceFiles" :key="`${file.package}:${file.relative_path}`" :class="{ active: selectedEvidenceKey === `${file.package}:${file.relative_path}`, 'prio-focus': evidencePriority(file) === 'focus' }" :disabled="loadingEvidence" @click="openEvidenceEntry(file)"><span><strong>{{ file.relative_path }}</strong><small>{{ file.package }} · {{ file.content_class }}</small></span><b>{{ formatBytes(file.bytes) }}</b><em>{{ evidenceBadge(file) }}</em></button></div>
         <button v-if="visibleEvidenceFiles.length < evidenceFiles.length" class="ghost-button ks-load-more" @click="evidenceVisibleCount += 100">继续显示 {{ Math.min(100, evidenceFiles.length - visibleEvidenceFiles.length) }} 个文件</button>
         <div v-if="loadingEvidence" class="ks-loading"><span class="material-symbols-outlined spinning">sync</span>正在读取证据文件…</div>
@@ -358,7 +381,7 @@
 
 <script setup lang="ts">
 import { computed, markRaw, nextTick, onErrorCaptured, onBeforeUnmount, reactive, ref, shallowRef, watch } from 'vue'
-import { open } from '@tauri-apps/plugin-dialog'
+import { save } from '@tauri-apps/plugin-dialog'
 import { monitoringBackend, readableError } from '@/services/backend'
 import { useKernSightEvidence } from '@/composables/useKernSightEvidence'
 import { buildAnalysisFlow, buildAnalysisPath, classifyDex, classifyPrivate, classifySo } from '@/services/kernsightPath'
@@ -371,6 +394,8 @@ import type {
   KernSightCaptureRequest,
   KernSightCaptureResult,
   KernSightEvidenceFileContent,
+  KernSightDexOwnershipCategory,
+  KernSightDexOwnershipEntry,
   KernSightLocalEvidenceBundle,
   KernSightPackageDumpReport,
   KernSightSessionReportDocument,
@@ -384,6 +409,8 @@ const probing = ref(false)
 const provisioning = ref(false)
 const provisionResult = ref<KernSightProvisionResult | null>(null)
 const probeError = ref('')
+const evidenceError = ref('')
+const evidenceMessage = ref('')
 const kernSight = ref<KernSightOverview | null>(null)
 const packageDumps = shallowRef<KernSightPackageDumpReport[]>([])
 const devicePackageDumps = shallowRef<KernSightPackageDumpReport[]>([])
@@ -402,7 +429,7 @@ const aiCopied = ref(false)
 const workspaceMode = ref<'evidence' | 'capture'>('evidence')
 const selectedPackage = ref('')
 const selectedEvidenceSource = ref<'local' | 'device'>('local')
-const { bundles: localEvidenceBundles, upsertBundle, importDirectory, requestedPackage } = useKernSightEvidence()
+const { bundles: localEvidenceBundles, upsertBundle, importDirectory, importArchive, requestedPackage } = useKernSightEvidence()
 const devicePackageNames = ref(new Set<string>())
 const importingLocal = ref(false)
 const pullingPackage = ref(false)
@@ -419,6 +446,8 @@ const evidencePreviewKind = ref('text')
 const plaintextDecoded = ref<Record<string, string>>({})
 const selectedArtifact = ref<any | null>(null)
 const selectedEvidenceCategory = ref('')
+const selectedDexOwnership = ref<KernSightDexOwnershipCategory | ''>('')
+const dexOwnershipVisibleCount = ref(30)
 const evidenceVisibleCount = ref(100)
 const evidenceBrowserRef = ref<HTMLElement | null>(null)
 let captureTimer: ReturnType<typeof setInterval> | undefined
@@ -508,6 +537,42 @@ const selectedLocalBundle = computed(() => selectedEvidenceSource.value === 'loc
 const selectedPackageDump = computed(() => selectedEvidenceSource.value === 'device'
   ? devicePackageDumps.value.find(dump => dump.package === selectedPackage.value) || null
   : selectedLocalBundle.value?.dumpReport || packageDumps.value.find(dump => dump.package === selectedPackage.value) || null)
+const dexOwnershipEntries = computed<KernSightDexOwnershipEntry[]>(() => selectedPackageDump.value?.dex_ownership?.entries || [])
+const dexOwnershipAvailable = computed(() => Boolean(selectedPackageDump.value?.dex_ownership))
+const dexOwnershipSeeds = computed(() => selectedPackageDump.value?.dex_ownership?.inferred_internal_namespaces || [])
+const dexOwnershipOrder: KernSightDexOwnershipCategory[] = ['business', 'internal_component', 'dynamic_payload', 'third_party_sdk', 'mixed', 'unknown']
+const dexOwnershipCards = computed(() => {
+  const counts = new Map<KernSightDexOwnershipCategory, number>()
+  for (const entry of dexOwnershipEntries.value) counts.set(entry.category, (counts.get(entry.category) || 0) + 1)
+  return dexOwnershipOrder.map(key => ({ key, label: dexOwnershipLabel(key), count: counts.get(key) || 0 }))
+})
+const dexOwnershipPackageSummary = computed(() => {
+  const ownership = selectedPackageDump.value?.dex_ownership
+  if (!ownership) return ''
+  const classSamples = ownership.business_class_samples
+    ?? dexOwnershipEntries.value.reduce((total, entry) => total + Number(entry.business_classes || 0), 0)
+  const dexSets = ownership.business_dex_sets
+    ?? dexOwnershipEntries.value.filter(entry => Number(entry.business_classes || 0) > 0).length
+  if (!classSamples) return '未在已索引的类描述符中找到精确主包命名空间'
+  return `精确主包命名空间 ${classSamples.toLocaleString()} 个类样本，分布于 ${dexSets.toLocaleString()} 个 DEX；混装文件仍保留主包归属，不再被 SDK 数量覆盖`
+})
+const filteredDexOwnershipEntries = computed(() => dexOwnershipEntries.value
+  .filter(entry => !selectedDexOwnership.value || entry.category === selectedDexOwnership.value)
+  .sort((left, right) => dexOwnershipOrder.indexOf(left.category) - dexOwnershipOrder.indexOf(right.category)
+    || right.confidence - left.confidence
+    || left.canonical_relative_path.localeCompare(right.canonical_relative_path)))
+const visibleDexOwnershipEntries = computed(() => filteredDexOwnershipEntries.value.slice(0, dexOwnershipVisibleCount.value))
+
+function dexOwnershipLabel(category: KernSightDexOwnershipCategory) {
+  return ({
+    business: '核心业务',
+    internal_component: '企业内部组件',
+    dynamic_payload: '动态载荷',
+    third_party_sdk: '第三方 SDK',
+    mixed: '混合归属',
+    unknown: '未判断',
+  } satisfies Record<KernSightDexOwnershipCategory, string>)[category]
+}
 const visibleLocalSessionBundles = computed(() => localEvidenceBundles.value.filter(bundle => bundle.sessionReport))
 const completedSessions = computed(() => kernSight.value?.sessions.filter(session => session.state === 'completed').length || 0)
 const sensitiveFileCount = computed(() => packageDumps.value.reduce((total, dump) => total + (dump.sensitive_files?.length || 0), 0))
@@ -1117,6 +1182,26 @@ async function importLocalEvidence() {
     packageDumps.value = [...dumps.values()]
     workspaceMode.value = 'evidence'
     selectPackage(bundle.package)
+    evidenceMessage.value = `已索引 ${bundle.package} 的本地证据目录：${bundle.fileCount.toLocaleString()} 个文件，${formatBytes(bundle.totalBytes)}`
+  } catch (error) {
+    probeError.value = readableError(error)
+  } finally {
+    importingLocal.value = false
+  }
+}
+
+async function importEvidenceArchive() {
+  importingLocal.value = true
+  probeError.value = ''
+  try {
+    const bundle = await importArchive()
+    if (!bundle) return
+    const dumps = new Map(packageDumps.value.map(dump => [dump.package, dump]))
+    dumps.set(bundle.package, bundle.dumpReport)
+    packageDumps.value = [...dumps.values()]
+    workspaceMode.value = 'evidence'
+    selectPackage(bundle.package)
+    evidenceMessage.value = `已打开 ${bundle.package} 的 MobileE 证据包：${bundle.fileCount.toLocaleString()} 个文件，${formatBytes(bundle.totalBytes)}`
   } catch (error) {
     probeError.value = readableError(error)
   } finally {
@@ -1126,20 +1211,53 @@ async function importLocalEvidence() {
 
 async function pullSelectedPackageEvidence() {
   if (!props.device || !selectedPackage.value || pullingPackage.value) return
-  const destination = await open({ directory: true, multiple: false, title: '选择 KernSight 情报保存目录' })
-  if (!destination || Array.isArray(destination)) return
-  if (!window.confirm(`将重新启动 ${selectedPackage.value} 并执行完整 L2 取证，然后拉取到 ${destination}。继续吗？`)) return
+  const destination = await save({
+    defaultPath: `${selectedPackage.value}.mee`,
+    filters: [{ name: 'ME evidence', extensions: ['mee'] }],
+  })
+  if (!destination) return
+  const archivePath = destination.toLowerCase().endsWith('.mee') ? destination : `${destination}.mee`
   pullingPackage.value = true
   probeError.value = ''
+  evidenceError.value = ''
+  const expectedBytes = Number(selectedPackageDump.value?.physical_bytes ?? selectedPackageDump.value?.total_bytes ?? 0)
+  evidenceMessage.value = `正在拉取并封装 ${selectedPackage.value}${expectedBytes ? `（约 ${formatBytes(expectedBytes)}）` : ''}。目标旁会先出现 .part 文件，完成后原子替换为：${archivePath}`
   try {
-    const bundle = await monitoringBackend.pullKernSightPackageEvidence(props.device.serial, selectedPackage.value, destination)
+    const bundle = await monitoringBackend.pullKernSightPackageArchive(props.device.serial, selectedPackage.value, archivePath)
     upsertBundle(bundle)
     const dumps = new Map(packageDumps.value.map(dump => [dump.package, dump]))
     dumps.set(bundle.package, bundle.dumpReport)
     packageDumps.value = [...dumps.values()]
     selectPackage(bundle.package)
+    const includedSessions = Array.isArray(bundle.sessionReport?.mobilee_included_sessions) ? bundle.sessionReport.mobilee_included_sessions.length : 0
+    const failedSessions = Array.isArray(bundle.sessionReport?.mobilee_session_failures) ? bundle.sessionReport.mobilee_session_failures.length : 0
+    evidenceMessage.value = `已保存并由 MobileE 自动解析 ${bundle.package}：${bundle.fileCount.toLocaleString()} 个文件、${includedSessions} 条手机会话${failedSessions ? `；另有 ${failedSessions} 条会话无法读取，详情已写入 session-index.json` : ''} · ${archivePath}`
   } catch (error) {
-    probeError.value = readableError(error)
+    evidenceMessage.value = ''
+    evidenceError.value = readableError(error)
+  } finally {
+    pullingPackage.value = false
+  }
+}
+
+async function exportSelectedEvidenceArchive() {
+  if (!selectedLocalBundle.value || pullingPackage.value) return
+  const destination = await save({
+    defaultPath: `${selectedLocalBundle.value.package}.mee`,
+    filters: [{ name: 'ME evidence', extensions: ['mee'] }],
+  })
+  if (!destination) return
+  const archivePath = destination.toLowerCase().endsWith('.mee') ? destination : `${destination}.mee`
+  pullingPackage.value = true
+  probeError.value = ''
+  evidenceError.value = ''
+  evidenceMessage.value = `正在导出 ${selectedLocalBundle.value.package} 的完整运行时证据：${archivePath}`
+  try {
+    const savedPath = await monitoringBackend.exportKernSightEvidenceArchive(selectedLocalBundle.value.root, archivePath)
+    evidenceMessage.value = `MobileE 证据包已导出：${savedPath}`
+  } catch (error) {
+    evidenceMessage.value = ''
+    evidenceError.value = readableError(error)
   } finally {
     pullingPackage.value = false
   }
@@ -1151,6 +1269,8 @@ function selectPackage(packageName: string) {
   captureForm.package = packageName
   selectedArtifact.value = null
   selectedEvidenceCategory.value = ''
+  selectedDexOwnership.value = ''
+  dexOwnershipVisibleCount.value = 30
   evidenceVisibleCount.value = 100
   closeEvidencePreview()
 }
@@ -1161,6 +1281,8 @@ function selectPackageSource(packageName: string, source: 'local' | 'device') {
   captureForm.package = packageName
   selectedArtifact.value = null
   selectedEvidenceCategory.value = ''
+  selectedDexOwnership.value = ''
+  dexOwnershipVisibleCount.value = 30
   evidenceVisibleCount.value = 100
   closeEvidencePreview()
 }
@@ -1826,6 +1948,7 @@ onBeforeUnmount(() => {
   max-width: 100%;
 }
 .runtime-probe-error { margin: 0; }
+.ks-pull-notice { width: 100%; margin: 8px 0 0; }
 .capability-probe-panel { padding: 18px; }
 .capability-probe-header { display: flex; align-items: flex-start; justify-content: space-between; gap: 18px; }
 .capability-probe-header h2 { margin: 5px 0 0; font-size: 14px; }
@@ -1860,7 +1983,7 @@ onBeforeUnmount(() => {
 .ks-provision-result{padding:15px;border-color:rgba(52,211,153,.25)}.ks-provision-result>header{display:flex;align-items:flex-start;justify-content:space-between;gap:12px}.ks-provision-result h2{margin:4px 0 0;font-size:13px}.ks-provision-result header p{margin:5px 0 0;color:var(--muted);font-size:7px;word-break:break-all}.ks-provision-result header>a{color:var(--primary);font-size:8px}.ks-provision-steps{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:7px;margin-top:12px}.ks-provision-steps article{display:grid;grid-template-columns:22px minmax(0,1fr);gap:7px;align-items:start;padding:9px;border:1px solid rgba(52,211,153,.17);border-radius:8px;background:rgba(52,211,153,.035)}.ks-provision-steps .material-symbols-outlined{color:#62d3a7;font-size:16px}.ks-provision-steps strong,.ks-provision-steps small{display:block}.ks-provision-steps strong{font-size:8px}.ks-provision-steps small{overflow:hidden;margin-top:3px;color:var(--muted);font-size:6px;text-overflow:ellipsis;white-space:nowrap}
 .ks-session-panel, .ks-package-panel, .ks-package-evidence-panel { padding: 16px; }
 .ks-session-panel{order:10}.ks-package-panel{order:20}.ks-package-evidence-panel{order:30}
-.ks-workspace-switcher{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:8px;padding:9px}.ks-workspace-switcher>button{display:grid;grid-template-columns:28px minmax(0,1fr);gap:2px 9px;align-items:center;padding:10px;color:inherit;text-align:left;border:1px solid var(--line);border-radius:10px;background:rgba(4,8,13,.3)}.ks-workspace-switcher>button:hover,.ks-workspace-switcher>button.active{border-color:rgba(57,125,246,.4);background:rgba(57,125,246,.08)}.ks-workspace-switcher .material-symbols-outlined{grid-row:1/3;color:#78a7ed;font-size:19px}.ks-workspace-switcher strong,.ks-workspace-switcher small{display:block}.ks-workspace-switcher strong{font-size:9px}.ks-workspace-switcher small{color:#69788e;font-size:7px}
+.ks-workspace-switcher{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:8px;padding:9px}.ks-workspace-switcher>button{display:grid;grid-template-columns:28px minmax(0,1fr);gap:2px 9px;align-items:center;padding:10px;color:inherit;text-align:left;border:1px solid var(--line);border-radius:10px;background:rgba(4,8,13,.3)}.ks-workspace-switcher>button:hover,.ks-workspace-switcher>button.active{border-color:rgba(57,125,246,.4);background:rgba(57,125,246,.08)}.ks-workspace-switcher .material-symbols-outlined{grid-row:1/3;color:#78a7ed;font-size:19px}.ks-workspace-switcher strong,.ks-workspace-switcher small{display:block}.ks-workspace-switcher strong{font-size:9px}.ks-workspace-switcher small{color:#69788e;font-size:7px}
 .ks-session-panel .section-title p, .ks-package-panel .section-title p, .ks-package-evidence-panel .section-title p { margin: 4px 0 0; color: #6d7b90; font-size: 8px; }
 .ks-title-actions{display:flex;align-items:center;gap:7px}
 .danger-button{color:#d86d78;border-color:rgba(216,109,120,.3)}
@@ -1933,6 +2056,13 @@ onBeforeUnmount(() => {
 .ks-package-list article>div strong,.ks-package-list article>div small,.ks-package-list span b,.ks-package-list span small { display:block; }.ks-package-list article>div strong{font-size:8px}.ks-package-list article>div small{margin-top:3px;color:#657388;font-size:7px}.ks-package-list span{text-align:center}.ks-package-list span b{font-size:9px}.ks-package-list span small{margin-top:3px;color:#657388;font-size:6px}.ks-package-list button{white-space:nowrap;font-size:7px}
 .ks-source-badges{display:flex!important;flex-wrap:wrap;gap:4px;margin-top:5px!important}.ks-source-badges b{display:inline-block;padding:3px 5px;border-radius:5px;font-size:6px}.ks-source-badges .source-local{color:#62d3a7;background:rgba(52,211,153,.09)}.ks-source-badges .source-device{color:#79a7ea;background:rgba(57,125,246,.1)}.ks-source-badges .source-unknown{color:#d1a35b;background:rgba(245,158,11,.08)}
 .ks-package-source-actions{display:flex;gap:4px}.ks-package-source-actions button.active{color:#b9d2fb;border-color:rgba(57,125,246,.4);background:rgba(57,125,246,.1)}.ks-selected-package-bar>b{padding:4px 6px;border-radius:5px;font-size:6px}.ks-selected-package-bar>.source-local{color:#62d3a7;background:rgba(52,211,153,.09)}.ks-selected-package-bar>.source-device{color:#79a7ea;background:rgba(57,125,246,.1)}
+.ks-dex-ownership{margin-top:12px;padding:14px;border:1px solid var(--line);border-radius:12px;background:var(--surface-soft)}
+.ks-dex-ownership>header{display:flex;align-items:flex-start;justify-content:space-between;gap:12px}.ks-dex-ownership>header strong,.ks-dex-ownership>header small{display:block}.ks-dex-ownership>header strong{font-size:13px}.ks-dex-ownership>header small{margin-top:5px;color:var(--muted);font-size:11px;line-height:1.45}.ks-dex-ownership>header>b{color:var(--primary);font-size:11px;white-space:nowrap}
+.ks-dex-ownership-summary{display:grid;grid-template-columns:repeat(6,minmax(0,1fr));gap:7px;margin-top:12px}.ks-dex-ownership-summary button{display:flex;align-items:center;justify-content:space-between;gap:8px;min-width:0;padding:10px;border:1px solid var(--line);border-radius:9px;color:var(--text);background:var(--surface);text-align:left}.ks-dex-ownership-summary button:hover,.ks-dex-ownership-summary button.active{border-color:currentColor;background:var(--primary-soft)}.ks-dex-ownership-summary b{font-size:17px}.ks-dex-ownership-summary span{font-size:10px;line-height:1.25}
+.ks-dex-ownership-seeds{display:flex;flex-wrap:wrap;align-items:center;gap:6px;margin:9px 0 0;color:var(--muted);font-size:10px}.ks-dex-ownership-seeds>b{padding:5px 7px;border:1px solid color-mix(in srgb,var(--primary) 28%,var(--line));border-radius:7px;color:var(--primary);background:var(--primary-soft);font-weight:600}
+.ks-dex-ownership-package{display:flex;align-items:center;gap:9px;margin:9px 0 0;padding:8px 10px;border:1px solid color-mix(in srgb,#39b980 30%,var(--line));border-radius:8px;color:var(--muted);background:color-mix(in srgb,#39b980 7%,var(--surface));font-size:10px;line-height:1.45}.ks-dex-ownership-package>b{color:#39b980;font:600 10px ui-monospace,SFMono-Regular,Menlo,monospace}.ks-dex-ownership-package>span{min-width:0}
+.ks-dex-ownership-summary .ownership-business,.ks-dex-ownership-list .ownership-business>div>strong{color:#39b980}.ks-dex-ownership-summary .ownership-internal_component,.ks-dex-ownership-list .ownership-internal_component>div>strong{color:#5d91df}.ks-dex-ownership-summary .ownership-dynamic_payload,.ks-dex-ownership-list .ownership-dynamic_payload>div>strong{color:#bb78e8}.ks-dex-ownership-summary .ownership-third_party_sdk,.ks-dex-ownership-list .ownership-third_party_sdk>div>strong{color:#8090a8}.ks-dex-ownership-summary .ownership-mixed,.ks-dex-ownership-list .ownership-mixed>div>strong{color:#d49a3d}.ks-dex-ownership-summary .ownership-unknown,.ks-dex-ownership-list .ownership-unknown>div>strong{color:#d16565}
+.ks-dex-ownership-list{display:grid;gap:7px;max-height:520px;margin-top:10px;overflow:auto}.ks-dex-ownership-list article{display:grid;grid-template-columns:minmax(260px,1.2fr) minmax(220px,.8fr);gap:5px 16px;padding:11px 12px;border:1px solid var(--line);border-left:3px solid currentColor;border-radius:9px;color:var(--muted);background:var(--surface)}.ks-dex-ownership-list article>div{min-width:0}.ks-dex-ownership-list article strong,.ks-dex-ownership-list article code{display:block}.ks-dex-ownership-list article strong{font-size:11px}.ks-dex-ownership-list article code{margin-top:4px;overflow:hidden;color:var(--text);font:10px ui-monospace,SFMono-Regular,Menlo,monospace;text-overflow:ellipsis;white-space:nowrap}.ks-dex-ownership-list article>span{color:var(--text);font-size:10px;text-align:right}.ks-dex-ownership-list article>small{overflow:hidden;color:var(--muted);font-size:10px;text-overflow:ellipsis;white-space:nowrap}.ks-dex-ownership-list article>p{margin:0;color:var(--muted);font-size:10px;line-height:1.45;text-align:right}
 .ks-capture-panel { padding: 17px; border-color: rgba(57,125,246,.22); }
 .ks-capture-panel .section-title p { max-width: 760px; margin: 4px 0 0; color: #6f7e94; font-size: 8px; line-height: 1.55; }
 .device-chip.active { color: #75d7ad; border-color: rgba(52,211,153,.3); }
@@ -2021,6 +2151,9 @@ onBeforeUnmount(() => {
 @media (max-width: 900px){.ks-binary-preview-grid{grid-template-columns:1fr}.ks-binary-preview-grid pre{height:360px}}
 @media (max-width: 650px) { .capability-probe-header { flex-direction: column; }.probe-mode { width: 100%; }.capability-check-grid, .probe-facts, .ks-report-summary,.ks-presets,.ks-capture-form,.ks-intelligence-grid,.ks-integrity-strip,.ks-network-summary,.ks-dns-list,.ks-lifecycle-grid,.ks-capture-plan,.ks-requirement-grid,.ks-provision-steps,.ks-forensic-grid,.ks-command-grid,.ks-evidence-policy,.ks-evidence-file-list,.ks-layer-contract,.ks-chain-rail,.ks-reassembly-funnel { grid-template-columns: 1fr; }.ks-install-gate>header,.ks-install-guidance{grid-template-columns:1fr}.ks-capture-plan details{grid-column:auto}.ks-capture-form .wide{grid-column:auto}.ks-session-row{grid-template-columns:1fr}.ks-session-open,.ks-package-list article{grid-template-columns:1fr}.ks-session-delete,.ks-session-owned{border-top:1px solid var(--line);border-left:0}.ks-package-list article>span{text-align:left}.ks-package-list article>span:nth-of-type(n){display:block}.ks-edge-list article,.ks-event-list summary,.ks-data-table article,.ks-backbone-list article{grid-template-columns:1fr}.ks-backbone-list article>span{grid-column:auto}.ks-edge-list small,.ks-data-table span{text-align:left}.ks-data-table code{grid-column:1}.ks-event-toolbar,.ks-graph-toolbar{grid-template-columns:1fr}.ks-dns-list article{grid-template-columns:24px 1fr}.ks-dns-list code{grid-column:2}.ks-semantic-list dl{grid-template-columns:1fr 1fr} }
 @media (max-width:650px){.ks-workspace-switcher,.ks-analyzable-list,.ks-artifact-focus dl{grid-template-columns:1fr}.ks-analyzable-list em{grid-column:auto}.ks-artifact-chain article{grid-template-columns:1fr}}
+@media (min-width:651px) and (max-width:1100px){.ks-workspace-switcher{grid-template-columns:repeat(2,minmax(0,1fr))}}
+@media (max-width:1100px){.ks-dex-ownership-summary{grid-template-columns:repeat(3,minmax(0,1fr))}}
+@media (max-width:650px){.ks-dex-ownership-summary,.ks-dex-ownership-list article{grid-template-columns:1fr}.ks-dex-ownership-list article>span,.ks-dex-ownership-list article>p{text-align:left}}
 /* Compact session actions and restrained secondary controls in both themes. */
 .runtime-monitor-layout .ghost-button,
 .runtime-hero-actions .primary-button,

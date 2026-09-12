@@ -127,6 +127,34 @@ export interface KernSightMirrorStatus {
   serial?: string | null
   detail?: string | null
   logs: string[]
+  coverage: KernSightMirrorCoverage
+}
+
+export interface KernSightMirrorCoverage {
+  networkConnects: number
+  networkHandshakes: number
+  observedFragments: number
+  observedBytes: number
+  reconstructedMessages: number
+  reconstructedRequests: number
+  reconstructedResponses: number
+  delivered: number
+  deliveryFailed: number
+  retryPending: number
+  unknownDirections: number
+  bufferedBytes: number
+  attachedProbes: number
+  activeProbes: number
+  standardTlsFragments: number
+  vendorFragments: number
+  jniFragments: number
+  stackCandidates: number
+  stackExportCandidates: number
+  stackPinnedBoundaries: number
+  stackEmpiricalBoundaries: number
+  stackKeylogCandidates: number
+  stackUncovered: number
+  state: 'idle' | 'waiting_for_network' | 'waiting_for_boundary' | 'unrecognized_stream' | 'delivery_failed' | 'waiting_for_pair' | 'delivering'
 }
 
 export interface KernSightCaptureResult {
@@ -196,6 +224,11 @@ export interface KernSightAnalyzerFact {
 export interface KernSightAnalyzerJoin {
   package: string
   root: string
+  source: 'local'
+  sourceLabel: string
+  dumpId?: string
+  agentVersion?: string
+  dexOwnershipMode: 'class-index' | 'legacy-path'
   sessionId?: string
   fileCount: number
   facts: KernSightAnalyzerFact[]
@@ -224,6 +257,54 @@ export interface KernSightDexSemanticSummary {
   class_descriptors_truncated: boolean
   method_names: string[]
   method_names_truncated: boolean
+  method_prototypes?: string[]
+  method_prototypes_truncated?: boolean
+  api_strings?: string[]
+}
+
+export type KernSightDexOwnershipCategory =
+  | 'business'
+  | 'internal_component'
+  | 'third_party_sdk'
+  | 'dynamic_payload'
+  | 'mixed'
+  | 'unknown'
+
+export interface KernSightDexOwnershipEntry {
+  sha256: string
+  canonical_relative_path: string
+  category: KernSightDexOwnershipCategory
+  confidence: number
+  sampled_classes: number
+  business_classes: number
+  internal_classes: number
+  third_party_classes: number
+  unknown_classes: number
+  dominant_namespaces: string[]
+  reasons: string[]
+}
+
+export interface KernSightDexOwnershipReport {
+  schema_version: string
+  package: string
+  inferred_internal_namespaces?: Array<{
+    namespace: string
+    registered_components: number
+    sampled_classes: number
+    reason: string
+  }>
+  entries: KernSightDexOwnershipEntry[]
+  business: number
+  internal_components: number
+  third_party_sdks: number
+  dynamic_payloads: number
+  mixed: number
+  unknown: number
+  business_class_samples?: number
+  business_dex_sets?: number
+  internal_class_samples?: number
+  third_party_class_samples?: number
+  unknown_class_samples?: number
 }
 
 export interface KernSightDexSet {
@@ -290,6 +371,8 @@ export interface KernSightPackageDumpReport {
   artifacts?: unknown[]
   dex_sets?: KernSightDexSet[]
   dex_index?: KernSightDexIndex
+  dex_ownership?: KernSightDexOwnershipReport
+  registered_component_classes?: string[]
   native_rule_version?: string
   native_framework_matches?: KernSightNativeFrameworkMatch[]
   sensitive_files?: KernSightSensitiveFile[]
@@ -298,6 +381,8 @@ export interface KernSightPackageDumpReport {
   open_code?: Array<Record<string, unknown>>
   code_loaders?: Array<Record<string, unknown>>
   total_bytes?: number
+  physical_bytes?: number
+  deduplicated_bytes?: number
   warnings?: string[]
   graph?: {
     entities?: Array<Record<string, unknown>>

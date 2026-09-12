@@ -9,10 +9,18 @@
         </h3>
         <p>静态命中只是待验证的测试入口，不代表漏洞成立或验证通过。KernSight 的 confirmed / correlated 是证据强度，不会自动改成这里的“确认存在风险”。</p>
       </div>
-      <span class="material-symbols-outlined disclosure-chevron">expand_more</span>
+      <div class="surface-summary-actions">
+        <button type="button" class="ghost-button" title="AI 只生成证据分诊和验证建议，不修改人工结论" @click.stop="$emit('open-ai', 'masvs-triage')"><span class="material-symbols-outlined">neurology</span>AI 证据分诊</button>
+        <span class="material-symbols-outlined disclosure-chevron">expand_more</span>
+      </div>
     </summary>
 
     <div class="analyzer-disclosure-body">
+      <div class="masvs-decision-chain">
+        <span><b>1 · 规则 / 经验库</b><small>匹配控制项与验证手册，不写结论</small></span>
+        <span><b>2 · AI 分诊</b><small>聚合证据、排序与指出缺口，只生成 hypothesis</small></span>
+        <span><b>3 · 运行时 / 人工</b><small>引用证据后，才填写风险、排除或通过</small></span>
+      </div>
       <p v-if="dirty" class="assessment-unsaved">
         <span class="material-symbols-outlined">edit_note</span>
         人工结论或复核备注已修改，尚未保存到项目快照。
@@ -87,6 +95,7 @@ const props = defineProps<{
 const emit = defineEmits<{
   verdict: [controlId: string, verdict: string]
   'update:notes': [notes: string]
+  'open-ai': [taskId: string]
 }>()
 
 const evidenceCount = computed(() => props.observations.filter((item) => item.status !== 'not-assessed').length)

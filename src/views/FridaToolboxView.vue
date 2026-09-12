@@ -2,10 +2,10 @@
   <div class="frida-layout">
     <section class="panel frida-header-card">
       <div class="section-title">
-        <div><div class="eyebrow">RUNTIME OBSERVATION</div><h2>Frida Toolbox · {{ device?.platform === 'ios' ? 'iOS' : device?.platform === 'android' ? 'Android' : '未选择设备' }}</h2><p>{{ device?.platform === 'ios' ? 'iOS 使用 Bundle ID + Attach/Spawn 执行运行时观察和 Mach-O 回收。' : device?.platform === 'android' ? 'Android 使用包名执行 DEX、SO 与诊断工作流。' : '连接并选择设备后，页面会只展示对应平台的运行时流程。' }}</p></div>
+        <div><div class="eyebrow">RUNTIME OBSERVATION</div><h2>Frida Toolbox · {{ device?.platform === 'ios' ? 'iOS' : device?.platform === 'android' ? 'Android' : '未选择设备' }}</h2><p>{{ device?.platform === 'ios' ? 'iOS 使用 Bundle ID + Attach/Spawn 执行运行时观察和 Mach-O 回收。' : device?.platform === 'android' ? 'Android 主证据链已迁移至 KernSight；这里仅保留独立脚本、DEX/SO 回收等兼容工具。' : '连接并选择设备后，页面会只展示对应平台的运行时流程。' }}</p></div>
         <button class="primary-button" :disabled="!device" @click="$emit('refresh')"><span class="material-symbols-outlined">refresh</span>刷新进程</button>
       </div>
-      <div class="frida-notice"><span class="material-symbols-outlined">info</span><span v-if="device?.platform === 'ios'">iOS 已内置 Mach-O 回收和运行时观察；JMCodeProtect 场景优先让 App 保持前台后使用 Attach，Attach 出现 (os/kern) failure 或进程未运行时再切换 Spawn。</span><span v-else-if="device?.platform === 'android'">Android 提供内置 DEX/SO 自动工作流。</span><span v-else>当前仅显示主机环境；选择设备后再加载平台脚本与操作。</span></div>
+      <div class="frida-notice"><span class="material-symbols-outlined">info</span><span v-if="device?.platform === 'ios'">iOS 已内置 Mach-O 回收和运行时观察；JMCodeProtect 场景优先让 App 保持前台后使用 Attach，Attach 出现 (os/kern) failure 或进程未运行时再切换 Spawn。</span><span v-else-if="device?.platform === 'android'">Android 的采集、归属和证据聚合请使用 KernSight；本页工具不会自动进入主证据链。</span><span v-else>当前仅显示主机环境；选择设备后再加载平台脚本与操作。</span></div>
       <details class="frida-guide"><summary>Frida 保姆级使用流程</summary><ol><li>Android：确认设备为 <code>device</code>，准备与主机 CLI 同版本、匹配 ABI 的 frida-server，点击“推送并启动”。</li><li>iOS：确认越狱设备的 Frida 通道可见；如果提示 Developer Disk Image，先选择目录并挂载，再刷新进程。不要全局隐藏越狱环境，否则 Sileo/Frida 服务也可能被隔离，零 Hook 会在脚本执行前失败；目标 App 的兼容策略应单独配置。</li><li>刷新进程后选择包名；Attach 适合已运行 App，Spawn 适合冷启动观察。注入导致目标退出后，MobileE 会清除旧 PID，并把已安装应用保留为 <code>STOPPED</code> 供 Spawn 重试。</li><li>先运行内置只读诊断脚本，再通过“外部脚本路径”加载你审查过的脚本。若目标在 agent 注入前退出，用户脚本无法处理，应改用内部调试构建或目标级测试配置。</li><li>导出/脱壳类工具建议在终端单独运行并把生成的 IPA/APK 回拖到 App Analyzer，工具只负责本地索引、架构识别和敏感线索分类。</li></ol></details>
     </section>
 
@@ -54,9 +54,9 @@
       <label class="script-editor"><span>用户脚本（仅本次运行，默认脚本只读取进程模块信息）</span><textarea v-model="script" spellcheck="false"></textarea></label>
       <div class="configured-action external-script"><div class="configured-path"><span>默认外部脚本</span><code>{{ externalScriptPath || '未配置' }}</code></div><button class="ghost-button" @click="$emit('open-settings')">设置脚本</button><button class="primary-button" :disabled="!selectedProcess || !externalScriptPath || attachUnavailable" @click="submit">运行外部脚本</button></div>
       <p class="active-script-line"><strong>当前将执行：</strong>{{ activeScriptLabel }}</p>
-      <div v-if="device" class="ios-runtime-workflow runtime-evidence-workflow">
+      <div v-if="device?.platform === 'ios'" class="ios-runtime-workflow runtime-evidence-workflow">
         <header>
-          <div><strong>{{ device.platform === 'ios' ? 'iOS' : 'Android' }} 运行时证据流程</strong><small>与 App Analyzer 的运行时证据项一一对应；按包名自动关联。任一步骤被拦截时立即停止后续自动采集，保留已有证据，静态分析不受影响。</small></div>
+          <div><strong>iOS 运行时证据流程</strong><small>与 App Analyzer 的运行时证据项一一对应；按 Bundle ID 自动关联。任一步骤被拦截时立即停止后续自动采集，保留已有证据，静态分析不受影响。</small></div>
           <button class="primary-button" :disabled="!runtimeWorkflowReady || running" @click="runFullRuntimeWorkflow">{{ running ? '运行时采集中…' : '执行平台运行时流程' }}</button>
         </header>
         <div class="runtime-step-grid">
@@ -64,21 +64,25 @@
             <b>{{ index + 1 }}</b><span><strong>{{ step.label }}</strong><small>{{ runtimeStatusLabel(step.key) }}</small></span>
           </button>
         </div>
-        <small>{{ device.platform === 'ios' ? 'Network/TLS 与 WebView 需要在观察时长内操作 App；没有事件时仍会保留观察器已就绪的负向证据。' : 'Java、网络、WebView、存储/密码学和 Root 均为只读观察；不会修改请求、信任结果、存储值或 Root 状态。' }}</small>
-        <details v-if="device.platform === 'ios'" class="frida-guide compact-runtime-tools"><summary>保护 / 终止专项（独立运行）</summary><div class="ios-runtime-actions"><button class="ghost-button" :disabled="!selectedProcess || running" @click="runBuiltinDiagnostic('ios_termination_trace.js')">追踪异常 / 终止调用栈</button><button class="ghost-button" :disabled="!selectedProcess || running" @click="runBuiltinDiagnostic('observe_jmprotection.js')">观察 JMProtection / FishHook</button></div><p>专项观察不属于默认流程，避免额外 Hook 干扰基础证据。只有出现终止调用或保护事件才形成实质证据。</p></details>
+        <small>Network/TLS 与 WebView 需要在观察时长内操作 App；没有事件时仍会保留观察器已就绪的负向证据。</small>
+        <details class="frida-guide compact-runtime-tools"><summary>保护 / 终止专项（独立运行）</summary><div class="ios-runtime-actions"><button class="ghost-button" :disabled="!selectedProcess || running" @click="runBuiltinDiagnostic('ios_termination_trace.js')">追踪异常 / 终止调用栈</button><button class="ghost-button" :disabled="!selectedProcess || running" @click="runBuiltinDiagnostic('observe_jmprotection.js')">观察 JMProtection / FishHook</button></div><p>专项观察不属于默认流程，避免额外 Hook 干扰基础证据。只有出现终止调用或保护事件才形成实质证据。</p></details>
       </div>
       <div v-if="device?.platform === 'android'" class="dex-workflow">
         <div><strong>DEX 运行时产物 · {{ runtimeStatusLabel('dex-artifact') }}</strong><p>程序已内置 Frida 17 原生 dump_dex.js。先勘查 ClassLoader 委派链与 dexElements，可定位隐藏 DEX / 热修复补丁；随后 Dump 会同时覆盖现有元素、内存 DEX 与 DefineClass。</p><button class="ghost-button compact-button" :disabled="!selectedProcess || running" @click="runBuiltinDiagnostic('inspect_classloader.js')">先勘查类加载器</button><button class="ghost-button compact-button" @click="useBuiltIn('dex')">使用内置 DEX 脚本</button></div>
-        <label><span>触发等待</span><input v-model.number="dexDuration" type="number" min="10" max="120" /></label>
-        <div class="configured-path workflow-path"><span>DEX 输出目录</span><code>{{ dexDestination || '桌面 MobileE-Dumps' }}</code></div>
-        <button class="primary-button" :disabled="!dexDumpReady" @click="runDexDump">按当前模式 Dump、修复并拉回电脑</button>
+        <div class="runtime-artifact-controls">
+          <label><span>触发等待（秒）</span><input v-model.number="dexDuration" type="number" min="10" max="120" /></label>
+          <div class="configured-path workflow-path"><span>DEX 输出目录</span><code>{{ dexDestination || '桌面 MobileE-Dumps' }}</code></div>
+          <button class="primary-button" :disabled="!dexDumpReady" @click="runDexDump">按当前模式 Dump、修复并拉回电脑</button>
+        </div>
         <small v-if="activeScriptPath && !isDexScript">当前脚本不是 DEX Dump 脚本，请从脚本列表选择 dump_dex。</small>
       </div>
       <div v-if="device?.platform === 'android'" class="dex-workflow so-workflow">
         <div><strong>SO 运行时产物 · {{ runtimeStatusLabel('so-artifact') }}</strong><p>内置 dump_so.js 会提取 App 私有的已加载/新加载 SO 内存映像，自动拉回电脑，并扫描 URL、IP、接口和硬编码凭据。</p><button class="ghost-button compact-button" @click="useBuiltIn('so')">使用内置 SO 脚本</button></div>
-        <label><span>触发等待</span><input v-model.number="soDuration" type="number" min="10" max="120" /></label>
-        <div class="configured-path workflow-path"><span>SO 输出目录</span><code>{{ soDestination || '桌面 MobileE-Dumps' }}</code></div>
-        <button class="primary-button" :disabled="!soDumpReady" @click="runSoDump">按当前模式 Dump SO、拉回并分析</button>
+        <div class="runtime-artifact-controls">
+          <label><span>触发等待（秒）</span><input v-model.number="soDuration" type="number" min="10" max="120" /></label>
+          <div class="configured-path workflow-path"><span>SO 输出目录</span><code>{{ soDestination || '桌面 MobileE-Dumps' }}</code></div>
+          <button class="primary-button" :disabled="!soDumpReady" @click="runSoDump">按当前模式 Dump SO、拉回并分析</button>
+        </div>
         <small v-if="activeScriptPath && !isSoScript">当前脚本不是 SO Dump 脚本；点击“使用内置 SO 脚本”。</small>
       </div>
       <div v-if="device?.platform === 'ios'" class="ios-dump-compact">

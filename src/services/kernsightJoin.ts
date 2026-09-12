@@ -6,6 +6,14 @@ import type {
 } from '@/types/monitoring'
 
 const DISCLAIMER = 'KernSight 的 confirmed / correlated / inferred 只描述证据怎么连上，不是 MASVS 漏洞结论。静态命中仍须人工判定。'
+const OWNERSHIP_LABELS: Record<string, string> = {
+  business: '核心业务',
+  internal_component: '企业内部组件',
+  dynamic_payload: '动态载荷',
+  third_party_sdk: '第三方 SDK',
+  mixed: '混合归属',
+  unknown: '未判断',
+}
 
 function record(value: unknown): Record<string, any> {
   return value && typeof value === 'object' ? value as Record<string, any> : {}
@@ -52,6 +60,44 @@ export function buildKernSightAnalyzerJoin(bundle: KernSightLocalEvidenceBundle)
   const privateDbs = unique(privateFiles.map(file => file.relativePath).filter(path => /\.db(?:-wal|-shm|-journal)?$/i.test(path)))
   const heapWindows = files.filter(file => file.relativePath.startsWith('runtime/plaintext/'))
   const readableDex = files.filter(file => file.relativePath.startsWith('readable-dex/') || file.relativePath.includes('blob-dex/'))
+  const runtimeSo = files.filter(file => file.relativePath.startsWith('runtime/runtime-so/'))
+  const dexOwnership = dump.dex_ownership
+  const ownershipEntries = dexOwnership?.entries || []
+  const ownershipSummary = ownershipEntries.length
+      ? [
+        ['business', dexOwnership?.business],
+        ['internal_component', dexOwnership?.internal_components],
+        ['dynamic_payload', dexOwnership?.dynamic_payloads],
+        ['third_party_sdk', dexOwnership?.third_party_sdks],
+        ['mixed', dexOwnership?.mixed],
+        ['unknown', dexOwnership?.unknown],
+      ].filter(([, count]) => Number(count || 0) > 0).map(([category, count]) => `${OWNERSHIP_LABELS[String(category)]} ${count}`).join(' · ')
+    : ''
+  const ownershipItems = [...ownershipEntries]
+    .sort((left, right) => right.confidence - left.confidence || left.canonical_relative_path.localeCompare(right.canonical_relative_path))
+    .map(entry => `${OWNERSHIP_LABELS[entry.category] || entry.category} · ${entry.confidence}% · 主包 ${entry.business_classes} 类 · ${entry.canonical_relative_path}${entry.dominant_namespaces?.length ? ` · ${entry.dominant_namespaces.slice(0, 3).join(' / ')}` : ''}`)
+
+  const elfArtifacts = list(dump.artifacts).filter(row => row.kind === 'elf')
+  const runtimeElf = elfArtifacts.filter(row => row.source === 'runtime-so' || String(row.relative_path || '').startsWith('runtime/runtime-so/'))
+  const installedElf = elfArtifacts.filter(row => row.source !== 'runtime-so' && !String(row.relative_path || '').startsWith('runtime/runtime-so/'))
+  const installedBySha = new Map(installedElf.filter(row => row.sha256).map(row => [String(row.sha256), row]))
+  const frameworkByPath = new Map<string, string[]>()
+  for (const match of dump.native_framework_matches || []) {
+    for (const evidence of match.evidence || []) {
+      const path = String(evidence.relative_path || '')
+      if (path) frameworkByPath.set(path, [...(frameworkByPath.get(path) || []), match.name])
+    }
+  }
+  const uniqueRuntimeElf = [...new Map(runtimeElf.map(row => [String(row.sha256 || row.relative_path || ''), row])).values()]
+  const shaAlignedElf = uniqueRuntimeElf.filter(row => row.sha256 && installedBySha.has(String(row.sha256)))
+  const runtimeSoItems = uniqueRuntimeElf.map(row => {
+    const path = String(row.relative_path || '')
+    const installed = row.sha256 ? installedBySha.get(String(row.sha256)) : undefined
+    const mappedIntoPackage = dump.install_dir && String(row.map_path || '').startsWith(String(dump.install_dir))
+    const identity = installed ? `SHA-256 对齐 ${installed.relative_path}` : (mappedIntoPackage ? '安装目录 mmap' : '仅运行时观察')
+    const rules = frameworkByPath.get(path)
+    return `${identity} · ${path}${rules?.length ? ` · 规则候选 ${rules.join(' / ')}` : ''}`
+  })
   const facts: KernSightAnalyzerFact[] = [
     fact(
       'sni',
@@ -98,10 +144,24 @@ export function buildKernSightAnalyzerJoin(bundle: KernSightLocalEvidenceBundle)
     fact(
       'dex',
       'L2',
-      'Dump DEX',
-      (dump.dex_index?.unique_dex || dump.readable_dex || readableDex.length) ? 'inferred' : 'absent',
-      `${dump.dex_index?.unique_dex ?? dump.readable_dex ?? readableDex.length} 个唯一/可读 DEX · heap/memory ${dump.runtime_blob_dex || 0}；DEX↔mmap 只标 correlated`,
-      unique(readableDex.map(file => file.relativePath)).slice(0, 8),
+      'DEX 业务归属',
+      (ownershipEntries.length || dump.dex_index?.unique_dex || dump.readable_dex || readableDex.length) ? 'inferred' : 'absent',
+      ownershipEntries.length
+        ? `${ownershipEntries.length} 个 SHA-256 唯一 DEX；主包 ${dexOwnership?.business_class_samples ?? ownershipEntries.reduce((sum, entry) => sum + Number(entry.business_classes || 0), 0)} 个类样本 / ${dexOwnership?.business_dex_sets ?? ownershipEntries.filter(entry => Number(entry.business_classes || 0) > 0).length} 个 DEX；${ownershipSummary}。分类来自同一份 ksightd 类级索引，AI 只复核 mixed / unknown`
+        : `${dump.dex_index?.unique_dex ?? dump.readable_dex ?? readableDex.length} 个唯一/可读 DEX；当前本地报告没有 dex_ownership，仅按证据目录降级展示，请用新版 ksightd 重新编目或从手机重新拉取`,
+      ownershipEntries.length ? ownershipItems : unique(readableDex.map(file => `旧版路径候选 · ${file.relativePath}`)),
+    ),
+    fact(
+      'so',
+      'L2',
+      'SO 运行归属',
+      (uniqueRuntimeElf.length || runtimeSo.length) ? (shaAlignedElf.length ? 'confirmed' : 'correlated') : 'absent',
+      uniqueRuntimeElf.length
+        ? `${uniqueRuntimeElf.length} 个内容去重后的运行时 SO；${shaAlignedElf.length} 个与安装态 ELF 的 SHA-256 完全一致。框架规则只标候选，不决定 APK 归属`
+        : runtimeSo.length
+          ? `${runtimeSo.length} 个运行时 SO 文件；旧报告缺少可比对 ELF 元数据，只能标 correlated`
+        : '没有 runtime/runtime-so 产物；不能判断安装包 SO 是否在本会话执行',
+      runtimeSoItems.length ? runtimeSoItems : unique(runtimeSo.map(file => `运行时文件 · ${file.relativePath}`)),
     ),
     fact(
       'private',
@@ -123,6 +183,11 @@ export function buildKernSightAnalyzerJoin(bundle: KernSightLocalEvidenceBundle)
   return {
     package: bundle.package,
     root: bundle.root,
+    source: 'local',
+    sourceLabel: 'Mac 本地证据副本',
+    dumpId: dump.dump_id,
+    agentVersion: dump.agent_version,
+    dexOwnershipMode: ownershipEntries.length ? 'class-index' : 'legacy-path',
     sessionId: String(session.session_id || ''),
     fileCount: bundle.fileCount,
     facts,

@@ -12,6 +12,8 @@ mod config;
 mod monitoring;
 
 pub(crate) const ADB_TIMEOUT: Duration = Duration::from_secs(20);
+const ADB_INSTALL_TIMEOUT: Duration = Duration::from_secs(300);
+const ADB_UNINSTALL_TIMEOUT: Duration = Duration::from_secs(90);
 static ADB_COMMAND_GATE: OnceLock<Mutex<()>> = OnceLock::new();
 
 fn adb_command_gate() -> &'static Mutex<()> {
@@ -100,8 +102,61 @@ struct ProcessInfo {
     user: String,
     memory_kb: u64,
     name: String,
+    display_name: Option<String>,
     protected: bool,
     system: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct InstalledAppInfo {
+    package_name: String,
+    display_name: String,
+    label_resolved: bool,
+}
+
+async fn installed_android_app_labels(serial: &str) -> HashMap<String, String> {
+    // Android's `ps` output intentionally contains process/package names only.
+    // Frida's application inventory already resolves Android resources to the
+    // localized label, so use it as a best-effort enrichment with a strict
+    // timeout. A missing Frida tool/server must never block Process Monitor.
+    let output = match timeout(
+        Duration::from_secs(3),
+        Command::new("frida-ps")
+            .args(["-D", serial, "-ai"])
+            .kill_on_drop(true)
+            .output(),
+    )
+    .await
+    {
+        Ok(Ok(output)) if output.status.success() => output,
+        _ => return HashMap::new(),
+    };
+
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(|line| {
+            let columns: Vec<_> = line
+                .trim()
+                .split("  ")
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .collect();
+            // `frida-ps -ai` uses "-" for an installed but currently stopped
+            // application. Keep those rows: the label is static application
+            // metadata and must not depend on a running process.
+            if columns.len() < 3 || (columns[0] != "-" && columns[0].parse::<u32>().is_err()) {
+                return None;
+            }
+            let package = columns.last()?.to_string();
+            let label = columns[1..columns.len() - 1].join(" ");
+            if package.is_empty() || label.is_empty() || label == package {
+                None
+            } else {
+                Some((package, label))
+            }
+        })
+        .collect()
 }
 
 #[derive(Debug, Deserialize)]
@@ -127,12 +182,21 @@ pub(crate) struct RawOutput {
     pub(crate) code: Option<i32>,
 }
 
-async fn run_adb_once(args: &[String]) -> Result<std::process::Output, String> {
+async fn run_adb_once(
+    args: &[String],
+    command_timeout: Duration,
+    operation: &str,
+) -> Result<std::process::Output, String> {
     let mut command = Command::new("adb");
     command.args(args).kill_on_drop(true);
-    timeout(ADB_TIMEOUT, command.output())
+    timeout(command_timeout, command.output())
         .await
-        .map_err(|_| "ADB 操作超时，请检查手机连接状态".to_string())?
+        .map_err(|_| {
+            format!(
+                "{operation}超过 {} 秒仍未完成；命令已终止。这不代表手机已断开，请检查设备端安装确认框、Package Installer 或目标应用状态",
+                command_timeout.as_secs()
+            )
+        })?
         .map_err(|error| format!("无法启动 adb：{error}。请先安装 Android platform-tools"))
 }
 
@@ -149,14 +213,18 @@ fn is_adb_daemon_failure(output: &std::process::Output) -> bool {
         || message.contains("protocol fault")
 }
 
-pub(crate) async fn run_adb(args: &[String]) -> Result<RawOutput, String> {
+async fn run_adb_with_timeout(
+    args: &[String],
+    command_timeout: Duration,
+    operation: &str,
+) -> Result<RawOutput, String> {
     // If the daemon is absent, every concurrent adb client otherwise tries to
     // become the server. macOS then reports USB interface ownership failures
     // and none of the competing daemons survives. Keep the complete command
     // behind one process-wide gate; normal adb calls are short and the device
     // detail fan-out remains fast enough while startup/restart stays reliable.
     let _guard = adb_command_gate().lock().await;
-    let mut output = run_adb_once(args).await?;
+    let mut output = run_adb_once(args, command_timeout, operation).await?;
     if !output.status.success() && is_adb_daemon_failure(&output) {
         // Recovery is deliberately limited to daemon-transport failures. Do
         // not restart a healthy server for ordinary device/command errors.
@@ -172,7 +240,7 @@ pub(crate) async fn run_adb(args: &[String]) -> Result<RawOutput, String> {
             .await
             .map_err(|error| format!("ADB daemon 自动恢复失败：{error}"))?;
         if start.status.success() {
-            output = run_adb_once(args).await?;
+            output = run_adb_once(args, command_timeout, operation).await?;
         }
     }
 
@@ -183,13 +251,28 @@ pub(crate) async fn run_adb(args: &[String]) -> Result<RawOutput, String> {
     })
 }
 
+pub(crate) async fn run_adb(args: &[String]) -> Result<RawOutput, String> {
+    run_adb_with_timeout(args, ADB_TIMEOUT, "ADB 操作").await
+}
+
 pub(crate) async fn run_device_adb(serial: &str, tail: &[&str]) -> Result<RawOutput, String> {
     let mut args = vec!["-s".to_string(), serial.to_string()];
     args.extend(tail.iter().map(|item| item.to_string()));
     run_adb(&args).await
 }
 
-fn shell_quote(value: &str) -> String {
+pub(crate) async fn run_device_adb_with_timeout(
+    serial: &str,
+    tail: &[&str],
+    command_timeout: Duration,
+    operation: &str,
+) -> Result<RawOutput, String> {
+    let mut args = vec!["-s".to_string(), serial.to_string()];
+    args.extend(tail.iter().map(|item| item.to_string()));
+    run_adb_with_timeout(&args, command_timeout, operation).await
+}
+
+pub(crate) fn shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
 }
 
@@ -638,6 +721,7 @@ async fn list_processes(serial: String) -> Result<Vec<ProcessInfo>, String> {
         .position(|item| *item == "NAME" || *item == "CMD")
         .unwrap_or_else(|| header.len().saturating_sub(1));
 
+    let labels = installed_android_app_labels(&serial).await;
     let mut processes: Vec<_> = lines
         .filter_map(|line| {
             let fields: Vec<_> = line.split_whitespace().collect();
@@ -650,10 +734,12 @@ async fn list_processes(serial: String) -> Result<Vec<ProcessInfo>, String> {
                 .unwrap_or(0);
             let protected = user == "root" || name == "zygote" || name == "zygote64";
             let system = !user.starts_with("u0_") && user != "shell";
+            let package = name.split(':').next().unwrap_or(&name);
             Some(ProcessInfo {
                 pid,
                 user,
                 memory_kb,
+                display_name: labels.get(package).cloned(),
                 name,
                 protected,
                 system,
@@ -663,6 +749,36 @@ async fn list_processes(serial: String) -> Result<Vec<ProcessInfo>, String> {
     processes.sort_by(|left, right| right.memory_kb.cmp(&left.memory_kb));
     processes.truncate(100);
     Ok(processes)
+}
+
+#[tauri::command]
+async fn list_installed_apps(serial: String) -> Result<Vec<InstalledAppInfo>, String> {
+    let output =
+        ensure_success(run_device_adb(&serial, &["shell", "pm", "list", "packages", "-3"]).await?)?;
+    let labels = installed_android_app_labels(&serial).await;
+    let mut apps = output
+        .stdout
+        .lines()
+        .filter_map(|line| line.trim().strip_prefix("package:"))
+        .map(str::trim)
+        .filter(|package| !package.is_empty())
+        .map(|package| {
+            let resolved = labels.get(package).cloned();
+            InstalledAppInfo {
+                package_name: package.to_owned(),
+                display_name: resolved.clone().unwrap_or_else(|| package.to_owned()),
+                label_resolved: resolved.is_some(),
+            }
+        })
+        .collect::<Vec<_>>();
+    apps.sort_by(|left, right| {
+        left.display_name
+            .to_lowercase()
+            .cmp(&right.display_name.to_lowercase())
+            .then(left.package_name.cmp(&right.package_name))
+    });
+    apps.dedup_by(|left, right| left.package_name == right.package_name);
+    Ok(apps)
 }
 
 fn validate_package_name(value: &str) -> Result<(), String> {
@@ -757,6 +873,11 @@ async fn run_adb_action(request: AdbActionRequest) -> Result<CommandResult, Stri
     };
     let output = if let Some(script) = root_script {
         run_device_root_script(&request.serial, script).await?
+    } else if request.action == "install_apk" {
+        run_device_adb_with_timeout(&request.serial, &tail, ADB_INSTALL_TIMEOUT, "APK 安装").await?
+    } else if request.action == "uninstall_apk" {
+        run_device_adb_with_timeout(&request.serial, &tail, ADB_UNINSTALL_TIMEOUT, "应用卸载")
+            .await?
     } else {
         run_device_adb(&request.serial, &tail).await?
     };
@@ -912,6 +1033,7 @@ pub fn run() {
             get_ios_device_details,
             get_device_details,
             list_processes,
+            list_installed_apps,
             run_adb_action,
             pull_device_files,
             push_device_file,
@@ -971,7 +1093,10 @@ pub fn run() {
             monitoring::list_kernsight_package_dumps,
             monitoring::read_kernsight_package_file,
             monitoring::import_kernsight_evidence_directory,
+            monitoring::import_kernsight_evidence_archive,
+            monitoring::export_kernsight_evidence_archive,
             monitoring::pull_kernsight_package_evidence,
+            monitoring::pull_kernsight_package_archive,
             monitoring::read_local_kernsight_evidence_file,
             monitoring::cleanup_kernsight_package_dump,
         ])

@@ -3,11 +3,12 @@
     <header class="app-header">
       <div class="brand-status">
         <button class="icon-button sidebar-toggle" :title="sidebarCollapsed ? '展开菜单' : '收起菜单'" @click="sidebarCollapsed = !sidebarCollapsed"><span class="material-symbols-outlined">{{ sidebarCollapsed ? 'menu_open' : 'menu' }}</span></button>
-        <h1>MobileE</h1>
+        <h1>ME</h1>
       </div>
       <div class="workspace-context">
         <span>{{ activeViewMeta.section }}</span>
         <strong>{{ activeViewMeta.label }}</strong>
+        <small>{{ activeViewMeta.description }}</small>
       </div>
       <div class="header-actions">
         <button class="icon-button" :title="theme === 'dark' ? '切换 Codex 浅色' : '切换暗色'" @click="toggleTheme"><span class="material-symbols-outlined">{{ theme === 'dark' ? 'light_mode' : 'dark_mode' }}</span></button>
@@ -19,28 +20,19 @@
     <div class="workspace-shell" :class="{ 'sidebar-collapsed': sidebarCollapsed }">
       <aside class="workspace-sidebar">
         <nav class="workspace-nav" aria-label="主导航">
-          <section class="nav-cluster" :class="{ active: deviceViews.includes(activeTab) }">
-            <button class="nav-parent" title="Connected Devices" :class="{ active: activeTab === 'devices' }" @click="activeTab = 'devices'">
-              <span class="material-symbols-outlined">devices</span><span><strong>Connected Devices</strong><small>设备、连接与基础操作</small></span>
-            </button>
-            <div class="nav-children">
-              <button :class="{ active: activeTab === 'devices' }" @click="activeTab = 'devices'"><span class="material-symbols-outlined">smartphone</span>设备总览</button>
-              <button :class="{ active: activeTab === 'adb' }" @click="activeTab = 'adb'"><span class="material-symbols-outlined">handyman</span>Device Tools</button>
-            </div>
-          </section>
-
-          <section class="nav-cluster" :class="{ active: analysisViews.includes(activeTab) }">
-            <button class="nav-parent" title="App / IPA Analysis" :class="{ active: analysisViews.includes(activeTab) }" @click="activeTab = 'analyzer'">
-              <span class="material-symbols-outlined">security</span><span><strong>App / IPA Analysis</strong><small>单个移动应用的证据工作台</small></span>
-            </button>
-            <div class="nav-children analysis-menu">
-              <button v-for="item in analysisMenu" :key="item.id" :class="{ active: activeTab === item.id }" @click="activeTab = item.id"><span class="material-symbols-outlined">{{ item.icon }}</span>{{ item.label }}</button>
-            </div>
-          </section>
-
-          <section class="nav-cluster runtime-nav" :class="{ active: activeTab === 'android-runtime' }">
-            <button class="nav-parent" title="KernSight 证据链" :class="{ active: activeTab === 'android-runtime' }" @click="activeTab = 'android-runtime'">
-              <span class="material-symbols-outlined">monitor_heart</span><span><strong>KernSight 证据链</strong><small>L0 Observe · L1 Inspect · L2 Dump</small></span><em>NEW</em>
+          <section v-for="group in navigationGroups" :key="group.label" class="nav-section">
+            <p class="nav-section-label">{{ group.label }}</p>
+            <button
+              v-for="item in group.items"
+              :key="item.id"
+              class="nav-item"
+              :class="{ active: activeTab === item.id }"
+              :title="`${item.label} · ${item.description}`"
+              @click="activeTab = item.id"
+            >
+              <span class="material-symbols-outlined">{{ item.icon }}</span>
+              <span><strong>{{ item.label }}</strong><small>{{ item.description }}</small></span>
+              <em v-if="item.badge">{{ item.badge }}</em>
             </button>
           </section>
         </nav>
@@ -62,26 +54,28 @@
         :selected-serial="selectedSerial"
         :details="details"
         :ios-details="iosDetails"
-        :processes="processes"
+        :installed-apps="installedApps"
         :loading="loading"
         @select-device="selectDevice"
         @refresh="refreshSelected"
         @refresh-devices="refreshDevices"
-        @inspect-process="inspectProcess"
       />
       <!-- Keep KernSight mounted so device/session/report state survives menu switches. -->
       <AndroidRuntimeMonitorView
         v-show="activeTab === 'android-runtime'"
         :device="selectedDevice"
         :details="details"
+        :installed-apps="fridaProcesses"
         @open-devices="activeTab = 'devices'"
         @open-ai="activeTab = 'ai-workbench'"
       />
       <AdbToolboxView
         v-show="activeTab === 'adb'"
+        :active="activeTab === 'adb'"
         :device="selectedDevice"
         :android-available="selectedDevice?.platform === 'android'"
         :history="terminalHistory"
+        :installed-apps="fridaProcesses"
         :running="commandRunning"
         :certificate="activeCertificate"
         :certificate-busy="certificateBusy"
@@ -121,10 +115,10 @@
         @open-settings="showSettings = true"
         @guidance-consumed="fridaGuidanceRequest = undefined"
       />
-      <ApkAnalyzerView v-else-if="activeTab === 'analyzer'" :analysis="analysis" :analyzing="analysisRunning" :history="terminalHistory" :focus-request="analyzerFocusRequest" @analyze="analyzeApp" @replace-analysis="analysis = $event" @restore-runtime-history="restoreRuntimeHistory" @open-runtime="openRuntimeConfirmation" @open-ai="activeTab = 'ai-workbench'" @open-data-flow="activeTab = 'boundaries'" @open-settings="showSettings = true" @open-kern-sight="activeTab = 'android-runtime'" @focus-consumed="analyzerFocusRequest = undefined" />
+      <ApkAnalyzerView v-else-if="activeTab === 'analyzer'" :analysis="analysis" :analyzing="analysisRunning" :history="terminalHistory" :focus-request="analyzerFocusRequest" @analyze="analyzeApp" @replace-analysis="analysis = $event" @restore-runtime-history="restoreRuntimeHistory" @open-runtime="openRuntimeConfirmation" @open-ai="openAiReview" @open-data-flow="activeTab = 'boundaries'" @open-settings="showSettings = true" @open-kern-sight="activeTab = 'android-runtime'" @focus-consumed="analyzerFocusRequest = undefined" />
       <DataBoundariesView v-else-if="activeTab === 'boundaries'" :analysis="analysis" :history="terminalHistory" :device="selectedDevice" @open-ai="activeTab = 'ai-workbench'" @open-analyzer="openAnalyzerEvidence" />
       <!-- Keep the workbench mounted: provider requests and generated evidence must survive tab switches. -->
-      <AiWorkbenchView v-show="activeTab === 'ai-workbench'" :analysis="analysis" :history="terminalHistory" :device="selectedDevice" />
+      <AiWorkbenchView v-show="activeTab === 'ai-workbench'" :analysis="analysis" :history="terminalHistory" :device="selectedDevice" :task-request="aiTaskRequest" />
         </main>
       </div>
     </div>
@@ -151,29 +145,36 @@ import type {
   AppAnalysis,
   CertificateInfo,
   EnvironmentReport,
-  ProcessInfo,
   TerminalEntry,
 } from '@/types'
 
 type TabId = 'devices' | 'adb' | 'frida' | 'analyzer' | 'boundaries' | 'ai-workbench' | 'android-runtime'
 
-const deviceViews: TabId[] = ['devices', 'adb']
-const analysisViews: TabId[] = ['analyzer', 'frida', 'boundaries', 'ai-workbench']
-const analysisMenu: { id: TabId; label: string; icon: string }[] = [
-  { id: 'analyzer', label: 'Static Analysis', icon: 'document_scanner' },
-  { id: 'frida', label: 'Runtime / Frida', icon: 'hub' },
-  { id: 'boundaries', label: 'Data Flow', icon: 'account_tree' },
-  { id: 'ai-workbench', label: 'AI Review', icon: 'neurology' },
+type NavigationItem = { id: TabId; label: string; description: string; icon: string; badge?: string }
+const navigationGroups: { label: string; items: NavigationItem[] }[] = [
+  { label: '设备', items: [
+    { id: 'devices', label: '设备总览', description: '连接、状态与已安装应用', icon: 'devices' },
+    { id: 'adb', label: '设备操作', description: 'ADB、文件与网络实验', icon: 'handyman' },
+  ] },
+  { label: '应用分析', items: [
+    { id: 'analyzer', label: '静态分析', description: 'APK / IPA 清单与证据', icon: 'document_scanner' },
+    { id: 'frida', label: '运行时分析', description: 'Frida、DEX 与 Native', icon: 'hub' },
+    { id: 'boundaries', label: '数据流', description: '来源、去向与关联链路', icon: 'account_tree' },
+    { id: 'ai-workbench', label: 'AI 复核', description: '证据包与模型审查', icon: 'neurology' },
+  ] },
+  { label: 'Android 观测', items: [
+    { id: 'android-runtime', label: 'KernSight', description: '采集、会话与 L2 证据', icon: 'monitor_heart', badge: 'LAB' },
+  ] },
 ]
 
-const viewMetadata: Record<TabId, { section: string; label: string }> = {
-  devices: { section: 'DEVICE WORKSPACE', label: 'Connected Devices' },
-  adb: { section: 'DEVICE WORKSPACE', label: 'Device Tools' },
-  analyzer: { section: 'APP / IPA ANALYSIS', label: 'Static Analysis' },
-  frida: { section: 'APP / IPA ANALYSIS', label: 'Runtime / Frida' },
-  boundaries: { section: 'APP / IPA ANALYSIS', label: 'Data Flow' },
-  'ai-workbench': { section: 'APP / IPA ANALYSIS', label: 'AI Context / Review' },
-  'android-runtime': { section: 'ANDROID · EVIDENCE CHAIN', label: 'L0 / L1 / L2' },
+const viewMetadata: Record<TabId, { section: string; label: string; description: string }> = {
+  devices: { section: 'DEVICE', label: '设备总览', description: '设备状态与第三方应用清单' },
+  adb: { section: 'DEVICE', label: '设备操作', description: '按任务选择工具，不再堆叠全部功能' },
+  analyzer: { section: 'APP ANALYSIS', label: '静态分析', description: 'APK / IPA 本地证据清单' },
+  frida: { section: 'APP ANALYSIS', label: '运行时分析', description: '进程、脚本与运行时产物' },
+  boundaries: { section: 'APP ANALYSIS', label: '数据流', description: '跨静态与运行时证据关联' },
+  'ai-workbench': { section: 'APP ANALYSIS', label: 'AI 复核', description: '结构化上下文与结论验证' },
+  'android-runtime': { section: 'ANDROID OBSERVABILITY', label: 'KernSight', description: 'L0 / L1 会话与 L2 包证据' },
 }
 
 const activeTab = ref<TabId>('devices')
@@ -184,6 +185,7 @@ const toolDirectory = computed(() => appConfig.toolDirectory)
 const analysis = ref<AppAnalysis | null>(null)
 const fridaGuidanceRequest = ref<{ id: number; appId: string; platform: 'android' | 'ios'; purpose: 'anti-instrumentation' }>()
 const analyzerFocusRequest = ref<{ id: string; sourceType: string; sourceLocation?: string }>()
+const aiTaskRequest = ref<{ id: number; taskId: string }>()
 const activeCertificate = ref<CertificateInfo | null>(null)
 const commandRunning = ref(false)
 const analysisRunning = ref(false)
@@ -194,12 +196,17 @@ const sidebarCollapsed = ref(localStorage.getItem('mobilee.sidebarCollapsed') ==
 const theme = ref<'dark' | 'light'>(localStorage.getItem('mobilee.theme') === 'light' ? 'light' : 'dark')
 let connectionTimer: ReturnType<typeof setInterval> | undefined
 
+function openAiReview(taskId = 'attack-surface') {
+  aiTaskRequest.value = { id: Date.now(), taskId }
+  activeTab.value = 'ai-workbench'
+}
+
 const {
   devices,
   selectedSerial,
   details,
   iosDetails,
-  processes,
+  installedApps,
   loading,
   selectedDevice,
   refreshDevices,
@@ -216,6 +223,7 @@ const {
   fridaProcesses,
   fridaScripts,
   refreshFrida,
+  refreshFridaProcesses,
   runFrida,
   runRuntimeWorkflow,
   runDexDump,
@@ -400,6 +408,9 @@ function restoreRuntimeHistory(entries: TerminalEntry[]) {
 }
 
 async function runAction(payload: { action: AdbAction; argument?: string }) {
+  // The toolbox has several entry points (button, Enter key, quick action).
+  // Ignore a second UI event while the first command owns the ADB channel.
+  if (commandRunning.value) return
   if (!selectedSerial.value || selectedDevice.value?.platform !== 'android') {
     error.value = '请先连接并选择一台 Android 设备'
     return
@@ -429,11 +440,6 @@ async function runAction(payload: { action: AdbAction; argument?: string }) {
   } finally {
     commandRunning.value = false
   }
-}
-
-async function inspectProcess(process: ProcessInfo) {
-  activeTab.value = 'adb'
-  await runAction({ action: 'process_info', argument: process.name })
 }
 
 function openRuntimeConfirmation() {
@@ -488,6 +494,10 @@ watch(activeTab, (tab) => {
     void refreshEnvironment(false)
   }
 })
+
+watch(() => [selectedSerial.value, selectedDevice.value?.platform] as const, ([serial, platform]) => {
+  if (serial && platform === 'android') void refreshFridaProcesses(false)
+}, { immediate: true })
 
 watch(toolDirectory, async (directory) => {
   try {

@@ -1,11 +1,13 @@
 <template>
   <div class="analyzer-layout">
-    <ScrollAnchorNav :anchors="analyzerAnchors" />
-    <section class="drop-zone panel" :class="{ dragging }" @dragover.prevent="dragging = true" @dragleave.prevent="dragging = false" @drop.prevent="onDrop">
-      <input ref="fileInput" type="file" accept=".apk,.ipa,application/vnd.android.package-archive" @change="onSelect" />
+    <section class="drop-zone panel" :class="{ dragging, 'has-analysis': !!analysis }" @dragover.prevent="dragging = true" @dragleave.prevent="dragging = false" @drop.prevent="onDrop">
       <span class="material-symbols-outlined">upload_file</span>
-      <div><h2>{{ selectedName || 'Drop APK / IPA Here' }}</h2><p>{{ filePath || '拖拽文件或输入本机绝对路径，分析过程在本机完成。' }}</p></div>
-      <div class="drop-actions"><button class="primary-button" @click="chooseFile">选择本机文件</button><button class="ghost-button" @click="fileInput?.click()">浏览器文件</button></div>
+      <div class="drop-source-copy"><div class="eyebrow">APP SOURCE</div><h2>{{ selectedName || '导入 APK / IPA' }}</h2><p>拖入文件、选择本机文件，或直接粘贴绝对路径。分析始终在本机完成。</p></div>
+      <div class="drop-path-row">
+        <input v-model.trim="filePath" placeholder="/absolute/path/to/app.apk or app.ipa" @keyup.enter="analyze" />
+        <button class="ghost-button" @click="chooseFile">选择文件</button>
+        <button class="primary-button" :disabled="!filePath || analyzing" @click="analyze">{{ analyzing ? '分析中…' : '开始分析' }}</button>
+      </div>
     </section>
 
     <section class="panel analyzer-card">
@@ -28,14 +30,22 @@
           <span class="live-pill" :class="{ online: !!analysis }">{{ analysis ? 'ANALYZED' : 'IDLE' }}</span>
         </div>
       </div>
-      <div class="analyzer-path-row"><input v-model.trim="filePath" placeholder="/absolute/path/to/app.apk or app.ipa" @keyup.enter="analyze" /><button class="primary-button" :disabled="!filePath || analyzing" @click="analyze">{{ analyzing ? '分析中…' : '开始分析' }}</button></div>
       <section class="analyzer-config-summary">
         <div><span>Apktool</span><code>{{ apktoolPath || '未配置' }}</code></div>
         <div><span>JADX</span><code>{{ jadxPath || '未配置' }}</code></div>
         <div><span>URL 过滤</span><strong>{{ excludedUrlPatterns.length }} 条规则</strong></div>
-        <button class="ghost-button" @click="emit('openSettings')"><span class="material-symbols-outlined">settings</span>分析器设置</button>
+        <div class="analyzer-config-actions">
+          <button class="ghost-button" @click="emit('openSettings')"><span class="material-symbols-outlined">settings</span>分析器设置</button>
+          <details class="analyzer-help-popover">
+            <summary class="help-dot" title="查看分析器运行说明" aria-label="查看分析器运行说明">?</summary>
+            <div>
+              <strong>分析器运行说明</strong>
+              <p>JADX / Apktool 在后台以 CLI 方式运行，不会打开 GUI。扫描完成后临时反编译目录会自动删除，终端进程短暂出现后消失属于正常完成。</p>
+              <p>APK 的 JAR 工具需要 Java；IPA 的内置 Plist / Mach-O 分析不依赖 Java。</p>
+            </div>
+          </details>
+        </div>
       </section>
-      <p class="tool-behavior-note">JADX/Apktool 以后台 CLI 方式运行，不会打开 GUI；扫描完成后临时反编译目录会自动删除，所以终端进程短暂出现后消失属于正常完成，不是闪退。APK 的 JAR 工具需要 Java，IPA 的内置 Plist/Mach-O 分析不依赖 Java。</p>
       <div v-if="analyzing" class="analysis-progress"><div class="analysis-progress-bar"><i></i></div><strong>{{ progressSteps[progressStep] }}</strong><small>大型 APK、Flutter SO 或 JADX 反编译可能需要数分钟，请不要重复点击。</small></div>
       <div v-if="!analysis" class="analyzer-placeholder"><span class="material-symbols-outlined">policy</span><h3>等待 APK / IPA</h3><p>读取包名、版本、架构、权限、组件、签名摘要和敏感文件线索；不会上传文件，也不会默认提取密钥或敏感数据。</p></div>
       <template v-else>
@@ -72,35 +82,80 @@
           <header><div><div class="eyebrow">DATA FLOW PREVIEW</div><strong>{{ boundaryFlows.length }} 条归并流程</strong><small>这里仅显示边界摘要；来源、去向和运行时关联统一放在 Data Flow 页面。</small></div><button class="ghost-button compact-button" @click="emit('openDataFlow')">打开 Data Flow <span class="material-symbols-outlined">arrow_forward</span></button></header>
           <div><article v-for="item in boundaryPreview" :key="item.boundary"><span>{{ item.label }}</span><strong>{{ item.count }}</strong></article><p v-if="!boundaryPreview.length">当前静态分析尚未形成可归并的数据边界。</p></div>
         </section>
-        <div id="analyzer-anti" class="analyzer-anchor-section" :class="{ focused: focusedSection === 'analyzer-anti' }"><AntiInstrumentationPanel
-          :assessment="analysis.antiInstrumentation || { status: 'not-detected', candidates: [], indicators: [] }"
-          :platform="analysis.platform"
-          :runtime-steps="runtimeCoverage"
-          :kern-sight-join="kernSightJoin"
-          :importing-kern-sight="importingKernSight"
-          @open-runtime="emit('openRuntime')"
-          @open-ai="emit('openAi')"
-          @open-kern-sight="openKernSightChain"
-          @import-kern-sight="importKernSightEvidence"
-        /></div>
-        <div id="analyzer-masvs" class="analyzer-anchor-section" :class="{ focused: focusedSection === 'analyzer-masvs' }"><MasvsWorkbench
-          :observations="analysis.masvsObservations"
-          :recipes="analysis.verificationRecipes"
-          :verdicts="assessmentVerdicts"
-          :notes="assessmentNotes"
-          :dirty="assessmentDirty"
-          @verdict="setAssessmentVerdict"
-          @update:notes="setAssessmentNotes"
-        /></div>
-        <details v-if="analysis.signature" class="manifest-panel"><summary>签名与证书详情</summary><pre>{{ analysis.signature }}</pre></details>
-        <div id="analyzer-static" class="analyzer-anchor-section" :class="{ focused: focusedSection === 'analyzer-static' }"><StaticSurfacePanel :analysis="analysis" /></div>
-        <p class="focus-view-hint"><strong>{{ focusOnly ? '重点视图' : '完整原始视图' }}</strong>：{{ focusOnly ? '优先展示业务类/方法、真实 Endpoint、TLS、Keychain、动态加载和 CodeProtect 映射；隐藏 SDK/编译器通用词、格式化模板及构建路径。' : '显示全部可恢复证据，可能包含 Swift/Foundation/NIO/OpenCV 等第三方内部噪音。' }}</p>
-        <div id="analyzer-code" class="analyzer-anchor-section" :class="{ focused: focusedSection === 'analyzer-code' }"><CodeIntelligencePanel :items="analysis.codeInsights" :focus-only="focusOnly" /></div>
-        <div id="analyzer-binary" class="analyzer-anchor-section" :class="{ focused: focusedSection === 'analyzer-binary' }"><BinaryInsightsPanel :items="analysis.binaryInsights" :focus-only="focusOnly" /></div>
-        <div id="analyzer-findings" class="findings-list analyzer-anchor-section" :class="{ focused: focusedSection === 'analyzer-findings' }"><h3>Review findings <small>{{ analysis.findings.length + analysis.protection.indicators.length }}</small></h3><article v-for="finding in analysis.findings" :key="finding.title + finding.detail"><b :class="`finding-${finding.severity}`">{{ finding.severity }}</b><div><strong>{{ finding.title }}</strong><p>{{ finding.detail }}</p></div></article><article v-for="indicator in analysis.protection.indicators" :key="indicator"><b class="finding-review">review</b><div><strong>加固/动态加载线索</strong><p>{{ indicator }}</p></div></article></div>
-        <div id="analyzer-sensitive" class="analyzer-anchor-section" :class="{ focused: focusedSection === 'analyzer-sensitive' }"><SensitiveItemsPanel :items="analysis.sensitiveItems" :file-name="analysis.fileName" :focus-only="focusOnly" @message="sensitiveMessage = $event" /></div>
-        <details class="manifest-panel" v-if="analysis.platform === 'android' && analysis.manifestXml"><summary>AndroidManifest.xml（AXML / aapt 解码结果）</summary><pre>{{ analysis.manifestXml }}</pre></details>
-        <details class="file-inventory"><summary>Interesting archive entries（{{ visibleFiles(analysis.files).length }} / {{ analysis.files.length }}）</summary><code v-for="file in visibleFiles(analysis.files)" :key="file">{{ file }}</code></details>
+        <nav class="analyzer-workspace-tabs" aria-label="分析结果工作区">
+          <button v-for="item in workspaceTabs" :key="item.id" type="button" :class="{ active: activeWorkspace === item.id }" @click="activeWorkspace = item.id">
+            <span class="material-symbols-outlined">{{ item.icon }}</span>
+            <span><strong>{{ item.label }}</strong><small>{{ item.description }}</small></span>
+            <b>{{ item.count }}</b>
+          </button>
+        </nav>
+
+        <section v-show="activeWorkspace === 'evidence'" class="analyzer-workspace analyzer-workspace-evidence">
+          <header class="analyzer-workspace-heading"><div><div class="eyebrow">STATIC ↔ RUNTIME</div><h3>证据关联</h3><p>按当前包名合并 KernSight session / dump 与静态候选；证据强度保持原样，不自动升级结论。</p></div><button class="ghost-button compact-button" @click="openPrimaryRuntime">{{ analysis.platform === 'android' ? '打开 KernSight' : '打开运行时工具' }}</button></header>
+          <div id="analyzer-anti" class="analyzer-anchor-section" :class="{ focused: focusedSection === 'analyzer-anti' }"><AntiInstrumentationPanel
+            :assessment="analysis.antiInstrumentation || { status: 'not-detected', candidates: [], indicators: [] }"
+            :platform="analysis.platform"
+            :runtime-steps="runtimeCoverage"
+            :kern-sight-join="kernSightJoin"
+            :ownership-rule-hits="ownershipRuleHits"
+            :importing-kern-sight="importingKernSight"
+            @open-runtime="emit('openRuntime')"
+            @open-ai="emit('openAi')"
+            @open-kern-sight="openKernSightChain"
+            @import-kern-sight="importKernSightEvidence"
+            @import-kern-sight-archive="importKernSightArchive"
+          /></div>
+        </section>
+
+        <section v-show="activeWorkspace === 'validation'" class="analyzer-workspace">
+          <header class="analyzer-workspace-heading"><div><div class="eyebrow">RISK VALIDATION</div><h3>风险验证</h3><p>先审阅静态攻击面与候选，再用 MASVS 矩阵记录人工或运行时结论。</p></div><button class="ghost-button compact-button" @click="emit('openAi', 'manifest-surface-review')"><span class="material-symbols-outlined">neurology</span>AI 辅助审阅</button></header>
+          <div id="analyzer-static" class="analyzer-anchor-section" :class="{ focused: focusedSection === 'analyzer-static' }"><StaticSurfacePanel :analysis="analysis" @open-ai="emit('openAi', $event)" /></div>
+          <div id="analyzer-masvs" class="analyzer-anchor-section" :class="{ focused: focusedSection === 'analyzer-masvs' }"><MasvsWorkbench
+            :observations="analysis.masvsObservations"
+            :recipes="analysis.verificationRecipes"
+            :verdicts="assessmentVerdicts"
+            :notes="assessmentNotes"
+            :dirty="assessmentDirty"
+            @verdict="setAssessmentVerdict"
+            @update:notes="setAssessmentNotes"
+            @open-ai="emit('openAi', $event)"
+          /></div>
+          <div id="analyzer-findings" class="findings-list analyzer-anchor-section" :class="{ focused: focusedSection === 'analyzer-findings' }"><h3>Review findings <small>{{ analysis.findings.length + analysis.protection.indicators.length }}</small></h3><article v-for="finding in analysis.findings" :key="finding.title + finding.detail"><b :class="`finding-${finding.severity}`">{{ finding.severity }}</b><div><strong>{{ finding.title }}</strong><p>{{ finding.detail }}</p></div></article><article v-for="indicator in analysis.protection.indicators" :key="indicator"><b class="finding-review">review</b><div><strong>加固/动态加载线索</strong><p>{{ indicator }}</p></div></article></div>
+        </section>
+
+        <section v-show="activeWorkspace === 'intelligence'" class="analyzer-workspace">
+          <header class="analyzer-workspace-heading"><div><div class="eyebrow">CODE INTELLIGENCE</div><h3>代码与二进制</h3><p>聚焦业务入口、DEX / Mach-O / ELF 证据和动态加载线索；可随时切换重点或完整视图。</p></div><div class="analyzer-heading-actions"><button v-if="analysis.platform === 'android'" class="ghost-button compact-button" @click="emit('openAi', 'artifact-ownership')"><span class="material-symbols-outlined">neurology</span>AI 复核 DEX / SO</button><button class="ghost-button compact-button" @click="focusOnly = !focusOnly">{{ focusOnly ? '显示完整证据' : '返回重点视图' }}</button></div></header>
+          <section v-if="analysis.platform === 'android'" class="artifact-ownership-card">
+            <header>
+              <div><div class="eyebrow">KERNSIGHT OWNERSHIP</div><strong>DEX / SO 业务归属</strong><p>{{ kernSightJoin ? `${kernSightJoin.sourceLabel} · ${kernSightJoin.dexOwnershipMode === 'class-index' ? '类级索引' : '旧版路径降级'} · ${ownershipRuleHits.length} 条本地规则命中` : '当前 APK 尚未关联 KernSight 运行时证据。' }}</p></div>
+              <div><button v-if="!kernSightJoin" class="ghost-button compact-button" @click="openKernSightChain">先用 ksightd 采集</button><button v-else class="ghost-button compact-button" @click="openKernSightChain">查看完整证据链</button></div>
+            </header>
+            <div v-if="kernSightJoin" class="artifact-ownership-grid">
+              <article v-for="fact in ownershipFacts" :key="fact.key" :class="`strength-${fact.strength}`">
+                <div><b>{{ fact.layer }}</b><strong>{{ fact.title }}</strong><em>{{ fact.strength }}</em></div>
+                <p>{{ fact.summary }}</p>
+                <code v-for="line in fact.items.slice(0, 5)" :key="line">{{ line }}</code>
+                <small v-if="fact.items.length > 5">另有 {{ fact.items.length - 5 }} 条，进入 KernSight 查看完整来源与映射链。</small>
+              </article>
+            </div>
+            <footer><span>确定性分类负责事实</span><i></i><span>AI 只复核 mixed / unknown</span><i></i><span>确认后写入本地规则库</span><i></i><span>后续 APK 自动匹配</span></footer>
+          </section>
+          <p class="focus-view-hint"><strong>{{ focusOnly ? '重点视图' : '完整原始视图' }}</strong>：{{ focusOnly ? '优先展示业务类/方法、真实 Endpoint、TLS、Keychain、动态加载和 CodeProtect 映射；隐藏 SDK/编译器通用词、格式化模板及构建路径。' : '显示全部可恢复证据，可能包含 Swift/Foundation/NIO/OpenCV 等第三方内部噪音。' }}</p>
+          <div id="analyzer-code" class="analyzer-anchor-section" :class="{ focused: focusedSection === 'analyzer-code' }"><CodeIntelligencePanel :items="analysis.codeInsights" :focus-only="focusOnly" /></div>
+          <div id="analyzer-binary" class="analyzer-anchor-section" :class="{ focused: focusedSection === 'analyzer-binary' }"><BinaryInsightsPanel :items="analysis.binaryInsights" :focus-only="focusOnly" /></div>
+        </section>
+
+        <section v-show="activeWorkspace === 'sensitive'" class="analyzer-workspace">
+          <header class="analyzer-workspace-heading"><div><div class="eyebrow">SENSITIVE MATERIAL</div><h3>敏感信息</h3><p>单独审阅密钥、凭据、端点和可能的隐私数据，避免与一般代码线索混排。</p></div></header>
+          <div id="analyzer-sensitive" class="analyzer-anchor-section" :class="{ focused: focusedSection === 'analyzer-sensitive' }"><SensitiveItemsPanel :items="analysis.sensitiveItems" :file-name="analysis.fileName" :focus-only="focusOnly" @message="sensitiveMessage = $event" /></div>
+        </section>
+
+        <section v-show="activeWorkspace === 'raw'" class="analyzer-workspace">
+          <header class="analyzer-workspace-heading"><div><div class="eyebrow">RAW INVENTORY</div><h3>原始清单</h3><p>签名、Manifest 与归档文件仅在需要追溯原始解析结果时展开。</p></div></header>
+          <details v-if="analysis.signature" class="manifest-panel"><summary>签名与证书详情</summary><pre>{{ analysis.signature }}</pre></details>
+          <details class="manifest-panel" v-if="analysis.platform === 'android' && analysis.manifestXml"><summary>AndroidManifest.xml（AXML / aapt 解码结果）</summary><pre>{{ analysis.manifestXml }}</pre></details>
+          <details class="file-inventory"><summary>Interesting archive entries（{{ visibleFiles(analysis.files).length }} / {{ analysis.files.length }}）</summary><code v-for="file in visibleFiles(analysis.files)" :key="file">{{ file }}</code></details>
+        </section>
       </template>
     </section>
   </div>
@@ -109,7 +164,7 @@
 <script setup lang="ts">
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { open, save } from '@tauri-apps/plugin-dialog'
-import { backend, readableError } from '@/services/backend'
+import { aiBackend, backend, readableError } from '@/services/backend'
 import { appConfig } from '@/services/config'
 import { getCurrentWebviewWindow } from '@tauri-apps/api/webviewWindow'
 import BinaryInsightsPanel from '@/components/analyzer/BinaryInsightsPanel.vue'
@@ -118,24 +173,14 @@ import CodeIntelligencePanel from '@/components/analyzer/CodeIntelligencePanel.v
 import MasvsWorkbench from '@/components/analyzer/MasvsWorkbench.vue'
 import SensitiveItemsPanel from '@/components/analyzer/SensitiveItemsPanel.vue'
 import StaticSurfacePanel from '@/components/analyzer/StaticSurfacePanel.vue'
-import ScrollAnchorNav from '@/components/ScrollAnchorNav.vue'
 import { buildBoundaryFlows, correlateBoundaries } from '@/services/boundaries'
 import { runtimeEvidenceCoverage } from '@/services/runtimeCoverage'
 import { useKernSightEvidence } from '@/composables/useKernSightEvidence'
 import type { AnalysisBaselineDiff, AnalysisCase, AppAnalysis, TerminalEntry } from '@/types'
+import type { KnowledgePattern } from '@/types/knowledge'
 
 const props = defineProps<{ analysis: AppAnalysis | null; analyzing: boolean; history: TerminalEntry[]; focusRequest?: { id: string; sourceType: string; sourceLocation?: string } }>()
-const analyzerAnchors = computed(() => props.analysis ? [
-  { id: 'analyzer-anti', label: 'RUNTIME EVIDENCE' },
-  { id: 'analyzer-masvs', label: 'MASVS 验证' },
-  { id: 'analyzer-static', label: '静态攻击面' },
-  { id: 'analyzer-code', label: '代码入口' },
-  { id: 'analyzer-binary', label: '二进制证据' },
-  { id: 'analyzer-findings', label: '风险结论' },
-  { id: 'analyzer-sensitive', label: '敏感信息' },
-] : [])
-const emit = defineEmits<{ analyze: [request: { path: string; apktoolPath?: string; jadxPath?: string; excludedUrlPatterns?: string[] }]; openAi: []; openRuntime: []; openDataFlow: []; openSettings: []; openKernSight: []; replaceAnalysis: [analysis: AppAnalysis]; restoreRuntimeHistory: [history: TerminalEntry[]]; focusConsumed: [] }>()
-const fileInput = ref<HTMLInputElement>()
+const emit = defineEmits<{ analyze: [request: { path: string; apktoolPath?: string; jadxPath?: string; excludedUrlPatterns?: string[] }]; openAi: [taskId?: string]; openRuntime: []; openDataFlow: []; openSettings: []; openKernSight: []; replaceAnalysis: [analysis: AppAnalysis]; restoreRuntimeHistory: [history: TerminalEntry[]]; focusConsumed: [] }>()
 const filePath = ref('')
 const selectedName = ref('')
 const dragging = ref(false)
@@ -151,6 +196,7 @@ const assessmentDirty = ref(false)
 const baselineDiff = ref<AnalysisBaselineDiff | null>(null)
 let pendingLoadedCase: AnalysisCase | null = null
 const focusOnly = ref(true)
+const activeWorkspace = ref<'evidence' | 'validation' | 'intelligence' | 'sensitive' | 'raw'>('evidence')
 const focusedSection = ref('')
 const progressStep = ref(0)
 const progressSteps = ['读取 APK/IPA 文件清单…', '解析 Manifest / Info.plist…', '运行 Apktool/JADX 回退分析…', '扫描 DEX、SO、Mach-O 与 Flutter 字符串…', '整理风险、组件和敏感信息上下文…']
@@ -177,8 +223,39 @@ const runtimeCoverage = computed(() => runtimeEvidenceCoverage(
   props.analysis?.packageId,
 ))
 const importingKernSight = ref(false)
+const ownershipKnowledge = ref<KnowledgePattern[]>([])
 const kernSight = useKernSightEvidence(computed(() => props.analysis?.packageId || ''))
 const kernSightJoin = computed(() => props.analysis?.platform === 'android' ? kernSight.join.value : null)
+const ownershipRuleHits = computed(() => {
+  const analysis = props.analysis
+  if (!analysis) return []
+  const haystack = [
+    ...analysis.files,
+    ...analysis.frameworks,
+    ...analysis.thirdPartyLibraries,
+    ...analysis.rawInventory.map(item => item.value),
+    ...analysis.binaryInsights.flatMap(item => [item.target, item.detail, ...item.evidence]),
+    ...analysis.codeInsights.flatMap(item => [item.binary, item.className || '', item.name, ...item.references]),
+  ].join('\n').toLowerCase()
+  return ownershipKnowledge.value.filter(pattern =>
+    ['artifact-ownership', 'vendor-sdk', 'dynamic-code', 'native-bridge'].includes(pattern.boundary)
+    && pattern.triggerSignals.some(signal => signal.trim() && haystack.includes(signal.trim().toLowerCase())),
+  )
+})
+const ownershipFacts = computed(() => kernSightJoin.value?.facts.filter(item => item.key === 'dex' || item.key === 'so') || [])
+const workspaceTabs = computed(() => {
+  const analysis = props.analysis
+  if (!analysis) return []
+  const runtimeCount = (kernSightJoin.value?.facts.filter((item) => item.strength !== 'absent').length || 0)
+    + (analysis.antiInstrumentation?.candidates.filter((item) => !item.filtered).length || 0)
+  return [
+    { id: 'evidence' as const, icon: 'hub', label: '证据关联', description: '静态 ↔ 运行时', count: runtimeCount },
+    { id: 'validation' as const, icon: 'verified_user', label: '风险验证', description: '攻击面 · MASVS', count: analysis.masvsObservations.length + analysis.findings.length },
+    { id: 'intelligence' as const, icon: 'data_object', label: '代码与二进制', description: 'DEX · SO · Mach-O', count: analysis.codeInsights.length + analysis.binaryInsights.length },
+    { id: 'sensitive' as const, icon: 'key', label: '敏感信息', description: '凭据 · 端点 · 隐私', count: analysis.sensitiveItems.length },
+    { id: 'raw' as const, icon: 'inventory_2', label: '原始清单', description: '签名 · Manifest · 文件', count: analysis.files.length },
+  ]
+})
 
 async function importKernSightEvidence() {
   importingKernSight.value = true
@@ -196,9 +273,42 @@ async function importKernSightEvidence() {
   }
 }
 
+async function importKernSightArchive() {
+  importingKernSight.value = true
+  try {
+    const bundle = await kernSight.importArchive()
+    if (bundle && props.analysis?.packageId && bundle.package !== props.analysis.packageId) {
+      exportMessage.value = `证据包属于 ${bundle.package}，与当前静态分析包名 ${props.analysis.packageId} 不一致；证据不会混用。`
+    } else if (bundle) {
+      exportMessage.value = `已打开 MobileE 证据包：${bundle.package}`
+    }
+  } catch (cause) {
+    exportMessage.value = `打开 MobileE 证据包失败：${readableError(cause)}`
+  } finally {
+    importingKernSight.value = false
+  }
+}
+
+async function loadOwnershipKnowledge() {
+  if (props.analysis?.platform !== 'android') {
+    ownershipKnowledge.value = []
+    return
+  }
+  try {
+    ownershipKnowledge.value = await aiBackend.listKnowledge()
+  } catch {
+    ownershipKnowledge.value = []
+  }
+}
+
 function openKernSightChain() {
   if (props.analysis?.packageId) kernSight.requestPackage(props.analysis.packageId)
   emit('openKernSight')
+}
+
+function openPrimaryRuntime() {
+  if (props.analysis?.platform === 'android') openKernSightChain()
+  else emit('openRuntime')
 }
 
 const excludedUrlPatterns = computed(() => excludedUrlsText.value
@@ -213,10 +323,33 @@ function useFile(file?: File) {
   const possiblePath = (file as File & { path?: string }).path
   if (possiblePath) filePath.value = possiblePath
 }
-function onSelect(event: Event) { useFile((event.target as HTMLInputElement).files?.[0]) }
 function onDrop(event: DragEvent) { useFile(event.dataTransfer?.files?.[0]) }
-function analyze() {
+async function analyze() {
   if (!filePath.value) return
+  if (/\.(?:mee|meevidence|mobileevidence)$/i.test(filePath.value)) {
+    importingKernSight.value = true
+    try {
+      const bundle = await kernSight.importArchive(filePath.value)
+      if (bundle) {
+        kernSight.requestPackage(bundle.package)
+        exportMessage.value = `已载入 ${bundle.package} 的 MobileE 证据，正在打开证据链。`
+        emit('openKernSight')
+      }
+    } catch (cause) {
+      exportMessage.value = `打开 MobileE 证据失败：${readableError(cause)}`
+    } finally {
+      importingKernSight.value = false
+    }
+    return
+  }
+  if (/\.(?:mec|mecase|mobileecase|mskcase|json)$/i.test(filePath.value)) {
+    try {
+      await restoreAnalysisCase(filePath.value)
+    } catch (cause) {
+      exportMessage.value = `打开 MobileE 分析案例失败：${readableError(cause)}`
+    }
+    return
+  }
   emit('analyze', {
     path: filePath.value,
     apktoolPath: apktoolPath.value || undefined,
@@ -225,7 +358,7 @@ function analyze() {
   })
 }
 async function chooseFile() {
-  const selected = await open({ multiple: false, filters: [{ name: 'Mobile packages', extensions: ['apk', 'ipa'] }] })
+  const selected = await open({ multiple: false, filters: [{ name: 'Mobile packages / cases', extensions: ['apk', 'ipa', 'mec', 'mee', 'mecase', 'meevidence', 'mobileecase', 'mobileevidence', 'mskcase', 'json'] }] })
   if (typeof selected === 'string') {
     filePath.value = selected
     selectedName.value = selected.split(/[\\/]/).pop() || selected
@@ -264,7 +397,7 @@ function setAssessmentNotes(notes: string) {
 async function saveCase() {
   if (!props.analysis) return
   const baseName = props.analysis.fileName.replace(/\.(apk|ipa)$/i, '') || 'mobile-assessment'
-  const outputPath = await save({ defaultPath: `${baseName}.mobileecase`, filters: [{ name: 'MobileE case', extensions: ['mobileecase', 'mskcase', 'json'] }] })
+  const outputPath = await save({ defaultPath: `${baseName}.mec`, filters: [{ name: 'ME case', extensions: ['mec'] }] })
   if (!outputPath) return
   try {
     const written = await backend.saveAnalysisCase(outputPath, props.analysis, assessmentVerdicts.value, assessmentNotes.value, scopedRuntimeHistory.value)
@@ -274,23 +407,26 @@ async function saveCase() {
     exportMessage.value = `保存项目快照失败：${readableError(cause)}`
   }
 }
+async function restoreAnalysisCase(path: string) {
+  const loaded = await backend.loadAnalysisCase(path)
+  pendingLoadedCase = loaded
+  baselineDiff.value = null
+  emit('restoreRuntimeHistory', (loaded.runtimeHistory || []).map((entry) => ({ ...entry, persisted: true })))
+  emit('replaceAnalysis', loaded.analysis)
+  exportMessage.value = `已打开 MobileE 案例：${path}（恢复 ${(loaded.runtimeHistory || []).length} 条运行记录）`
+}
 async function loadCase() {
-  const selected = await open({ multiple: false, filters: [{ name: 'MobileE case', extensions: ['mobileecase', 'mskcase', 'json'] }] })
+  const selected = await open({ multiple: false, filters: [{ name: 'ME case', extensions: ['mec', 'mecase', 'mobileecase', 'mskcase', 'json'] }] })
   if (typeof selected !== 'string') return
   try {
-    const loaded = await backend.loadAnalysisCase(selected)
-    pendingLoadedCase = loaded
-    baselineDiff.value = null
-    emit('restoreRuntimeHistory', (loaded.runtimeHistory || []).map((entry) => ({ ...entry, persisted: true })))
-    emit('replaceAnalysis', loaded.analysis)
-    exportMessage.value = `已打开项目快照：${selected}（恢复 ${(loaded.runtimeHistory || []).length} 条运行记录）`
+    await restoreAnalysisCase(selected)
   } catch (cause) {
-    exportMessage.value = `打开项目快照失败：${readableError(cause)}`
+    exportMessage.value = `打开 MobileE 案例失败：${readableError(cause)}`
   }
 }
 async function compareCase() {
   if (!props.analysis) return
-  const selected = await open({ multiple: false, filters: [{ name: 'MobileE case', extensions: ['mobileecase', 'mskcase', 'json'] }] })
+  const selected = await open({ multiple: false, filters: [{ name: 'ME case', extensions: ['mec', 'mecase', 'mobileecase', 'mskcase', 'json'] }] })
   if (typeof selected !== 'string') return
   try {
     baselineDiff.value = await backend.compareAnalysisCase(selected, props.analysis)
@@ -306,6 +442,7 @@ function visibleFiles(files: string[]) {
 }
 
 onMounted(async () => {
+  await loadOwnershipKnowledge()
   try {
     const webview = getCurrentWebviewWindow()
     unlistenDrop = await webview.onDragDropEvent((event) => {
@@ -342,6 +479,7 @@ watch(() => props.analysis?.packageId, async (packageId) => {
 watch(() => props.analysis?.artifactSha256, (value) => {
   baselineDiff.value = null
   sensitiveMessage.value = ''
+  activeWorkspace.value = 'evidence'
   if (pendingLoadedCase && pendingLoadedCase.analysis.artifactSha256 === value) {
     assessmentVerdicts.value = { ...pendingLoadedCase.verdicts }
     assessmentNotes.value = pendingLoadedCase.notes
@@ -352,6 +490,7 @@ watch(() => props.analysis?.artifactSha256, (value) => {
   assessmentVerdicts.value = {}
   assessmentNotes.value = ''
   assessmentDirty.value = false
+  void loadOwnershipKnowledge()
 })
 watch(() => props.focusRequest?.id, async () => {
   const request = props.focusRequest
@@ -362,6 +501,15 @@ watch(() => props.focusRequest?.id, async () => {
     runtime: 'analyzer-code', 'runtime-observed': 'analyzer-code', 'static-correlated': 'analyzer-code',
   }
   focusedSection.value = sectionBySource[request.sourceType] || 'analyzer-static'
+  activeWorkspace.value = ({
+    'analyzer-anti': 'evidence',
+    'analyzer-static': 'validation',
+    'analyzer-masvs': 'validation',
+    'analyzer-findings': 'validation',
+    'analyzer-code': 'intelligence',
+    'analyzer-binary': 'intelligence',
+    'analyzer-sensitive': 'sensitive',
+  } as const)[focusedSection.value] || 'validation'
   focusOnly.value = false
   exportMessage.value = `来自 Data Flow 的 Source ID：${request.id}${request.sourceLocation ? ` · ${request.sourceLocation}` : ''}`
   await nextTick()

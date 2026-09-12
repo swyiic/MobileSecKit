@@ -47,8 +47,15 @@ export interface ProcessInfo {
   user: string
   memoryKb: number
   name: string
+  displayName?: string
   protected: boolean
   system: boolean
+}
+
+export interface InstalledAppInfo {
+  packageName: string
+  displayName: string
+  labelResolved: boolean
 }
 
 export type AdbAction =

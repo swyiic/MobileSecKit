@@ -1,5 +1,7 @@
 use crate::{run_device_adb, run_device_root_script};
-use ksight_core::{DumpArtifact, MergedDumpRef, SessionGraph, SessionReport, SessionReportBuilder};
+use ksight_core::{
+    DexArtifactSet, DumpArtifact, MergedDumpRef, SessionGraph, SessionReport, SessionReportBuilder,
+};
 use ksight_model::Event;
 use ksight_protocol::{
     AgentStatus, DurableSessionSummary, GetStatus, Hello, ListSessions, Message, ReplayBatches,
@@ -9,6 +11,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
+use std::fs::File;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
@@ -18,6 +22,7 @@ use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWriteExt, BufRead
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 use tokio::time::{timeout, Duration, Instant};
 use uuid::Uuid;
+use zip::{write::SimpleFileOptions, ZipArchive, ZipWriter};
 
 const KSIGHT_AGENT: &str = "/data/local/tmp/ksight/ksightd";
 const KSIGHT_SPOOL: &str = "/data/local/tmp/ksight/spool";
@@ -35,6 +40,9 @@ const MAX_INSPECT_PLAINTEXT_BYTES: u32 = 64 * 1024;
 const MIRROR_STATUS_TIMEOUT: Duration = Duration::from_secs(4);
 const MIRROR_CONTROL_TIMEOUT: Duration = Duration::from_secs(8);
 const MIRROR_STOP_TIMEOUT: Duration = Duration::from_secs(18);
+const MOBILEE_EVIDENCE_SCHEMA: &str = "mobilee.kernsight-evidence/v1";
+const MAX_EVIDENCE_ARCHIVE_FILES: usize = 100_000;
+const MAX_EVIDENCE_ARCHIVE_BYTES: u64 = 8 * 1024 * 1024 * 1024;
 
 const DEVICE_MIRROR_PROCESS_STATUS: &str = r#"
 capture_count=0
@@ -153,6 +161,116 @@ pub struct KernSightMirrorStatus {
     serial: Option<String>,
     detail: Option<String>,
     logs: Vec<String>,
+    coverage: MirrorCoverageStatus,
+}
+
+/// Payload-free live coverage counters parsed from ksightd diagnostics.
+#[derive(Debug, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MirrorCoverageStatus {
+    network_connects: u64,
+    network_handshakes: u64,
+    observed_fragments: u64,
+    observed_bytes: u64,
+    reconstructed_messages: u64,
+    reconstructed_requests: u64,
+    reconstructed_responses: u64,
+    delivered: u64,
+    delivery_failed: u64,
+    retry_pending: u64,
+    unknown_directions: u64,
+    buffered_bytes: u64,
+    attached_probes: u64,
+    active_probes: u64,
+    standard_tls_fragments: u64,
+    vendor_fragments: u64,
+    jni_fragments: u64,
+    stack_candidates: u64,
+    stack_export_candidates: u64,
+    stack_pinned_boundaries: u64,
+    stack_empirical_boundaries: u64,
+    stack_keylog_candidates: u64,
+    stack_uncovered: u64,
+    state: &'static str,
+}
+
+fn mirror_counter(line: &str, key: &str) -> Option<u64> {
+    line.split_whitespace().find_map(|part| {
+        let (name, value) = part.split_once('=')?;
+        if name != key {
+            return None;
+        }
+        value
+            .trim_matches(|ch: char| !ch.is_ascii_digit())
+            .parse()
+            .ok()
+    })
+}
+
+fn mirror_coverage_from_logs(logs: &VecDeque<String>, running: bool) -> MirrorCoverageStatus {
+    let diagnostic = logs
+        .iter()
+        .rev()
+        .find(|line| line.contains("observed_fragments=") && line.contains("delivered="));
+    let count = |key| {
+        diagnostic
+            .and_then(|line| mirror_counter(line, key))
+            .unwrap_or(0)
+    };
+    let attached_probes = logs
+        .iter()
+        .filter(|line| line.contains("attached") && !line.contains("attached=0"))
+        .count() as u64;
+    let active_probes = logs
+        .iter()
+        .filter(|line| line.contains("hits=") && mirror_counter(line, "hits").unwrap_or(0) > 0)
+        .count() as u64;
+    let observed_fragments = count("observed_fragments");
+    let network_connects = count("network_connects");
+    let reconstructed_messages = count("reconstructed_messages");
+    let delivered = count("delivered");
+    let delivery_failed = count("delivery_failed");
+    let state = if !running {
+        "idle"
+    } else if network_connects == 0 {
+        "waiting_for_network"
+    } else if observed_fragments == 0 {
+        "waiting_for_boundary"
+    } else if reconstructed_messages == 0 {
+        "unrecognized_stream"
+    } else if delivered == 0 && delivery_failed > 0 {
+        "delivery_failed"
+    } else if delivered == 0 {
+        "waiting_for_pair"
+    } else {
+        "delivering"
+    };
+    MirrorCoverageStatus {
+        network_connects,
+        network_handshakes: count("network_handshakes"),
+        observed_fragments,
+        observed_bytes: count("observed_bytes"),
+        reconstructed_messages,
+        reconstructed_requests: count("reconstructed_requests"),
+        reconstructed_responses: count("reconstructed_responses"),
+        delivered,
+        delivery_failed,
+        retry_pending: count("retry_pending"),
+        unknown_directions: count("unknown_directions"),
+        buffered_bytes: count("buffered_bytes"),
+        attached_probes,
+        active_probes,
+        standard_tls_fragments: count("standard_tls_fragments"),
+        vendor_fragments: count("vendor_fragments"),
+        jni_fragments: count("jni_fragments"),
+        stack_candidates: count("stack_candidates"),
+        stack_export_candidates: count("stack_export_candidates"),
+        stack_pinned_boundaries: count("stack_pinned_boundaries"),
+        stack_empirical_boundaries: count("stack_empirical_boundaries"),
+        stack_keylog_candidates: count("stack_keylog_candidates"),
+        stack_uncovered: count("stack_uncovered"),
+        state,
+    }
 }
 
 #[derive(Debug, Default)]
@@ -1827,13 +1945,21 @@ pub async fn stop_kernsight_mirror(
         validate_serial(value)?;
     }
     stop_mirror_child(&state, serial.as_deref(), reverse_port).await?;
+    let (logs, coverage) = {
+        let stored = state.logs.lock().await;
+        (
+            stored.iter().cloned().collect(),
+            mirror_coverage_from_logs(&stored, false),
+        )
+    };
     Ok(KernSightMirrorStatus {
         running: false,
         cleanup_pending: false,
         package: None,
         serial: None,
         detail: Some("设备端 ksightd、KernSight pcap 子进程与会话状态已完成清理".into()),
-        logs: state.logs.lock().await.iter().cloned().collect(),
+        logs,
+        coverage,
     })
 }
 
@@ -1882,13 +2008,22 @@ pub async fn kernsight_mirror_status(
             status.pcap_count
         )
     });
+    let package = state.package.lock().await.clone();
+    let (logs, coverage) = {
+        let stored = state.logs.lock().await;
+        (
+            stored.iter().cloned().collect(),
+            mirror_coverage_from_logs(&stored, running),
+        )
+    };
     Ok(KernSightMirrorStatus {
         running,
         cleanup_pending,
-        package: state.package.lock().await.clone(),
+        package,
         serial: known_serial,
         detail,
-        logs: state.logs.lock().await.iter().cloned().collect(),
+        logs,
+        coverage,
     })
 }
 
@@ -2184,7 +2319,10 @@ pub async fn list_kernsight_package_dumps(serial: String) -> Result<Vec<Value>, 
         validate_package(package)?;
         let document = run_device_root_script(&serial, &format!("cat {path}")).await?;
         if document.code == Some(0) {
-            if let Ok(value) = serde_json::from_str::<Value>(&document.stdout) {
+            if let Ok(mut value) = serde_json::from_str::<Value>(&document.stdout) {
+                // Re-catalog older agent reports in memory so opening phone evidence and
+                // importing the same dump produce identical ownership results.
+                enrich_local_dex_ownership(&mut value, package);
                 reports.push(value);
             }
         }
@@ -2211,7 +2349,8 @@ pub async fn read_kernsight_package_file(
         return Err("证据文件预览上限必须在 1 B 到 1 MiB 之间".into());
     }
     let path = format!("{KSIGHT_PACKAGES}/{package}/{relative_path}");
-    let size = run_device_root_script(&serial, &format!("stat -c %s {path} 2>/dev/null"))
+    let quoted_path = crate::shell_quote(&path);
+    let size = run_device_root_script(&serial, &format!("stat -c %s {quoted_path} 2>/dev/null"))
         .await?
         .stdout
         .trim()
@@ -2219,7 +2358,7 @@ pub async fn read_kernsight_package_file(
         .map_err(|_| "证据文件不存在或无法读取大小".to_string())?;
     let output = run_device_root_script(
         &serial,
-        &format!("head -c {max_bytes} {path} 2>/dev/null | base64"),
+        &format!("head -c {max_bytes} {quoted_path} 2>/dev/null | base64"),
     )
     .await?;
     if output.code != Some(0) {
@@ -2249,7 +2388,7 @@ pub async fn import_kernsight_evidence_directory(
     }
     let dump_path = root.join("dump-report.json");
     let dump_text = read_bounded_text(&dump_path, 64 * 1024 * 1024)?;
-    let dump_report: Value = serde_json::from_str(&dump_text)
+    let mut dump_report: Value = serde_json::from_str(&dump_text)
         .map_err(|error| format!("dump-report.json 无效：{error}"))?;
     let package = dump_report
         .get("package")
@@ -2257,6 +2396,7 @@ pub async fn import_kernsight_evidence_directory(
         .ok_or("dump-report.json 缺少 package")?
         .to_owned();
     validate_package(&package)?;
+    enrich_local_dex_ownership(&mut dump_report, &package);
     let session_path = root.join("session-report.json");
     let session_report = if session_path.is_file() {
         Some(
@@ -2280,6 +2420,431 @@ pub async fn import_kernsight_evidence_directory(
     })
 }
 
+fn enrich_local_dex_ownership(dump_report: &mut Value, package: &str) {
+    let ownership_is_current = dump_report.get("dex_ownership").is_some_and(|ownership| {
+        ownership.get("schema_version").and_then(Value::as_str)
+            == Some("mobilee.kernsight-dex-ownership/v3")
+            && ownership
+                .get("package")
+                .and_then(Value::as_str)
+                .is_some_and(|value| value.eq_ignore_ascii_case(package))
+            && ownership
+                .get("entries")
+                .and_then(Value::as_array)
+                .is_some_and(|entries| !entries.is_empty())
+    });
+    if ownership_is_current {
+        return;
+    }
+    let Some(dex_sets_value) = dump_report.get("dex_sets").cloned() else {
+        return;
+    };
+    let Ok(dex_sets) = serde_json::from_value::<Vec<DexArtifactSet>>(dex_sets_value) else {
+        return;
+    };
+    if dex_sets.is_empty() {
+        return;
+    }
+    let registered_component_classes = dump_report
+        .get("registered_component_classes")
+        .cloned()
+        .and_then(|value| serde_json::from_value::<Vec<String>>(value).ok())
+        .unwrap_or_default();
+    let package_path = package.to_ascii_lowercase().replace('.', "/");
+    let organization_path = package_path
+        .split('/')
+        .take(2)
+        .collect::<Vec<_>>()
+        .join("/");
+    let internal_roots = registered_component_classes
+        .iter()
+        .map(|value| value.to_ascii_lowercase().replace('.', "/"))
+        .map(|value| value.split('/').take(2).collect::<Vec<_>>().join("/"))
+        .filter(|value| value.contains('/') && value != &organization_path)
+        .collect::<BTreeSet<_>>();
+    let mut counts = BTreeMap::<String, usize>::new();
+    let mut business_class_samples = 0usize;
+    let mut business_dex_sets = 0usize;
+    let mut internal_class_samples = 0usize;
+    let mut third_party_class_samples = 0usize;
+    let mut unknown_class_samples = 0usize;
+    let mut entries = Vec::new();
+    for set in dex_sets {
+        let descriptors = set
+            .semantic
+            .as_ref()
+            .map(|semantic| semantic.class_descriptors.as_slice())
+            .unwrap_or_default();
+        let mut business = 0usize;
+        let mut internal = 0usize;
+        let mut sdk = 0usize;
+        let mut namespaces = BTreeMap::<String, usize>::new();
+        for descriptor in descriptors {
+            let class = descriptor
+                .trim_start_matches('[')
+                .trim_start_matches('L')
+                .trim_end_matches(';')
+                .to_ascii_lowercase();
+            let namespace = class.split('/').take(3).collect::<Vec<_>>().join(".");
+            *namespaces.entry(namespace).or_default() += 1;
+            if !package_path.is_empty() && mobilee_namespace_contains(&package_path, &class) {
+                business += 1;
+            } else if is_mobilee_sdk_namespace(&class) {
+                sdk += 1;
+            } else if internal_roots
+                .iter()
+                .any(|root| mobilee_namespace_contains(root, &class))
+                || (organization_path.contains('/')
+                    && mobilee_namespace_contains(&organization_path, &class))
+            {
+                internal += 1;
+            }
+        }
+        let total = descriptors.len();
+        let unknown = total.saturating_sub(business + internal + sdk);
+        let percent = |value: usize| if total == 0 { 0 } else { value * 100 / total };
+        let runtime_only = set
+            .sources
+            .iter()
+            .any(|source| matches!(source.as_str(), "memory-dex" | "heap-blob"))
+            && !set.sources.iter().any(|source| source == "apk-dex");
+        let classified = business + internal + sdk;
+        let has_first_party = business + internal > 0;
+        let has_non_first_party = sdk + unknown > 0;
+        let category = if total == 0 {
+            "unknown"
+        } else if percent(business) >= 55 {
+            "business"
+        } else if percent(internal) >= 55 {
+            "internal_component"
+        } else if has_first_party && has_non_first_party {
+            "mixed"
+        } else if business > 0 {
+            "business"
+        } else if internal > 0 {
+            "internal_component"
+        } else if percent(sdk) >= 60 {
+            "third_party_sdk"
+        } else if runtime_only {
+            "dynamic_payload"
+        } else if classified * 100 >= total * 65 {
+            if sdk >= internal {
+                "third_party_sdk"
+            } else {
+                "internal_component"
+            }
+        } else {
+            "unknown"
+        };
+        business_class_samples += business;
+        internal_class_samples += internal;
+        third_party_class_samples += sdk;
+        unknown_class_samples += unknown;
+        if business > 0 {
+            business_dex_sets += 1;
+        }
+        *counts.entry(category.into()).or_default() += 1;
+        let mut namespace_rows = namespaces.into_iter().collect::<Vec<_>>();
+        namespace_rows.sort_by(|left, right| right.1.cmp(&left.1).then(left.0.cmp(&right.0)));
+        entries.push(serde_json::json!({
+            "sha256": set.sha256,
+            "canonical_relative_path": set.canonical_relative_path,
+            "category": category,
+            "confidence": percent(match category { "business" => business, "internal_component" => internal, "third_party_sdk" => sdk, "mixed" => classified, _ => unknown }),
+            "sampled_classes": total,
+            "business_classes": business,
+            "internal_classes": internal,
+            "third_party_classes": sdk,
+            "unknown_classes": unknown,
+            "dominant_namespaces": namespace_rows.into_iter().take(6).map(|(name, count)| format!("{name} ({count})")).collect::<Vec<_>>(),
+            "reasons": [format!("类样本 {total}：业务 {business}、内部组件 {internal}、第三方 SDK {sdk}、未知 {unknown}"), if runtime_only { String::from("仅在内存/堆载荷中观察到") } else { String::from("包含安装态或可读 DEX 来源") }],
+        }));
+    }
+    if let Some(object) = dump_report.as_object_mut() {
+        object.insert("dex_ownership".into(), serde_json::json!({
+            "schema_version": "mobilee.kernsight-dex-ownership/v3",
+            "package": package,
+            "entries": entries,
+            "business": counts.get("business").copied().unwrap_or_default(),
+            "internal_components": counts.get("internal_component").copied().unwrap_or_default(),
+            "third_party_sdks": counts.get("third_party_sdk").copied().unwrap_or_default(),
+            "dynamic_payloads": counts.get("dynamic_payload").copied().unwrap_or_default(),
+            "mixed": counts.get("mixed").copied().unwrap_or_default(),
+            "unknown": counts.get("unknown").copied().unwrap_or_default(),
+            "business_class_samples": business_class_samples,
+            "business_dex_sets": business_dex_sets,
+            "internal_class_samples": internal_class_samples,
+            "third_party_class_samples": third_party_class_samples,
+            "unknown_class_samples": unknown_class_samples,
+        }));
+        object.insert(
+            "dex_ownership_generated_by".into(),
+            Value::String("mobilee-import".into()),
+        );
+    }
+}
+
+fn mobilee_namespace_contains(root: &str, path: &str) -> bool {
+    path == root
+        || path
+            .strip_prefix(root)
+            .is_some_and(|suffix| suffix.starts_with('/'))
+}
+
+fn is_mobilee_sdk_namespace(path: &str) -> bool {
+    const PREFIXES: &[&str] = &[
+        "android/",
+        "androidx/",
+        "com/airbnb/",
+        "com/alibaba/fastjson/",
+        "com/bumptech/glide/",
+        "com/facebook/",
+        "com/google/",
+        "com/huawei/hms/",
+        "com/tenpay/",
+        "com/tencent/bugly/",
+        "com/tencent/mapsdk/",
+        "com/tencent/mm/opensdk/",
+        "com/tencent/qqmail/",
+        "com/tencent/smtt/",
+        "com/tencent/tencentmap/",
+        "com/tencent/wework/",
+        "com/tencent/weworklocal/",
+        "com/weishu/reflection/",
+        "io/flutter/",
+        "kotlin/",
+        "kotlinx/",
+        "okhttp3/",
+        "org/apache/",
+        "org/chromium/",
+        "org/json/",
+        "retrofit2/",
+    ];
+    PREFIXES.iter().any(|prefix| path.starts_with(prefix))
+}
+
+fn collect_archive_files(root: &Path) -> Result<Vec<(PathBuf, String, u64)>, String> {
+    let canonical_root = root
+        .canonicalize()
+        .map_err(|error| format!("证据目录不可访问：{error}"))?;
+    let mut pending = vec![canonical_root.clone()];
+    let mut files = Vec::new();
+    let mut total_bytes = 0u64;
+    while let Some(directory) = pending.pop() {
+        for entry in
+            std::fs::read_dir(&directory).map_err(|error| format!("无法遍历证据目录：{error}"))?
+        {
+            let entry = entry.map_err(|error| format!("无法读取证据目录项：{error}"))?;
+            let path = entry.path();
+            let file_type = entry
+                .file_type()
+                .map_err(|error| format!("无法读取证据目录项类型：{error}"))?;
+            if file_type.is_symlink() {
+                continue;
+            }
+            let metadata = entry
+                .metadata()
+                .map_err(|error| format!("无法读取证据元数据：{error}"))?;
+            if metadata.is_dir() {
+                pending.push(path);
+                continue;
+            }
+            if !metadata.is_file() {
+                continue;
+            }
+            let relative = path
+                .strip_prefix(&canonical_root)
+                .map_err(|_| "证据文件超出所选目录".to_string())?
+                .to_string_lossy()
+                .replace('\\', "/");
+            validate_evidence_relative_path(&relative)?;
+            total_bytes = total_bytes.saturating_add(metadata.len());
+            if total_bytes > MAX_EVIDENCE_ARCHIVE_BYTES {
+                return Err("证据包未压缩大小超过 8 GiB 上限".into());
+            }
+            files.push((path, relative, metadata.len()));
+            if files.len() > MAX_EVIDENCE_ARCHIVE_FILES {
+                return Err("证据包文件数超过 100000 个上限".into());
+            }
+        }
+    }
+    files.sort_by(|left, right| left.1.cmp(&right.1));
+    Ok(files)
+}
+
+fn write_kernsight_evidence_archive(root: &Path, output: &Path) -> Result<(), String> {
+    if !root.join("dump-report.json").is_file() {
+        return Err("所选目录缺少 dump-report.json".into());
+    }
+    let files = collect_archive_files(root)?;
+    let dump_report: Value = serde_json::from_str(&read_bounded_text(
+        &root.join("dump-report.json"),
+        64 * 1024 * 1024,
+    )?)
+    .map_err(|error| format!("dump-report.json 无效：{error}"))?;
+    let package = dump_report
+        .get("package")
+        .and_then(Value::as_str)
+        .ok_or("dump-report.json 缺少 package")?;
+    validate_package(package)?;
+    if let Some(parent) = output.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|error| format!("无法创建证据包输出目录：{error}"))?;
+    }
+    let mut temporary_name = output.as_os_str().to_os_string();
+    temporary_name.push(".part");
+    let temporary = PathBuf::from(temporary_name);
+    let file = File::create(&temporary).map_err(|error| format!("无法创建证据包：{error}"))?;
+    let mut writer = ZipWriter::new(file);
+    let options = SimpleFileOptions::default()
+        // APK/DEX/SO and most runtime artifacts are already dense or compressed.
+        // Store them directly so a multi-gigabyte pull is packaged in one local
+        // pass instead of spending minutes recompressing every artifact.
+        .compression_method(zip::CompressionMethod::Stored)
+        .unix_permissions(0o600);
+    let manifest = serde_json::json!({
+        "schemaVersion": MOBILEE_EVIDENCE_SCHEMA,
+        "package": package,
+        "dumpId": dump_report.get("dump_id").and_then(Value::as_str),
+        "agentVersion": dump_report.get("agent_version").and_then(Value::as_str),
+        "fileCount": files.len(),
+        "uncompressedBytes": files.iter().map(|item| item.2).sum::<u64>(),
+    });
+    writer
+        .start_file("manifest.json", options)
+        .map_err(|error| format!("无法写入证据包清单：{error}"))?;
+    writer
+        .write_all(
+            serde_json::to_string_pretty(&manifest)
+                .unwrap_or_default()
+                .as_bytes(),
+        )
+        .map_err(|error| format!("无法写入证据包清单：{error}"))?;
+    for (path, relative, _) in files {
+        writer
+            .start_file(format!("evidence/{relative}"), options)
+            .map_err(|error| format!("无法写入证据包文件 {relative}：{error}"))?;
+        let mut source =
+            File::open(&path).map_err(|error| format!("无法读取证据文件 {relative}：{error}"))?;
+        std::io::copy(&mut source, &mut writer)
+            .map_err(|error| format!("无法写入证据文件 {relative}：{error}"))?;
+    }
+    writer
+        .finish()
+        .map_err(|error| format!("无法完成证据包：{error}"))?;
+    std::fs::rename(&temporary, output).map_err(|error| {
+        let _ = std::fs::remove_file(&temporary);
+        format!("无法保存证据包：{error}")
+    })?;
+    Ok(())
+}
+
+fn resolve_local_path(value: &str, label: &str) -> Result<PathBuf, String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Err(format!("{label}为空"));
+    }
+    let path = PathBuf::from(trimmed);
+    if path.is_absolute() {
+        return Ok(path);
+    }
+    let current = std::env::current_dir().map_err(|error| format!("无法解析{label}：{error}"))?;
+    Ok(current.join(path))
+}
+
+#[tauri::command]
+pub fn export_kernsight_evidence_archive(
+    root: String,
+    output_path: String,
+) -> Result<String, String> {
+    let root = resolve_local_path(&root, "证据目录")?;
+    let output = resolve_local_path(&output_path, "输出文件")?;
+    if !root.is_dir() {
+        return Err(format!(
+            "证据目录不存在或已失效：{}。如果它来自临时解包，请重新打开 MobileE 案例文件后再导出。",
+            root.display()
+        ));
+    }
+    if output.file_name().is_none() {
+        return Err(format!("输出文件名无效：{}", output.display()));
+    }
+    write_kernsight_evidence_archive(&root, &output)?;
+    Ok(output.to_string_lossy().into_owned())
+}
+
+#[tauri::command]
+pub async fn import_kernsight_evidence_archive(
+    path: String,
+) -> Result<KernSightLocalEvidenceBundle, String> {
+    let archive_path = PathBuf::from(path.trim());
+    if !archive_path.is_absolute() || !archive_path.is_file() {
+        return Err("请选择有效的 MobileE 案例文件绝对路径".into());
+    }
+    let file = File::open(&archive_path).map_err(|error| format!("无法打开证据包：{error}"))?;
+    let mut archive =
+        ZipArchive::new(file).map_err(|error| format!("证据包不是有效 ZIP：{error}"))?;
+    if archive.len() > MAX_EVIDENCE_ARCHIVE_FILES + 1 {
+        return Err("证据包文件数超过安全上限".into());
+    }
+    let extraction_root = std::env::temp_dir().join(format!("mobilee-evidence-{}", Uuid::new_v4()));
+    let evidence_root = extraction_root.join("evidence");
+    std::fs::create_dir_all(&evidence_root)
+        .map_err(|error| format!("无法创建证据包缓存目录：{error}"))?;
+    let mut total_bytes = 0u64;
+    let mut manifest_valid = false;
+    for index in 0..archive.len() {
+        let mut entry = archive
+            .by_index(index)
+            .map_err(|error| format!("无法读取证据包条目：{error}"))?;
+        let enclosed = entry
+            .enclosed_name()
+            .ok_or("证据包包含不安全路径")?
+            .to_path_buf();
+        total_bytes = total_bytes.saturating_add(entry.size());
+        if total_bytes > MAX_EVIDENCE_ARCHIVE_BYTES {
+            return Err("证据包解压大小超过 8 GiB 上限".into());
+        }
+        if enclosed == Path::new("manifest.json") {
+            let mut text = String::new();
+            entry
+                .by_ref()
+                .take(1024 * 1024)
+                .read_to_string(&mut text)
+                .map_err(|error| format!("无法读取证据包清单：{error}"))?;
+            let manifest: Value =
+                serde_json::from_str(&text).map_err(|error| format!("证据包清单无效：{error}"))?;
+            manifest_valid = manifest.get("schemaVersion").and_then(Value::as_str)
+                == Some(MOBILEE_EVIDENCE_SCHEMA);
+            continue;
+        }
+        let Ok(relative) = enclosed.strip_prefix("evidence") else {
+            continue;
+        };
+        if relative.as_os_str().is_empty() {
+            continue;
+        }
+        let output = evidence_root.join(relative);
+        if entry.is_dir() {
+            std::fs::create_dir_all(&output)
+                .map_err(|error| format!("无法创建证据目录：{error}"))?;
+            continue;
+        }
+        if let Some(parent) = output.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|error| format!("无法创建证据目录：{error}"))?;
+        }
+        let mut target =
+            File::create(&output).map_err(|error| format!("无法解压证据文件：{error}"))?;
+        std::io::copy(&mut entry, &mut target)
+            .map_err(|error| format!("无法解压证据文件：{error}"))?;
+    }
+    if !manifest_valid {
+        let _ = std::fs::remove_dir_all(&extraction_root);
+        return Err("不是受支持的 MobileE KernSight 证据包".into());
+    }
+    import_kernsight_evidence_directory(evidence_root.to_string_lossy().into_owned()).await
+}
+
 #[tauri::command]
 pub async fn pull_kernsight_package_evidence(
     serial: String,
@@ -2294,29 +2859,304 @@ pub async fn pull_kernsight_package_evidence(
     }
     std::fs::create_dir_all(&destination)
         .map_err(|error| format!("无法创建本地拉取目录：{error}"))?;
-    let executable = resolve_ksightctl()?;
-    let output = Command::new(&executable)
-        .args([
-            "device",
-            "--serial",
-            &serial,
-            "pull-package",
-            "--package",
-            &package,
-            "--launch",
-            "--dest",
-        ])
-        .arg(&destination)
-        .output()
-        .await
-        .map_err(|error| format!("无法启动 {}：{error}", executable.display()))?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        return Err(format!("KernSight L2 拉取失败：{}{}", stderr, stdout));
+    let remote = format!("{KSIGHT_PACKAGES}/{package}");
+    let remote_report_path = format!("{remote}/dump-report.json");
+    let report_output =
+        run_device_root_script(&serial, &format!("cat {remote_report_path}")).await?;
+    if report_output.code != Some(0) || report_output.stdout.trim().is_empty() {
+        return Err("手机端没有完整的包证据索引；请先完成一次采集，再执行拉取".into());
     }
-    import_kernsight_evidence_directory(destination.join(package).to_string_lossy().into_owned())
-        .await
+    let remote_report: Value = serde_json::from_str(&report_output.stdout)
+        .map_err(|error| format!("手机端包证据报告不完整或已损坏：{error}"))?;
+    let report_package = remote_report
+        .get("package")
+        .and_then(Value::as_str)
+        .ok_or("手机端 dump-report.json 缺少 package，不能确认包证据归属")?;
+    if report_package != package {
+        return Err(format!(
+            "手机端报告属于 {report_package}，与当前选择的 {package} 不一致"
+        ));
+    }
+    let remote_dump_id = remote_report
+        .get("dump_id")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .ok_or("手机端 dump-report.json 缺少 dump_id，不能确认已存信息完整收口")?
+        .to_owned();
+
+    let local_root = destination.join(&package);
+    let local_report_path = local_root.join("dump-report.json");
+    if local_root.is_dir()
+        && !local_report_path.is_file()
+        && std::fs::read_dir(&local_root)
+            .map_err(|error| format!("无法检查本地目标目录：{error}"))?
+            .next()
+            .is_some()
+    {
+        return Err(
+            "目标包目录非空但没有 dump-report.json；为避免混入旧文件，请选择一个新的空目录".into(),
+        );
+    }
+    if local_report_path.is_file() {
+        let local_report = serde_json::from_str::<Value>(&read_bounded_text(
+            &local_report_path,
+            64 * 1024 * 1024,
+        )?)
+        .map_err(|error| format!("目标目录中已有无效的 dump-report.json：{error}"))?;
+        let local_dump_id = local_report
+            .get("dump_id")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        if local_dump_id != remote_dump_id {
+            return Err(format!(
+                "目标目录已保存另一轮包证据（{local_dump_id}），为避免新旧文件混合，请选择一个新的空目录"
+            ));
+        }
+    }
+
+    // `ksightctl pull-package` always performs dump-package first. This action
+    // is deliberately a transport-only path: preserve the completed device
+    // snapshot and copy it without launching or touching the target process.
+    let chmod = run_device_root_script(&serial, &format!("chmod -R a+rX {remote}")).await?;
+    if chmod.code != Some(0) {
+        return Err(if chmod.stderr.is_empty() {
+            "无法开放手机端已存信息的只读拉取权限".into()
+        } else {
+            format!("无法读取手机端已存信息：{}", chmod.stderr)
+        });
+    }
+    let destination_text = destination.to_string_lossy().into_owned();
+    let pull = crate::run_device_adb_with_timeout(
+        &serial,
+        &["pull", &remote, &destination_text],
+        Duration::from_secs(600),
+        "KernSight 全部已存信息拉取",
+    )
+    .await?;
+    if pull.code != Some(0) {
+        return Err(if pull.stderr.is_empty() {
+            format!("KernSight 已存信息拉取失败：{}", pull.stdout)
+        } else {
+            format!("KernSight 已存信息拉取失败：{}", pull.stderr)
+        });
+    }
+
+    let bundle =
+        import_kernsight_evidence_directory(local_root.to_string_lossy().into_owned()).await?;
+    let pulled_dump_id = bundle
+        .dump_report
+        .get("dump_id")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    if pulled_dump_id != remote_dump_id {
+        return Err("拉取后的 dump_id 与手机端不一致；本地结果未载入，请重新选择空目录拉取".into());
+    }
+    Ok(bundle)
+}
+
+#[tauri::command]
+pub async fn pull_kernsight_package_archive(
+    serial: String,
+    package: String,
+    output_path: String,
+) -> Result<KernSightLocalEvidenceBundle, String> {
+    let output = PathBuf::from(output_path.trim());
+    if !output.is_absolute() {
+        return Err("MobileE 证据包输出文件必须是绝对路径".into());
+    }
+    if let Some(parent) = output.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|error| format!("无法创建证据输出目录：{error}"))?;
+    }
+    let mut partial_name = output.as_os_str().to_os_string();
+    partial_name.push(".part");
+    let partial = PathBuf::from(partial_name);
+    std::fs::write(
+        &partial,
+        b"ME evidence transfer in progress. This file will be replaced atomically.\n",
+    )
+    .map_err(|error| format!("无法创建拉取进度文件：{error}"))?;
+    let staging = std::env::temp_dir().join(format!("mobilee-pull-{}", Uuid::new_v4()));
+    if let Err(error) = std::fs::create_dir_all(&staging) {
+        let _ = std::fs::remove_file(&partial);
+        return Err(format!("无法创建拉取缓存目录：{error}"));
+    }
+    let bundle = pull_kernsight_package_evidence(
+        serial.clone(),
+        package.clone(),
+        staging.to_string_lossy().into_owned(),
+    )
+    .await;
+    let bundle = match bundle {
+        Ok(bundle) => bundle,
+        Err(error) => {
+            let _ = std::fs::remove_dir_all(&staging);
+            let _ = std::fs::remove_file(&partial);
+            return Err(error);
+        }
+    };
+    let session_result = timeout(
+        Duration::from_secs(120),
+        append_device_sessions_to_package_evidence(&serial, &package, Path::new(&bundle.root)),
+    )
+    .await;
+    if session_result.is_err() {
+        let _ = std::fs::remove_dir_all(&staging);
+        let _ = std::fs::remove_file(&partial);
+        return Err(format!(
+            "包文件已拉取，但关联会话处理超过 120 秒；未生成不完整证据包"
+        ));
+    }
+    if let Err(error) = session_result.expect("timeout result already checked") {
+        let _ = std::fs::remove_dir_all(&staging);
+        let _ = std::fs::remove_file(&partial);
+        return Err(format!(
+            "包文件已拉取，但无法读取手机端关联会话；未生成不完整证据包：{error}"
+        ));
+    }
+    if let Err(error) = write_kernsight_evidence_archive(Path::new(&bundle.root), &output) {
+        let _ = std::fs::remove_dir_all(&staging);
+        let _ = std::fs::remove_file(&partial);
+        return Err(error);
+    }
+    // The directory already contains the bytes represented by the newly written
+    // archive. Re-index it in place instead of immediately extracting the archive
+    // into a second multi-gigabyte cache.
+    import_kernsight_evidence_directory(bundle.root).await
+}
+
+async fn append_device_sessions_to_package_evidence(
+    serial: &str,
+    package: &str,
+    evidence_root: &Path,
+) -> Result<(), String> {
+    let overview = get_kernsight_overview(serial.to_owned()).await?;
+    let sessions_root = evidence_root.join("sessions");
+    std::fs::create_dir_all(&sessions_root)
+        .map_err(|error| format!("无法创建 Session 证据目录：{error}"))?;
+
+    let mut aggregate = SessionReportBuilder::default();
+    let mut included_ids = Vec::new();
+    let mut matched_ids = Vec::new();
+    let mut failures = Vec::new();
+    for summary in overview.sessions {
+        let session_id = summary.session_id;
+        let events = match replay_session_events(serial, session_id).await {
+            Ok(events) => events,
+            Err(error) => {
+                failures.push(serde_json::json!({
+                    "sessionId": session_id,
+                    "error": error,
+                }));
+                continue;
+            }
+        };
+        let mut builder = SessionReportBuilder::default();
+        for event in &events {
+            builder.record(event);
+        }
+        let report = builder.finish();
+        let belongs_to_package = report
+            .processes
+            .iter()
+            .any(|process| process.package.as_deref() == Some(package))
+            || events.iter().any(|event| {
+                event
+                    .header
+                    .process
+                    .packages
+                    .iter()
+                    .any(|candidate| candidate.package_name == package)
+                    || event
+                        .header
+                        .process
+                        .command_line
+                        .as_deref()
+                        .is_some_and(|command| {
+                            command == package || command.starts_with(&format!("{package}:"))
+                        })
+            });
+        if !belongs_to_package {
+            continue;
+        }
+        let session_dir = sessions_root.join(session_id.to_string());
+        std::fs::create_dir_all(&session_dir)
+            .map_err(|error| format!("无法创建 Session {session_id} 目录：{error}"))?;
+        let report_path = session_dir.join("session-report.json");
+        let events_path = session_dir.join("events.json");
+        std::fs::write(
+            &report_path,
+            serde_json::to_vec_pretty(&report)
+                .map_err(|error| format!("无法编码 Session {session_id} 报告：{error}"))?,
+        )
+        .map_err(|error| format!("无法保存 Session {session_id} 报告：{error}"))?;
+        std::fs::write(
+            &events_path,
+            serde_json::to_vec(&events)
+                .map_err(|error| format!("无法编码 Session {session_id} 事件：{error}"))?,
+        )
+        .map_err(|error| format!("无法保存 Session {session_id} 事件：{error}"))?;
+        included_ids.push(session_id.to_string());
+        for event in &events {
+            aggregate.record(event);
+        }
+        matched_ids.push(session_id.to_string());
+    }
+
+    let mut aggregate_report = aggregate.finish();
+    compact_session_report_for_ui(&mut aggregate_report);
+    let mut aggregate_value =
+        serde_json::to_value(aggregate_report).map_err(|error| error.to_string())?;
+    if let Some(object) = aggregate_value.as_object_mut() {
+        object.insert(
+            "mobilee_source_sessions".into(),
+            serde_json::json!(matched_ids),
+        );
+        object.insert(
+            "mobilee_session_scope".into(),
+            Value::String("all-package-associated-sessions-preserved-and-aggregated".into()),
+        );
+        object.insert(
+            "mobilee_included_sessions".into(),
+            serde_json::json!(included_ids),
+        );
+        object.insert(
+            "mobilee_session_failures".into(),
+            serde_json::json!(failures),
+        );
+    }
+    std::fs::write(
+        evidence_root.join("session-report.json"),
+        serde_json::to_vec_pretty(&aggregate_value)
+            .map_err(|error| format!("无法编码汇总 Session 报告：{error}"))?,
+    )
+    .map_err(|error| format!("无法保存汇总 Session 报告：{error}"))?;
+    let index = serde_json::json!({
+        "schemaVersion": "mobilee.kernsight-package-sessions/v1",
+        "package": package,
+        "scannedSessions": overview.status.session_count,
+        "includedSessions": included_ids,
+        "matchedSessions": matched_ids,
+        "failures": failures,
+        "scope": "完整保留所有能够关联到当前包的手机 Session；跳过其他 App 的会话",
+    });
+    std::fs::write(
+        evidence_root.join("session-index.json"),
+        serde_json::to_vec_pretty(&index)
+            .map_err(|error| format!("无法编码 Session 索引：{error}"))?,
+    )
+    .map_err(|error| format!("无法保存 Session 索引：{error}"))?;
+    std::fs::write(
+        evidence_root.join("capture.txt"),
+        format!(
+            "package={package}\nincluded_sessions={}\nmatched_sessions={}\nfailed_sessions={}\n",
+            included_ids.len(),
+            matched_ids.len(),
+            failures.len()
+        ),
+    )
+    .map_err(|error| format!("无法保存采集摘要：{error}"))?;
+    Ok(())
 }
 
 #[tauri::command]
@@ -2429,46 +3269,16 @@ fn validate_package(package: &str) -> Result<(), String> {
 }
 
 fn validate_evidence_relative_path(path: &str) -> Result<(), String> {
-    let allowed_root = [
-        "runtime/",
-        "data-private/",
-        "readable-dex/",
-        "forensics/",
-        "apk/",
-        "apk-dex/",
-        "lib/",
-        "oat/",
-        "assets/",
-        "apk-assets/",
-        "mapped/",
-        "open/",
-        "code-loader/",
-        "data-cache/",
-        "repaired/",
-    ]
-    .iter()
-    .any(|prefix| path.starts_with(prefix))
-        || matches!(
-            path,
-            "dump-report.json"
-                | "session-report.json"
-                | "session-report.txt"
-                | "session.uuid"
-                | "CAPTURE.txt"
-                | "EVIDENCE.txt"
-                | "HOWTO.txt"
-        );
     if path.is_empty()
         || path.starts_with('/')
+        || path.contains('\\')
+        || path.contains(':')
         || path
             .split('/')
             .any(|part| part.is_empty() || part == "." || part == "..")
-        || !allowed_root
-        || !path.bytes().all(|byte| {
-            byte.is_ascii_alphanumeric() || matches!(byte, b'/' | b'.' | b'_' | b'-' | b'+' | b'@')
-        })
+        || path.chars().any(char::is_control)
     {
-        return Err("证据相对路径不在允许的 package dump 目录内".into());
+        return Err("证据文件路径不符合 MobileE 案例容器规则".into());
     }
     Ok(())
 }
@@ -2485,32 +3295,6 @@ fn read_bounded_text(path: &Path, max_bytes: u64) -> Result<String, String> {
         ));
     }
     std::fs::read_to_string(path).map_err(|error| format!("无法读取 {}：{error}", path.display()))
-}
-
-fn resolve_ksightctl() -> Result<PathBuf, String> {
-    if let Some(path) = std::env::var_os("KSIGHTCTL_PATH").map(PathBuf::from) {
-        if path.is_file() {
-            return Ok(path);
-        }
-    }
-    let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
-    for candidate in [
-        manifest.join("../../KernSight/target/release/ksightctl"),
-        manifest.join("../../KernSight/target/debug/ksightctl"),
-    ] {
-        if candidate.is_file() {
-            return Ok(candidate);
-        }
-    }
-    if let Some(paths) = std::env::var_os("PATH") {
-        for directory in std::env::split_paths(&paths) {
-            let candidate = directory.join("ksightctl");
-            if candidate.is_file() {
-                return Ok(candidate);
-            }
-        }
-    }
-    Err("找不到 ksightctl。请构建 KernSight release，或设置 KSIGHTCTL_PATH".into())
 }
 
 fn local_tree_stats(
@@ -2660,5 +3444,144 @@ mod tests {
         assert!(line.starts_with("event pid=42"));
         assert!(line.contains("载荷已从运行日志中省略"));
         assert!(!line.contains("private-value"));
+    }
+
+    #[test]
+    fn mirror_coverage_distinguishes_capture_reassembly_and_delivery() {
+        let mut logs = VecDeque::new();
+        logs.push_back("network_connects=3 network_handshakes=1 observed_fragments=18 observed_bytes=4096 reconstructed_messages=0 reconstructed_requests=0 reconstructed_responses=0 delivered=0 delivery_failed=0 retry_pending=0 unknown_directions=2 buffered_bytes=4096".into());
+        let waiting = mirror_coverage_from_logs(&logs, true);
+        assert_eq!(waiting.observed_fragments, 18);
+        assert_eq!(waiting.state, "unrecognized_stream");
+
+        logs.push_back("network_connects=5 network_handshakes=2 observed_fragments=30 observed_bytes=8192 reconstructed_messages=4 reconstructed_requests=2 reconstructed_responses=2 delivered=2 delivery_failed=0 retry_pending=0 unknown_directions=0 buffered_bytes=0".into());
+        let delivering = mirror_coverage_from_logs(&logs, true);
+        assert_eq!(delivering.reconstructed_responses, 2);
+        assert_eq!(delivering.delivered, 2);
+        assert_eq!(delivering.state, "delivering");
+    }
+
+    #[tokio::test]
+    async fn mee_round_trip_preserves_all_supported_evidence_paths() {
+        let root = std::env::temp_dir().join(format!("mobilee-archive-test-{}", Uuid::new_v4()));
+        let source = root.join("source");
+        std::fs::create_dir_all(source.join("runtime/plaintext")).unwrap();
+        std::fs::write(
+            source.join("dump-report.json"),
+            r#"{"package":"com.example.archive","dump_id":"dump-1","agent_version":"0.2.10"}"#,
+        )
+        .unwrap();
+        std::fs::write(source.join("runtime/plaintext/sample.txt"), b"sample").unwrap();
+        std::fs::create_dir_all(source.join("sessions/session-1")).unwrap();
+        std::fs::write(source.join("sessions/session-1/events.json"), b"[]").unwrap();
+        std::fs::write(source.join("sessions/session-1/session-report.json"), b"{}").unwrap();
+        std::fs::write(source.join("session-index.json"), b"{}").unwrap();
+        std::fs::write(source.join("capture.txt"), b"included_sessions=1\n").unwrap();
+        std::fs::create_dir_all(source.join("dex-classification/01-business")).unwrap();
+        std::fs::write(
+            source.join("dex-classification/01-business/index.json"),
+            b"{}",
+        )
+        .unwrap();
+        std::fs::create_dir_all(source.join("runtime/packer-mem")).unwrap();
+        std::fs::write(
+            source.join("runtime/packer-mem/42-1000-[anon_v8].bin"),
+            b"memory",
+        )
+        .unwrap();
+        let archive = root.join("com.example.archive.mee");
+        write_kernsight_evidence_archive(&source, &archive).unwrap();
+        let bundle = import_kernsight_evidence_archive(archive.to_string_lossy().into_owned())
+            .await
+            .unwrap();
+        assert_eq!(bundle.package, "com.example.archive");
+        assert!(bundle
+            .files
+            .iter()
+            .any(|file| file.relative_path == "runtime/plaintext/sample.txt"));
+        assert!(bundle
+            .files
+            .iter()
+            .any(|file| file.relative_path == "sessions/session-1/events.json"));
+        assert!(bundle
+            .files
+            .iter()
+            .any(|file| { file.relative_path == "dex-classification/01-business/index.json" }));
+        assert!(bundle
+            .files
+            .iter()
+            .any(|file| { file.relative_path == "runtime/packer-mem/42-1000-[anon_v8].bin" }));
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(
+            Path::new(&bundle.root)
+                .parent()
+                .unwrap_or_else(|| Path::new(&bundle.root)),
+        );
+    }
+
+    #[test]
+    fn legacy_dex_sets_are_recataloged_with_class_level_ownership() {
+        let semantic = serde_json::json!({
+            "version": "039", "declared_file_size": 1024, "string_ids": 1,
+            "type_ids": 1, "field_ids": 0, "method_ids": 1, "class_defs": 1,
+            "class_descriptors": ["Lcom/tencent/wework/api/WWAPI;"],
+            "class_descriptors_truncated": false, "method_names": [],
+            "method_names_truncated": false, "method_prototypes": [],
+            "method_prototypes_truncated": false, "api_strings": []
+        });
+        let mut report = serde_json::json!({
+            "package": "com.example.product",
+            "dex_sets": [{
+                "sha256": "abc", "bytes": 1024,
+                "canonical_relative_path": "readable-dex/classes2.dex",
+                "sources": ["apk-dex"], "observations": [], "semantic": semantic
+            }]
+        });
+        enrich_local_dex_ownership(&mut report, "com.example.product");
+        assert_eq!(
+            report["dex_ownership"]["entries"][0]["category"],
+            "third_party_sdk"
+        );
+        assert_eq!(report["dex_ownership"]["third_party_sdks"], 1);
+    }
+
+    #[test]
+    fn legacy_ownership_does_not_hide_exact_package_classes_in_mixed_dex() {
+        let semantic = serde_json::json!({
+            "version": "039", "declared_file_size": 1024, "string_ids": 4,
+            "type_ids": 4, "field_ids": 0, "method_ids": 4, "class_defs": 4,
+            "class_descriptors": [
+                "Lcom/dlxx/mam/Internal/MainActivity;",
+                "Lcom/tencent/wework/Api;",
+                "Lcom/tencent/wework/Auth;",
+                "Lcom/tencent/wework/Storage;"
+            ],
+            "class_descriptors_truncated": false, "method_names": [],
+            "method_names_truncated": false, "method_prototypes": [],
+            "method_prototypes_truncated": false, "api_strings": []
+        });
+        let mut report = serde_json::json!({
+            "package": "com.dlxx.mam.Internal",
+            "dex_sets": [{
+                "sha256": "mixed", "bytes": 1024,
+                "canonical_relative_path": "apk-dex/split/classes13.dex",
+                "sources": ["apk-dex"], "observations": [], "semantic": semantic
+            }],
+            "dex_ownership": {
+                "schema_version": "mobilee.kernsight-dex-ownership/v1",
+                "package": "com.dlxx.mam.Internal",
+                "entries": [{"category": "third_party_sdk"}]
+            }
+        });
+
+        enrich_local_dex_ownership(&mut report, "com.dlxx.mam.Internal");
+
+        assert_eq!(
+            report["dex_ownership"]["schema_version"],
+            "mobilee.kernsight-dex-ownership/v3"
+        );
+        assert_eq!(report["dex_ownership"]["entries"][0]["category"], "mixed");
+        assert_eq!(report["dex_ownership"]["business_class_samples"], 1);
+        assert_eq!(report["dex_ownership"]["business_dex_sets"], 1);
     }
 }

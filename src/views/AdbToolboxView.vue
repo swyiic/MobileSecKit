@@ -1,18 +1,39 @@
 <template>
   <div class="toolbox-layout">
     <div v-if="!androidAvailable" class="notice"><span class="material-symbols-outlined">info</span>当前设备不是 Android，ADB Toolbox 不可用；请切换到 Frida Toolbox。</div>
-    <section class="quick-action-grid">
-      <button v-for="item in quickActions" :key="item.action" :disabled="running || !device || !props.androidAvailable" @click="runQuick(item.action, item.argument)">
+    <section class="tool-workspace-header panel">
+      <div class="tool-workspace-copy">
+        <div class="eyebrow">DEVICE OPERATIONS</div>
+        <h2>设备操作</h2>
+        <p>先选择任务，再执行操作。采集、网络实验和普通 ADB 工具彼此分区，避免误把不同链路当成同一功能。</p>
+      </div>
+      <span class="device-chip">{{ device?.model || '未选择设备' }}</span>
+      <nav class="tool-section-tabs" aria-label="设备操作分类">
+        <button v-for="item in toolSections" :key="item.id" :class="{ active: toolSection === item.id }" @click="toolSection = item.id">
+          <span class="material-symbols-outlined">{{ item.icon }}</span>
+          <span><strong>{{ item.label }}</strong><small>{{ item.hint }}</small></span>
+          <i v-if="item.id === 'traffic' && mirrorRunning"></i>
+        </button>
+      </nav>
+      <button v-if="latestHistory && toolSection !== 'console'" class="tool-latest-result" @click="toolSection = 'console'">
+        <span class="material-symbols-outlined" :class="latestHistory.success ? 'success' : 'failed'">{{ latestHistory.success ? 'check_circle' : 'error' }}</span>
+        <span><small>最近操作</small><strong>{{ latestHistory.command }}</strong></span>
+        <em>查看日志</em>
+      </button>
+    </section>
+
+    <section v-if="toolSection === 'inspect'" class="quick-action-grid">
+      <button v-for="item in quickActions" :key="item.action" type="button" :disabled="running || !device || !props.androidAvailable" @click.stop="runQuick(item.action, item.argument)">
         <span class="material-symbols-outlined">{{ item.icon }}</span>
         <span><strong>{{ item.label }}</strong><small>{{ item.hint }}</small></span>
       </button>
-      <button :disabled="!device || !androidAvailable" @click="shellCommand = 'getprop'; submitShell()">
+      <button type="button" :disabled="running || !device || !androidAvailable" @click.stop="shellCommand = 'getprop'; submitShell()">
         <span class="material-symbols-outlined">terminal</span>
         <span><strong>Shell</strong><small>自由命令行</small></span>
       </button>
     </section>
 
-    <section class="control-panel panel">
+    <section v-if="toolSection === 'inspect'" class="control-panel panel">
       <div class="section-title compact">
         <div><div class="eyebrow">DEVICE FORENSICS</div><h2>ADB Toolbox</h2></div>
         <span class="device-chip">{{ device?.model || 'No device' }}</span>
@@ -26,9 +47,9 @@
         </label>
         <label v-if="needsPackage">
           <span>目标包名</span>
-          <input v-model.trim="argument" placeholder="com.example.app" @keyup.enter="submit" />
+          <input v-model.trim="argument" placeholder="com.example.app" @keydown.enter.prevent.stop="submit" />
         </label>
-        <button class="primary-button run-command" :disabled="running || !device || !androidAvailable || (needsPackage && !argument)" @click="submit">
+        <button type="button" class="primary-button run-command" :disabled="running || !device || !androidAvailable || (needsPackage && !argument)" @click.stop="submit">
           <span class="material-symbols-outlined">{{ running ? 'progress_activity' : 'play_arrow' }}</span>
           {{ running ? 'Running…' : '执行检查' }}
         </button>
@@ -36,20 +57,20 @@
       <p class="safety-note">只读检查使用普通 <code>adb shell</code>，SELinux 开关和透明代理等特权操作才使用 <code>su -c</code>；SELinux 修改通常只在本次开机有效。</p>
     </section>
 
-    <section class="deploy-panel panel">
+    <section v-if="toolSection === 'files'" class="deploy-panel panel">
       <div class="section-title compact"><div><div class="eyebrow">APP DEPLOY</div><h2>安装 / 卸载应用</h2></div><span class="device-chip">写操作</span></div>
       <div class="certificate-row deploy-file-row">
         <input v-model.trim="apkPath" placeholder="本机 APK 路径，例如 /tmp/app.apk" />
-        <button class="ghost-button" :disabled="!device || !androidAvailable" @click="pickApk">选择 APK</button>
-        <button class="primary-button" :disabled="!apkPath || !device || !androidAvailable || running" @click="installApk">安装</button>
+        <button type="button" class="ghost-button" :disabled="running || !device || !androidAvailable" @click.stop="pickApk">选择 APK</button>
+        <button type="button" class="primary-button" :disabled="!apkPath || !device || !androidAvailable || running" @click.stop="installApk">安装</button>
       </div>
       <div class="collect-row deploy-uninstall-row">
-        <input v-model.trim="uninstallPackage" placeholder="卸载包名，例如 com.example.app" @keyup.enter="uninstallApk" />
-        <button class="ghost-button" :disabled="!uninstallPackage || !device || !androidAvailable || running" @click="uninstallApk">卸载应用</button>
+        <input v-model.trim="uninstallPackage" placeholder="卸载包名，例如 com.example.app" @keydown.enter.prevent.stop="uninstallApk" />
+        <button type="button" class="ghost-button" :disabled="!uninstallPackage || !device || !androidAvailable || running" @click.stop="uninstallApk">卸载应用</button>
       </div>
     </section>
 
-    <section class="transfer-panel panel">
+    <section v-if="toolSection === 'files'" class="transfer-panel panel">
       <div class="section-title compact"><div><div class="eyebrow">FILE TRANSFER</div><h2>脱壳产物与设备文件</h2><p>输入内容会自动保留，切换页面后不会恢复默认值。</p></div><span class="device-chip">ADB</span></div>
       <div class="transfer-workflows">
         <article>
@@ -71,7 +92,7 @@
       </div>
     </section>
 
-    <section class="mirror-panel panel">
+    <section v-if="toolSection === 'traffic'" class="mirror-panel panel">
       <div class="section-title compact">
         <div>
           <div class="eyebrow">KERNSIGHT · eBPF</div>
@@ -101,13 +122,37 @@
       </div>
       <p class="safety-note">{{ mirrorRunning ? `运行中：${mirrorPackage} → ${mirrorHost}:${mirrorPort}，单次明文最多 64 KiB；响应通过 127.0.0.1:18081 回放。点停止才会结束。` : mirrorCleanupPending ? 'ksightd 已退出，但设备上仍有 KernSight pcap 子进程；请点击“清理残留”完成会话封存。' : `不限时长。LAN 填 ${mirrorHost}:${mirrorPort}；ADB reverse 则 Burp 听 0.0.0.0:${mirrorPort}。若 Burp 配置了全局 upstream，请为 127.0.0.1:18081 添加直连例外，否则历史中会只有请求、没有原始响应。` }}</p>
       <p v-if="mirrorStatusDetail" class="mirror-process-detail">{{ mirrorStatusDetail }}</p>
+      <section v-if="mirrorRunning || mirrorCoverage.observedFragments" class="mirror-coverage" :data-state="mirrorCoverage.state">
+        <header>
+          <div><small>LIVE COVERAGE · 仅计数</small><strong>{{ mirrorCoverageLabel }}</strong></div>
+          <b>{{ mirrorCoverage.delivered.toLocaleString() }} 条已进入 Burp</b>
+        </header>
+        <div class="mirror-coverage-grid">
+          <span><small>网络连接 / 握手</small><strong>{{ mirrorCoverage.networkConnects }} / {{ mirrorCoverage.networkHandshakes }}</strong></span>
+          <span><small>边界片段</small><strong>{{ mirrorCoverage.observedFragments.toLocaleString() }}</strong></span>
+          <span><small>完成重组</small><strong>{{ mirrorCoverage.reconstructedMessages.toLocaleString() }}</strong></span>
+          <span><small>请求 / 响应</small><strong>{{ mirrorCoverage.reconstructedRequests }} / {{ mirrorCoverage.reconstructedResponses }}</strong></span>
+          <span><small>重组缓冲</small><strong>{{ formatMirrorBytes(mirrorCoverage.bufferedBytes) }}</strong></span>
+          <span><small>投递失败 / 重试</small><strong>{{ mirrorCoverage.deliveryFailed }} / {{ mirrorCoverage.retryPending }}</strong></span>
+        </div>
+        <div class="mirror-adapter-line">标准 TLS {{ mirrorCoverage.standardTlsFragments }} · 厂商边界 {{ mirrorCoverage.vendorFragments }} · JNI {{ mirrorCoverage.jniFragments }} · 待识别方向 {{ mirrorCoverage.unknownDirections }}</div>
+        <div v-if="mirrorCoverage.stackCandidates" class="mirror-stack-line">
+          <span>已加载网络栈 <b>{{ mirrorCoverage.stackCandidates }}</b></span>
+          <span>导出符号候选 <b>{{ mirrorCoverage.stackExportCandidates }}</b></span>
+          <span>固定边界 <b>{{ mirrorCoverage.stackPinnedBoundaries }}</b></span>
+          <span>待固定边界 <b>{{ mirrorCoverage.stackEmpiricalBoundaries }}</b></span>
+          <span>Keylog 候选 <b>{{ mirrorCoverage.stackKeylogCandidates }}</b></span>
+          <span>暂未覆盖 <b>{{ mirrorCoverage.stackUncovered }}</b></span>
+        </div>
+        <p>{{ mirrorCoverageHint }}</p>
+      </section>
       <details class="mirror-live-log" open>
         <summary>实时诊断日志（{{ mirrorLogs.length }}）</summary>
         <pre>{{ mirrorLogs.length ? mirrorLogs.join('\n') : '等待设备端启动信息…' }}</pre>
       </details>
     </section>
 
-    <section class="security-tools panel">
+    <section v-if="toolSection === 'traffic'" class="security-tools panel">
       <div class="section-title compact"><div><div class="eyebrow">BURP / MITM LAB</div><h2>代理与证书</h2></div><span class="device-chip">需要 root 的选项会失败而不会静默修改</span></div>
       <div class="proxy-grid">
         <label><span>Proxy IP / Host</span><input v-model.trim="proxyHost" placeholder="192.168.3.100" /></label>
@@ -133,12 +178,12 @@
       </div>
     </section>
 
-    <section class="shell-panel panel">
+    <section v-if="toolSection === 'console'" class="shell-panel panel">
       <div class="section-title compact"><div><div class="eyebrow">REMOTE SHELL</div><h2>命令行</h2></div></div>
       <div class="shell-row"><span class="shell-prefix">$ adb shell</span><input v-model="shellCommand" placeholder="settings get global http_proxy" @keyup.enter="submitShell" /><button class="primary-button" :disabled="!shellCommand || !device || !androidAvailable" @click="submitShell">执行</button></div>
     </section>
 
-    <section class="terminal-panel">
+    <section v-if="toolSection === 'console'" class="terminal-panel">
       <header>
         <div class="traffic-lights"><i></i><i></i><i></i></div>
         <span><span class="material-symbols-outlined">terminal</span> adb-session</span>
@@ -158,12 +203,23 @@
 <script setup lang="ts">
 import { computed, onMounted, onUnmounted, ref, watch, type Ref } from 'vue'
 import { open } from '@tauri-apps/plugin-dialog'
-import type { AdbAction, CertificateInfo, DeviceSummary } from '@/types'
+import type { AdbAction, CertificateInfo, DeviceSummary, KernSightMirrorCoverage } from '@/types'
 import { formatDateTime } from '@/utils/time'
 import { monitoringBackend } from '@/services/backend'
 
-const props = defineProps<{ device?: DeviceSummary; androidAvailable: boolean; history: { time: number; command: string; output: string; success: boolean }[]; running: boolean; certificate: CertificateInfo | null; certificateBusy?: boolean; certificateFeedback?: string }>()
+const props = defineProps<{ active: boolean; device?: DeviceSummary; androidAvailable: boolean; history: { time: number; command: string; output: string; success: boolean }[]; running: boolean; certificate: CertificateInfo | null; certificateBusy?: boolean; certificateFeedback?: string }>()
 const androidAvailable = computed(() => props.androidAvailable)
+type ToolSection = 'inspect' | 'files' | 'traffic' | 'console'
+const toolSections: { id: ToolSection; label: string; hint: string; icon: string }[] = [
+  { id: 'inspect', label: '检查', hint: '状态与只读诊断', icon: 'fact_check' },
+  { id: 'files', label: '应用与文件', hint: '安装、拉取和推送', icon: 'folder_copy' },
+  { id: 'traffic', label: '流量实验', hint: 'eBPF 镜像、代理与证书', icon: 'lan' },
+  { id: 'console', label: '终端与日志', hint: 'Shell 和操作记录', icon: 'terminal' },
+]
+const savedToolSection = localStorage.getItem('mobilee.adb.toolSection') as ToolSection | null
+const toolSection = ref<ToolSection>(toolSections.some(item => item.id === savedToolSection) ? savedToolSection! : 'inspect')
+watch(toolSection, value => localStorage.setItem('mobilee.adb.toolSection', value), { flush: 'sync' })
+const latestHistory = computed(() => props.history[0])
 const emit = defineEmits<{
   run: [payload: { action: AdbAction; argument?: string }]
   shell: [command: string]
@@ -178,7 +234,6 @@ const emit = defineEmits<{
 
 const presets: { value: AdbAction; label: string }[] = [
   { value: 'logcat', label: 'Logcat（最近 120 行）' },
-  { value: 'packages', label: '第三方应用包列表' },
   { value: 'processes', label: '全部进程' },
   { value: 'system_properties', label: '系统属性 / Build' },
   { value: 'storage', label: '外部存储文件清单' },
@@ -194,7 +249,6 @@ const presets: { value: AdbAction; label: string }[] = [
 ]
 const quickActions: { action: AdbAction; label: string; hint: string; icon: string; argument?: string }[] = [
   { action: 'logcat', label: 'Logcat', hint: '应用崩溃与错误', icon: 'bug_report' },
-  { action: 'packages', label: 'Packages', hint: '已安装应用', icon: 'apps' },
   { action: 'storage', label: 'Storage', hint: '外部文件清单', icon: 'folder_open' },
   { action: 'proxy_status', label: 'Proxy', hint: '当前代理', icon: 'lan' },
   { action: 'selinux_permissive', label: 'SELinux Off', hint: '临时 Permissive', icon: 'lock_open' },
@@ -206,7 +260,8 @@ function persistentRef(key: string, fallback: string): Ref<string> {
   return value
 }
 
-const selectedAction = ref<AdbAction>((localStorage.getItem('mobilee.adb.action') as AdbAction) || 'logcat')
+const savedAction = localStorage.getItem('mobilee.adb.action') as AdbAction | null
+const selectedAction = ref<AdbAction>(presets.some((item) => item.value === savedAction) ? savedAction! : 'logcat')
 watch(selectedAction, value => localStorage.setItem('mobilee.adb.action', value), { flush: 'sync' })
 const argument = ref('')
 const shellCommand = ref('')
@@ -226,6 +281,35 @@ const mirrorStatusDetail = ref('')
 const mirrorBusy = ref(false)
 const mirrorStatusKnown = ref(false)
 const mirrorLogs = ref<string[]>([])
+const emptyMirrorCoverage = (): KernSightMirrorCoverage => ({ networkConnects: 0, networkHandshakes: 0, observedFragments: 0, observedBytes: 0, reconstructedMessages: 0, reconstructedRequests: 0, reconstructedResponses: 0, delivered: 0, deliveryFailed: 0, retryPending: 0, unknownDirections: 0, bufferedBytes: 0, attachedProbes: 0, activeProbes: 0, standardTlsFragments: 0, vendorFragments: 0, jniFragments: 0, stackCandidates: 0, stackExportCandidates: 0, stackPinnedBoundaries: 0, stackEmpiricalBoundaries: 0, stackKeylogCandidates: 0, stackUncovered: 0, state: 'idle' })
+const mirrorCoverage = ref<KernSightMirrorCoverage>(emptyMirrorCoverage())
+const mirrorCoverageLabel = computed(() => ({
+  idle: '等待采集',
+  waiting_for_network: '等待目标应用联网',
+  waiting_for_boundary: '尚未命中数据边界',
+  unrecognized_stream: '已命中，但协议尚未识别',
+  delivery_failed: 'Burp 投递失败',
+  waiting_for_pair: '已重组，等待请求/响应配对',
+  delivering: '正在投递',
+}[mirrorCoverage.value.state] || '正在诊断'))
+const mirrorCoverageHint = computed(() => {
+  const state = mirrorCoverage.value.state
+  if (state === 'waiting_for_network') return '尚未观察到目标应用建立连接。请确认包名对应当前运行进程，并在 App 中触发一次联网操作。'
+  if (state === 'waiting_for_boundary' && mirrorCoverage.value.stackEmpiricalBoundaries) return `已识别 ${mirrorCoverage.value.stackEmpiricalBoundaries} 个厂商边界，但 ABI 规则尚未固定，为避免再次造成 App 闪退，当前不会自动挂载。`
+  if (state === 'waiting_for_boundary' && mirrorCoverage.value.stackUncovered) return `已发现 ${mirrorCoverage.value.stackUncovered} 个当前规则无法解码的网络栈；需要补充对应构建版本的固定规则。`
+  if (state === 'waiting_for_boundary' && mirrorCoverage.value.stackExportCandidates) return '已找到可挂载的导出符号候选但尚无命中：可能当前请求走了另一套 SDK，或该库只是被加载但未实际承载连接。'
+  if (state === 'waiting_for_boundary') return '目标进程存在，但当前挂载点没有命中。通常表示流量经过尚未覆盖的 Cronet、QUIC、Flutter 或自研边界。'
+  if (state === 'unrecognized_stream') return '已经复制到数据片段，但尚未重组成 HTTP/1 或 HTTP/2；这不是 Burp 连接故障。'
+  if (state === 'delivery_failed') return '已重组出消息，但无法送达 Burp。请检查监听地址、ADB reverse 和 upstream 直连例外。'
+  if (state === 'waiting_for_pair') return '已识别协议，正在等待配对或后台投递；无需重复启动镜像。'
+  if (state === 'delivering') return '采集、协议重组和 Burp 投递链路均已有实际命中。'
+  return '启动镜像后，这里会区分“没有命中”“无法重组”和“无法投递”。'
+})
+function formatMirrorBytes(value: number) {
+  if (value < 1024) return `${value} B`
+  if (value < 1024 * 1024) return `${(value / 1024).toFixed(1)} KiB`
+  return `${(value / 1024 / 1024).toFixed(1)} MiB`
+}
 let mirrorPolling: ReturnType<typeof setInterval> | undefined
 let mirrorChecking = false
 const certificatePath = ref('')
@@ -261,6 +345,7 @@ async function refreshMirrorStatus() {
     mirrorCleanupPending.value = !!status.cleanupPending
     mirrorStatusDetail.value = status.detail || ''
     mirrorLogs.value = status.logs || []
+    mirrorCoverage.value = status.coverage || emptyMirrorCoverage()
     mirrorStatusKnown.value = true
     if (status.package) mirrorPackage.value = status.package
   } catch (cause) {
@@ -271,10 +356,18 @@ async function refreshMirrorStatus() {
   }
 }
 onMounted(() => {
-  void refreshMirrorStatus()
-  mirrorPolling = setInterval(() => void refreshMirrorStatus(), 2000)
+  if (props.active) void refreshMirrorStatus()
+  mirrorPolling = setInterval(() => {
+    // This view stays mounted to preserve a KernSight session. Do not let its
+    // hidden/status polling contend with an install, uninstall or another ADB
+    // command for the process-wide ADB gate.
+    if (props.active && !props.running) void refreshMirrorStatus()
+  }, 2000)
 })
 onUnmounted(() => { if (mirrorPolling) clearInterval(mirrorPolling) })
+watch(() => props.active, active => {
+  if (active && !props.running) void refreshMirrorStatus()
+})
 
 async function startMirror() {
   if (mirrorBusy.value || mirrorChecking || mirrorRunning.value || mirrorCleanupPending.value || !mirrorStatusKnown.value || !mirrorPackage.value || !mirrorHost.value || !mirrorPort.value || !props.device?.serial) return
@@ -329,6 +422,7 @@ async function stopMirror() {
     mirrorRunning.value = false
     mirrorCleanupPending.value = !!status.cleanupPending
     mirrorStatusDetail.value = status.detail || ''
+    mirrorCoverage.value = status.coverage || emptyMirrorCoverage()
     emit('log', { command: 'stop mirror', output: status.detail || '已停止镜像并清理设备端采集进程', success: true })
   } catch (cause) {
     mirrorStatusDetail.value = String(cause)

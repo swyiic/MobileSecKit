@@ -385,6 +385,7 @@ export function useFridaToolbox(context: FridaToolboxContext) {
     fridaProcesses,
     fridaScripts,
     refreshFrida,
+    refreshFridaProcesses,
     runFrida,
     runRuntimeWorkflow,
     runDexDump,

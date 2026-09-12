@@ -39,6 +39,19 @@ export async function importKernSightDirectory(path?: string) {
   return bundle
 }
 
+export async function importKernSightArchive(path?: string) {
+  const chosen = path || await open({
+    multiple: false,
+    title: '打开 MobileE 案例',
+    filters: [{ name: 'ME evidence', extensions: ['mee', 'meevidence', 'mobileevidence'] }],
+  })
+  if (!chosen || Array.isArray(chosen)) return null
+  const bundle = await monitoringBackend.importKernSightEvidenceArchive(chosen)
+  upsertKernSightBundle(bundle)
+  requestedPackage.value = bundle.package
+  return bundle
+}
+
 export async function importKernSightForPackage(packageName: string) {
   const existing = bundleForPackage(packageName)
   if (existing) return existing
@@ -67,6 +80,7 @@ export function useKernSightEvidence(packageName?: MaybeRef<string>) {
     join,
     upsertBundle: upsertKernSightBundle,
     importDirectory: importKernSightDirectory,
+    importArchive: importKernSightArchive,
     importForPackage: importKernSightForPackage,
     requestPackage: requestKernSightPackage,
   }

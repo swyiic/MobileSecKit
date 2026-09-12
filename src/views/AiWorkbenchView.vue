@@ -33,8 +33,29 @@
       <section class="ai-source-strip">
         <div><small>APP</small><strong>{{ analysis.displayName || analysis.fileName }}</strong><code>{{ analysis.packageId || analysis.platform }}</code></div>
         <div><small>STATIC</small><strong>{{ analysis.dataBoundaries.length }}</strong><span>边界候选</span></div>
-        <div><small>RUNTIME · APP SCOPED</small><strong>{{ runtimeEvidence.length }}</strong><span>{{ analysis.packageId ? `仅 ${analysis.packageId}` : '未解析包名，仅静态证据' }}</span></div>
+        <div><small>RUNTIME · HISTORY</small><strong>{{ terminalRuntimeEvidence.length }}</strong><span>{{ analysis.packageId ? `仅 ${analysis.packageId}` : '未解析包名，仅静态证据' }}</span></div>
+        <div :class="{ 'source-ready': kernSightJoin }"><small>KERNSIGHT · L0/L1/L2</small><strong>{{ kernSightFacts.length }}</strong><span>{{ kernSightJoin ? `${kernSightJoin.sessionId || '本地包证据'} · ${kernSightJoin.fileCount} files` : '尚未接入包证据' }}</span></div>
         <div><small>CODE</small><strong>{{ analysis.codeInsights.length }}</strong><span>代码入口</span></div>
+      </section>
+
+      <section class="ai-evidence-fusion" :class="{ ready: kernSightJoin }">
+        <header>
+          <div><div class="eyebrow">STATIC ↔ RUNTIME EVIDENCE JOIN</div><strong>{{ kernSightJoin ? 'KernSight 证据已进入 AI Context' : '当前 AI 只有静态结果与终端历史' }}</strong></div>
+          <span>{{ kernSightJoin ? '按包名隔离 · 不自动升级结论' : 'WAITING FOR L2' }}</span>
+        </header>
+        <p v-if="!kernSightJoin">在 KernSight 的包证据区导入与当前包名一致的报告后，这里会把 L0/L1/L2 摘要作为独立 Evidence ID 送入 AI。不会把整份原始明文或全部文件无差别塞给模型。</p>
+        <template v-else>
+          <div class="ai-fusion-metrics">
+            <span><small>已接入事实</small><strong>{{ kernSightFacts.length }}</strong></span>
+            <span><small>名称/路径候选对齐</small><strong>{{ codeAlignment.matched }}</strong></span>
+            <span><small>仅运行时出现</small><strong>{{ codeAlignment.runtimeOnly }}</strong></span>
+            <span><small>物理文件</small><strong>{{ kernSightJoin.fileCount }}</strong></span>
+          </div>
+          <div class="ai-fusion-facts">
+            <span v-for="fact in kernSightFacts" :key="fact.key" :data-strength="fact.strength"><b>{{ fact.layer }}</b>{{ fact.title }}<small>{{ fact.strength }}</small></span>
+          </div>
+          <p>{{ kernSightJoin.disclaimer }} DEX/SO 的名称或路径相同只算候选对齐；后续应优先补 SHA-256 / Build ID，再做类、方法、Endpoint 与内存映射的确定性关联。</p>
+        </template>
       </section>
 
       <div class="ai-grid">
@@ -209,16 +230,17 @@ import { open, save } from '@tauri-apps/plugin-dialog'
 import { aiBackend } from '@/services/backend'
 import { appConfig } from '@/services/config'
 import { correlateBoundaries } from '@/services/boundaries'
+import { useKernSightEvidence } from '@/composables/useKernSightEvidence'
 import { formatDateTime } from '@/utils/time'
 import ScrollAnchorNav from '@/components/ScrollAnchorNav.vue'
 import AiExternalResultDialog from '@/components/ai/AiExternalResultDialog.vue'
 import AiReviewResults from '@/components/ai/AiReviewResults.vue'
 import RuleLibraryDrawer from '@/components/RuleLibraryDrawer.vue'
-import type { AiContextPack, AiProviderRequest, AiTaskTemplate, AiValidationReport, AppAnalysis, DeviceSummary, ExclusionRule, KnowledgePattern, TerminalEntry } from '@/types'
+import type { AiContextPack, AiProviderRequest, AiTaskTemplate, AiValidationReport, AppAnalysis, DataBoundaryObservation, DeviceSummary, ExclusionRule, KnowledgePattern, TerminalEntry } from '@/types'
 
 interface BatchTaskResult { task: AiTaskTemplate; pack?: AiContextPack; validation?: AiValidationReport; error?: string }
 
-const props = defineProps<{ analysis: AppAnalysis | null; history: TerminalEntry[]; device?: DeviceSummary | null }>()
+const props = defineProps<{ analysis: AppAnalysis | null; history: TerminalEntry[]; device?: DeviceSummary | null; taskRequest?: { id: number; taskId: string } }>()
 const tasks = ref<AiTaskTemplate[]>([])
 const taskId = ref('attack-surface')
 const maxChars = ref(24000)
@@ -252,7 +274,31 @@ const externalResultError = ref('')
 
 const selectedTask = computed(() => tasks.value.find((task) => task.id === taskId.value))
 const correlated = computed(() => correlateBoundaries(props.analysis, props.history, props.analysis?.platform || props.device?.platform || 'unknown', props.device?.serial))
-const runtimeEvidence = computed(() => correlated.value.items.filter((item) => item.sourceType === 'runtime' || item.sourceType === 'runtime-observed' || item.sourceType === 'static-correlated' || item.confidence === 'runtime-confirmed'))
+const terminalRuntimeEvidence = computed(() => correlated.value.items.filter((item) => item.sourceType === 'runtime' || item.sourceType === 'runtime-observed' || item.sourceType === 'static-correlated' || item.confidence === 'runtime-confirmed'))
+const kernSight = useKernSightEvidence(computed(() => props.analysis?.packageId || ''))
+const kernSightJoin = computed(() => props.analysis?.platform === 'android' ? kernSight.join.value : null)
+const kernSightFacts = computed(() => kernSightJoin.value?.facts.filter((fact) => fact.strength !== 'absent') || [])
+const kernSightEvidence = computed<DataBoundaryObservation[]>(() => kernSightFacts.value.map((fact) => ({
+  id: `kernsight-${kernSightJoin.value?.sessionId || 'bundle'}-${fact.key}`,
+  boundary: ({ sni: 'network', tls: 'tls', binder: 'ipc', dex: 'dynamic-code', so: 'native-bridge', private: 'storage', heap: 'storage', jni: 'native-bridge' } as Record<string, string>)[fact.key] || 'runtime-integrity',
+  direction: 'observed',
+  title: `KernSight ${fact.layer} · ${fact.title}`,
+  summary: fact.summary,
+  sourceType: fact.strength === 'confirmed' ? 'runtime' : `kernsight-${fact.strength}`,
+  sourceLocation: kernSightJoin.value?.root,
+  platform: 'android',
+  dataTypes: [fact.layer, fact.strength, fact.key],
+  severity: 'info',
+  confidence: fact.strength === 'confirmed' ? 'runtime-observed' : fact.strength,
+  evidence: fact.items,
+})))
+const runtimeEvidence = computed(() => [...terminalRuntimeEvidence.value, ...kernSightEvidence.value])
+const codeAlignment = computed(() => {
+  const staticNames = new Set((props.analysis?.files || []).map((path) => path.split(/[\\/]/).pop()?.toLowerCase()).filter(Boolean))
+  const runtimeItems = kernSightFacts.value.filter((fact) => fact.key === 'dex' || fact.key === 'so').flatMap((fact) => fact.items)
+  const matched = runtimeItems.filter((path) => staticNames.has(path.split(/[\\/]/).pop()?.toLowerCase())).length
+  return { matched, runtimeOnly: Math.max(0, runtimeItems.length - matched) }
+})
 const selectedChunk = computed(() => pack.value?.chunks.find((chunk) => chunk.id === selectedChunkId.value) || pack.value?.chunks[0])
 const selectedEvidence = computed(() => {
   const ids = new Set(selectedChunk.value?.evidenceIds || [])
@@ -610,10 +656,22 @@ watch(() => props.analysis?.artifactSha256 || props.analysis?.path, () => {
   externalResultError.value = ''
 })
 
+watch(() => props.analysis?.packageId, async (packageName) => {
+  if (packageName && props.analysis?.platform === 'android' && !kernSightJoin.value) {
+    await kernSight.importForPackage(packageName)
+  }
+}, { immediate: true })
+
+watch(() => props.taskRequest, (requested) => {
+  if (requested && tasks.value.some((task) => task.id === requested.taskId)) taskId.value = requested.taskId
+})
+
 onMounted(async () => {
   try {
     tasks.value = await aiBackend.listTaskTemplates()
-    if (!tasks.value.some((task) => task.id === taskId.value)) taskId.value = tasks.value[0]?.id || 'attack-surface'
+    const requested = props.taskRequest?.taskId
+    if (requested && tasks.value.some((task) => task.id === requested)) taskId.value = requested
+    else if (!tasks.value.some((task) => task.id === taskId.value)) taskId.value = tasks.value[0]?.id || 'attack-surface'
   } catch (error) {
     setMessage(`读取 AI 任务模板失败：${String(error)}`, true)
   }

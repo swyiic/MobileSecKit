@@ -66,32 +66,29 @@
       <section class="process-panel panel">
         <div class="section-title compact">
           <div>
-            <h2>Process Monitor</h2>
-            <p>{{ selectedDevice?.platform === 'ios' ? 'iOS 进程请在 Frida Toolbox 中刷新' : '按内存排序的实时进程快照' }}</p>
+            <h2>已安装应用</h2>
+            <p>{{ selectedDevice?.platform === 'ios' ? 'iOS 应用清单请在运行时分析中查看' : `第三方应用 · ${installedApps.length} 个` }}</p>
           </div>
-          <button class="icon-button" :disabled="loading" title="刷新进程" @click="$emit('refresh')">
+          <button class="icon-button" :disabled="loading" title="刷新应用清单" @click="$emit('refresh')">
             <span class="material-symbols-outlined">refresh</span>
           </button>
         </div>
         <label class="search-box">
           <span class="material-symbols-outlined">search</span>
-          <input v-model="query" placeholder="搜索 PID、用户或包名" />
+          <input v-model="query" placeholder="搜索应用名称或包名" />
         </label>
-        <div v-if="selectedDevice?.platform === 'ios'" class="empty-inline">iOS 不使用 ADB 进程接口；切换到 Frida Toolbox 查看运行中的 App。</div>
+        <div v-if="selectedDevice?.platform === 'ios'" class="empty-inline">iOS 不使用 Android 安装包接口；请切换到运行时分析查看应用清单。</div>
         <div v-else class="process-list">
-          <article v-for="process in filteredProcesses" :key="process.pid" class="process-row" :class="[process.system ? 'system-process' : 'user-process', { muted: process.protected }]">
+          <article v-for="app in filteredApps" :key="app.packageName" class="process-row installed-app-row user-process">
             <div class="process-mark">
-              <span class="material-symbols-outlined">{{ process.protected ? 'shield_lock' : 'memory' }}</span>
+              <span class="material-symbols-outlined">apps</span>
             </div>
             <div class="process-copy">
-              <strong>{{ process.name }}</strong>
-              <p>PID {{ process.pid }} · {{ process.user }} · {{ formatMemory(process.memoryKb) }}</p>
+              <strong>{{ app.displayName }}</strong>
+              <p><code>{{ app.packageName }}</code><span v-if="!app.labelResolved"> · 应用名称未解析</span></p>
             </div>
-            <button class="ghost-button" :disabled="process.protected" @click="$emit('inspect-process', process)">
-              Inspect
-            </button>
           </article>
-          <div v-if="!filteredProcesses.length" class="empty-inline">没有匹配的进程</div>
+          <div v-if="!filteredApps.length" class="empty-inline">没有匹配的第三方应用</div>
         </div>
       </section>
     </template>
@@ -100,7 +97,7 @@
 
 <script setup lang="ts">
 import { computed, ref } from 'vue'
-import type { DeviceDetails, DeviceSummary, IosDeviceDetails, ProcessInfo } from '@/types'
+import type { DeviceDetails, DeviceSummary, InstalledAppInfo, IosDeviceDetails } from '@/types'
 
 function batteryIcon(level: number) {
   if (level >= 90) return 'battery_android_full'
@@ -115,7 +112,7 @@ const props = defineProps<{
   selectedSerial: string
   details: DeviceDetails | null
   iosDetails: IosDeviceDetails | null
-  processes: ProcessInfo[]
+  installedApps: InstalledAppInfo[]
   loading: boolean
 }>()
 
@@ -123,22 +120,17 @@ defineEmits<{
   'select-device': [serial: string]
   refresh: []
   'refresh-devices': []
-  'inspect-process': [process: ProcessInfo]
 }>()
 
 const query = ref('')
 const selectedDevice = computed(() => props.devices.find((item) => item.serial === props.selectedSerial))
-const filteredProcesses = computed(() => {
+const filteredApps = computed(() => {
   const needle = query.value.trim().toLowerCase()
-  if (!needle) return props.processes
-  return props.processes.filter((process) =>
-    `${process.pid} ${process.user} ${process.name}`.toLowerCase().includes(needle),
+  if (!needle) return props.installedApps
+  return props.installedApps.filter((app) =>
+    `${app.displayName} ${app.packageName}`.toLowerCase().includes(needle),
   )
 })
-
-function formatMemory(memoryKb: number) {
-  return memoryKb ? `${(memoryKb / 1024).toFixed(memoryKb > 10240 ? 0 : 1)} MB` : '—'
-}
 
 function tone(value: string) {
   const normalized = value.toLowerCase()

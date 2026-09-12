@@ -6,38 +6,47 @@
         <h3>权限、组件与配置 <small>{{ totalItems }} 项</small></h3>
         <p>红色优先复核，黄色需要结合系统版本、权限保护和业务用途判断。</p>
       </div>
-      <span class="material-symbols-outlined disclosure-chevron">expand_more</span>
+      <div class="surface-summary-actions">
+        <button type="button" class="ghost-button" title="聚合同类权限、组件与配置后进入 AI 精审" @click.stop="$emit('open-ai', 'manifest-surface')"><span class="material-symbols-outlined">neurology</span>AI 聚合精审</button>
+        <span class="material-symbols-outlined disclosure-chevron">expand_more</span>
+      </div>
     </summary>
     <div class="analyzer-disclosure-body static-surface-grid">
       <section>
         <h3>Permissions <small>{{ analysis.permissions.length }}</small><button type="button" class="help-dot" :aria-expanded="help === 'permission'" @click.stop="help = help === 'permission' ? '' : 'permission'">?</button></h3>
         <p v-if="help === 'permission'" class="inline-help">红色为短信、联系人、录音、精确位置、安装包、悬浮窗、全盘存储等高风险权限；黄色需结合 Android 版本、厂商 ROM 和业务场景复核。</p>
-        <div class="tag-list"><span v-for="permission in analysis.permissions" :key="permission" :class="`risk-tag-${permissionRisk(permission)}`" :title="permissionHint(permission)">{{ permission }}</span><em v-if="!analysis.permissions.length">未找到 / 工具不可用</em></div>
+        <div class="tag-list"><span v-for="permission in visibleGroup('permissions', analysis.permissions)" :key="permission" :class="`risk-tag-${permissionRisk(permission)}`" :title="permissionHint(permission)">{{ permission }}</span><em v-if="!analysis.permissions.length">未找到 / 工具不可用</em></div>
+        <button v-if="analysis.permissions.length > previewLimit" class="surface-more" @click="toggleGroup('permissions')">{{ expandedGroups.permissions ? '收起' : `显示全部 ${analysis.permissions.length} 项` }}</button>
       </section>
       <section>
         <h3>Components <small>{{ analysis.components.length }}</small><button type="button" class="help-dot" :aria-expanded="help === 'component'" @click.stop="help = help === 'component' ? '' : 'component'">?</button></h3>
         <p v-if="help === 'component'" class="inline-help">重点手测 exported=true 且没有 permission 保护的组件；仅“存在组件”不等于漏洞。</p>
-        <div class="tag-list"><span v-for="component in analysis.components" :key="component" :class="`risk-tag-${componentRisk(component)}`" :title="componentHint(component)">{{ component }}</span><em v-if="!analysis.components.length">未找到 / 工具不可用</em></div>
+        <div class="tag-list"><span v-for="component in visibleGroup('components', analysis.components)" :key="component" :class="`risk-tag-${componentRisk(component)}`" :title="componentHint(component)">{{ component }}</span><em v-if="!analysis.components.length">未找到 / 工具不可用</em></div>
+        <button v-if="analysis.components.length > previewLimit" class="surface-more" @click="toggleGroup('components')">{{ expandedGroups.components ? '收起' : `优先显示高价值项 · 展开全部 ${analysis.components.length}` }}</button>
       </section>
       <section>
         <h3>{{ analysis.platform === 'ios' ? 'Info.plist / Entitlements' : 'Manifest security flags' }} <small>{{ analysis.manifestFlags.length }}</small><button type="button" class="help-dot" :aria-expanded="help === 'manifest'" @click.stop="help = help === 'manifest' ? '' : 'manifest'">?</button></h3>
         <p v-if="help === 'manifest'" class="inline-help">{{ analysis.platform === 'ios' ? '重点检查 ATS、get-task-allow、文件共享、后台模式及隐私用途声明。' : 'debuggable=true、allowBackup=true、usesCleartextTraffic=true 通常需要醒目标记；最终风险仍取决于 targetSdk、网络安全配置和业务数据。' }}</p>
-        <div class="tag-list"><span v-for="flag in analysis.manifestFlags" :key="flag" :class="`risk-tag-${manifestRisk(flag)}`" :title="manifestHint(flag)">{{ flag }}</span><em v-if="!analysis.manifestFlags.length">未显式配置</em></div>
+        <div class="tag-list"><span v-for="flag in visibleGroup('flags', analysis.manifestFlags)" :key="flag" :class="`risk-tag-${manifestRisk(flag)}`" :title="manifestHint(flag)">{{ flag }}</span><em v-if="!analysis.manifestFlags.length">未显式配置</em></div>
+        <button v-if="analysis.manifestFlags.length > previewLimit" class="surface-more" @click="toggleGroup('flags')">{{ expandedGroups.flags ? '收起' : `显示全部 ${analysis.manifestFlags.length} 项` }}</button>
       </section>
       <section>
         <h3>Exported components <small>{{ analysis.exportedComponents.length }}</small><button type="button" class="help-dot" :aria-expanded="help === 'exported'" @click.stop="help = help === 'exported' ? '' : 'exported'">?</button></h3>
         <p v-if="help === 'exported'" class="inline-help">导出组件是外部入口，不一定是漏洞；无权限保护、接受外部 URI/Intent 或触发敏感操作时风险更高。</p>
-        <div class="tag-list"><span v-for="component in analysis.exportedComponents" :key="component" :class="`risk-tag-${componentRisk(component)}`" :title="componentHint(component)">{{ component }}</span><em v-if="!analysis.exportedComponents.length">未发现 exported=true</em></div>
+        <div class="tag-list"><span v-for="component in visibleGroup('exported', analysis.exportedComponents)" :key="component" :class="`risk-tag-${componentRisk(component)}`" :title="componentHint(component)">{{ component }}</span><em v-if="!analysis.exportedComponents.length">未发现 exported=true</em></div>
+        <button v-if="analysis.exportedComponents.length > previewLimit" class="surface-more" @click="toggleGroup('exported')">{{ expandedGroups.exported ? '收起' : `显示全部 ${analysis.exportedComponents.length} 项` }}</button>
       </section>
       <section>
         <h3>Intent Filters / Deep Links <small>{{ analysis.intentFilters.length }}</small><button type="button" class="help-dot" :aria-expanded="help === 'intent'" @click.stop="help = help === 'intent' ? '' : 'intent'">?</button></h3>
         <p v-if="help === 'intent'" class="inline-help">重点检查 Scheme、HTTP(S) App Link 的 host/path 限制、参数校验和登录态。</p>
-        <div class="tag-list"><span v-for="filter in analysis.intentFilters" :key="filter" class="risk-tag-review">{{ filter }}</span><em v-if="!analysis.intentFilters.length">未发现自定义 Intent Filter</em></div>
+        <div class="tag-list"><span v-for="filter in visibleGroup('intents', analysis.intentFilters)" :key="filter" class="risk-tag-review">{{ filter }}</span><em v-if="!analysis.intentFilters.length">未发现自定义 Intent Filter</em></div>
+        <button v-if="analysis.intentFilters.length > previewLimit" class="surface-more" @click="toggleGroup('intents')">{{ expandedGroups.intents ? '收起' : `显示全部 ${analysis.intentFilters.length} 项` }}</button>
       </section>
       <section>
         <h3>Third-party SDKs / Libraries <small>{{ analysis.thirdPartyLibraries.length }}</small><button type="button" class="help-dot" :aria-expanded="help === 'sdk'" @click.stop="help = help === 'sdk' ? '' : 'sdk'">?</button></h3>
         <p v-if="help === 'sdk'" class="inline-help">结果用于建立依赖清单；准确版本和 CVE 仍需结合构建元数据或 SBOM 确认。</p>
-        <div class="tag-list"><span v-for="library in analysis.thirdPartyLibraries" :key="library" class="risk-tag-normal">{{ library }}</span><em v-if="!analysis.thirdPartyLibraries.length">未识别到已知 SDK 特征</em></div>
+        <div class="tag-list"><span v-for="library in visibleGroup('libraries', analysis.thirdPartyLibraries)" :key="library" class="risk-tag-normal">{{ library }}</span><em v-if="!analysis.thirdPartyLibraries.length">未识别到已知 SDK 特征</em></div>
+        <button v-if="analysis.thirdPartyLibraries.length > previewLimit" class="surface-more" @click="toggleGroup('libraries')">{{ expandedGroups.libraries ? '收起' : `显示全部 ${analysis.thirdPartyLibraries.length} 项` }}</button>
       </section>
     </div>
   </details>
@@ -48,7 +57,10 @@ import { computed, ref } from 'vue'
 import type { AppAnalysis } from '@/types'
 
 const props = defineProps<{ analysis: AppAnalysis }>()
+defineEmits<{ 'open-ai': [taskId: string] }>()
 const help = ref('')
+const previewLimit = 80
+const expandedGroups = ref<Record<string, boolean>>({})
 const totalItems = computed(() => props.analysis.permissions.length
   + props.analysis.components.length
   + props.analysis.manifestFlags.length
@@ -92,5 +104,16 @@ function manifestRisk(flag: string) {
 
 function manifestHint(flag: string) {
   return manifestRisk(flag) === 'high' ? '发布配置存在明显安全风险，请结合 targetSdk 与业务数据确认' : '需要结合系统版本和配置文件内容进一步判断'
+}
+
+function visibleGroup(key: string, values: string[]) {
+  if (expandedGroups.value[key]) return values
+  const risk = key === 'permissions' ? permissionRisk : (key === 'components' || key === 'exported') ? componentRisk : key === 'flags' ? manifestRisk : () => 'normal'
+  const score: Record<string, number> = { high: 0, review: 1, normal: 2 }
+  return [...values].sort((left, right) => (score[risk(left)] ?? 3) - (score[risk(right)] ?? 3)).slice(0, previewLimit)
+}
+
+function toggleGroup(key: string) {
+  expandedGroups.value = { ...expandedGroups.value, [key]: !expandedGroups.value[key] }
 }
 </script>
