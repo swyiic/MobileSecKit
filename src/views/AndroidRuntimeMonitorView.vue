@@ -343,13 +343,13 @@
     </section>
 
     <section v-if="workspaceMode === 'evidence' && selectedPackageDump" class="panel ks-package-evidence-panel">
-      <div class="section-title compact"><div><div class="eyebrow">FORENSIC EVIDENCE</div><h2>{{ selectedPackage }} · 产物与私有文件</h2><p>MobileE 会在载入后自动整理文件、内存、会话与映射关系；文件存在本身不代表本次运行已经执行或外发。</p></div><span class="device-chip">{{ evidenceFiles.length.toLocaleString() }} FILES · {{ formatBytes(Number(selectedPackageDump.physical_bytes ?? selectedLocalBundle?.totalBytes ?? selectedPackageDump.total_bytes ?? 0)) }}</span></div>
+      <div class="section-title compact"><div><div class="eyebrow">FORENSIC EVIDENCE</div><h2>{{ selectedPackage }} · 产物与私有文件</h2><p>MobileE 会在载入后自动整理文件、内存、会话与映射关系；文件存在本身不代表本次运行已经执行或外发。</p></div><span class="device-chip">{{ evidenceFiles.length.toLocaleString() }} FILES · {{ allocatedEvidenceLabel(selectedPackageDump.local_storage_accounting?.allocated_bytes ?? selectedPackageDump.physical_bytes) }}</span></div>
       <template v-if="selectedPackageDump">
-      <div class="ks-selected-package-bar"><button v-if="device && selectedEvidenceSource === 'device'" class="primary-button" :disabled="pullingPackage" @click="pullSelectedPackageEvidence">{{ pullingPackage ? '正在拉取并解析…' : '拉取全部信息' }}</button><button v-else-if="selectedLocalBundle" class="ghost-button" :disabled="pullingPackage" @click="exportSelectedEvidenceArchive">{{ pullingPackage ? '正在封装…' : '导出 .mee' }}</button><b :class="`source-${selectedEvidenceSource}`">{{ selectedEvidenceSource === 'local' ? 'MAC 本地证据' : '手机端证据' }}</b><span>Dump {{ selectedPackageDump.dump_id || 'legacy' }}</span><span>{{ selectedPackageDump.launched ? '已执行 launch harvest' : '未执行 launch harvest' }}</span><span>物理 {{ formatBytes(Number(selectedPackageDump.physical_bytes ?? selectedLocalBundle?.totalBytes ?? selectedPackageDump.total_bytes ?? 0)) }}</span><span v-if="selectedPackageDump.deduplicated_bytes">去重节省 {{ formatBytes(Number(selectedPackageDump.deduplicated_bytes)) }}</span></div>
+      <div class="ks-selected-package-bar"><button v-if="device && selectedEvidenceSource === 'device'" class="primary-button" :disabled="pullingPackage" @click="pullSelectedPackageEvidence">{{ pullingPackage ? '正在拉取并解析…' : '拉取全部信息' }}</button><button v-else-if="selectedLocalBundle" class="ghost-button" :disabled="pullingPackage" @click="exportSelectedEvidenceArchive">{{ pullingPackage ? '正在封装…' : '导出 .mee' }}</button><b :class="`source-${selectedEvidenceSource}`">{{ selectedEvidenceSource === 'local' ? 'MAC 本地证据' : '手机端证据' }}</b><span>Dump {{ selectedPackageDump.dump_id || 'legacy' }}</span><span v-if="selectedPackageDump.local_storage_accounting">本地逻辑 {{ formatBytes(Number(selectedPackageDump.local_storage_accounting.logical_file_bytes)) }} · 分配 {{ allocatedEvidenceLabel(selectedPackageDump.local_storage_accounting.allocated_bytes) }} · 已验证代码重复 {{ formatBytes(Number(selectedPackageDump.local_storage_accounting.verified_code_duplicate_bytes)) }}（账面，非物理节省）</span><span>{{ selectedPackageDump.launched ? '已执行 launch harvest' : '未执行 launch harvest' }}</span><span>物理 {{ allocatedEvidenceLabel(selectedPackageDump.local_storage_accounting?.allocated_bytes ?? selectedPackageDump.physical_bytes) }}</span><span v-if="selectedPackageDump.storage_accounting === 'kernsight.inode-accounting/v1'">硬链接共享逻辑字节 {{ formatBytes(Number(selectedPackageDump.deduplicated_bytes ?? 0)) }}</span></div>
       <section v-if="evidenceError" class="notice error-notice ks-pull-notice" role="alert"><span class="material-symbols-outlined">error</span><span>{{ evidenceError }}</span><button @click="evidenceError = ''">关闭</button></section>
       <section v-if="evidenceMessage" class="notice ks-pull-notice" role="status"><span class="material-symbols-outlined">task_alt</span><span>{{ evidenceMessage }}</span><button @click="evidenceMessage = ''">关闭</button></section>
       <section class="ks-dex-ownership">
-        <header><div><strong>DEX 业务归属</strong><small>{{ dexOwnershipAvailable ? 'ksightd 类级确定性分类；AI 只需复核混合与未知' : '旧版报告没有归属索引，请重新执行 L2 采集' }}</small></div><b>{{ dexOwnershipEntries.length }} UNIQUE DEX</b></header>
+        <header><div><strong>DEX 业务归属</strong><small>{{ dexOwnershipAvailable ? '类命名空间与清单线索分类；不代表已验证企业所有权' : '旧记录缺少可核验归属依据；可继续查看原始文件' }}</small></div><b>{{ dexOwnershipEntries.length }} UNIQUE DEX</b></header>
         <div v-if="dexOwnershipAvailable" class="ks-dex-ownership-summary">
           <button v-for="item in dexOwnershipCards" :key="item.key" type="button" :class="[`ownership-${item.key}`, { active: selectedDexOwnership === item.key }]" @click="selectedDexOwnership = selectedDexOwnership === item.key ? '' : item.key"><b>{{ item.count }}</b><span>{{ item.label }}</span></button>
         </div>
@@ -357,7 +357,7 @@
         <p v-if="dexOwnershipSeeds.length" class="ks-dex-ownership-seeds">动态内部种子：<b v-for="seed in dexOwnershipSeeds" :key="seed.namespace" :title="seed.reason">{{ seed.namespace.split('/').join('.') }} · {{ seed.registered_components }} 组件 / {{ seed.sampled_classes }} 类</b></p>
         <div v-if="dexOwnershipAvailable" class="ks-dex-ownership-list">
           <article v-for="entry in visibleDexOwnershipEntries" :key="entry.sha256" :class="`ownership-${entry.category}`">
-            <div><strong>{{ dexOwnershipLabel(entry.category) }} · {{ entry.confidence }}%</strong><code>{{ entry.canonical_relative_path }}</code></div>
+            <div><strong>{{ dexOwnershipLabel(entry.category) }} · 线索评分 {{ entry.confidence }}/100</strong><code>{{ entry.canonical_relative_path }}</code></div>
             <span>{{ entry.sampled_classes }} 类 · 业务 {{ entry.business_classes }} · 内部 {{ entry.internal_classes }} · SDK {{ entry.third_party_classes }} · 未知 {{ entry.unknown_classes }}</span>
             <small>{{ entry.dominant_namespaces.join(' · ') || '没有可发布命名空间' }}</small>
             <p>{{ entry.reasons.join('；') }}</p>
@@ -369,8 +369,8 @@
         <article v-for="surface in forensicSurfaces" :key="surface.key" :class="{ active: selectedEvidenceCategory === surface.key }" @click="openEvidenceCategory(surface.key)"><span class="material-symbols-outlined">{{ surface.icon }}</span><div><strong>{{ surface.label }}</strong><small>{{ surface.path }}</small><p>{{ surface.detail }}</p></div><b>{{ surface.count }}</b></article>
       </div>
       <section ref="evidenceBrowserRef" class="ks-evidence-browser">
-        <header><div><strong>文件证据浏览器{{ selectedEvidenceCategoryLabel ? ` · ${selectedEvidenceCategoryLabel}` : '' }}</strong><small>上方分类只筛选此浏览器。DEX/SO 的语义、映射链也在选中文件后展示；证据文件不能在这里单独删除。</small></div><div><b>{{ evidenceFiles.length }} catalogued</b><button v-if="selectedEvidenceCategory" class="ghost-button" @click="openEvidenceCategory('')">显示全部</button></div></header>
-        <div class="ks-evidence-file-list"><button v-for="file in visibleEvidenceFiles" :key="`${file.package}:${file.relative_path}`" :class="{ active: selectedEvidenceKey === `${file.package}:${file.relative_path}`, 'prio-focus': evidencePriority(file) === 'focus' }" :disabled="loadingEvidence" @click="openEvidenceEntry(file)"><span><strong>{{ file.relative_path }}</strong><small>{{ file.package }} · {{ file.content_class }}</small></span><b>{{ formatBytes(file.bytes) }}</b><em>{{ evidenceBadge(file) }}</em></button></div>
+        <header><div><strong>文件证据浏览器{{ selectedEvidenceCategoryLabel ? ` · ${selectedEvidenceCategoryLabel}` : '' }}</strong><small>内存窗口失败：读 {{ memoryCounterLabel(selectedPackageDump.memory_window_read_failures, selectedLocalBundle?.files) }} / 短读 {{ memoryCounterLabel(selectedPackageDump.memory_window_short_reads, selectedLocalBundle?.files) }} / 写 {{ memoryCounterLabel(selectedPackageDump.memory_window_write_failures, selectedLocalBundle?.files) }}。上方分类只筛选此浏览器。DEX/SO 的语义、映射链也在选中文件后展示；证据文件不能在这里单独删除。</small></div><div><b>{{ evidenceFiles.length }} catalogued</b><button v-if="selectedEvidenceCategory" class="ghost-button" @click="openEvidenceCategory('')">显示全部</button></div></header>
+        <div class="ks-evidence-file-list"><button v-for="file in visibleEvidenceFiles" :key="`${file.package}:${file.relative_path}`" :class="{ active: selectedEvidenceKey === `${file.package}:${file.relative_path}`, 'prio-focus': evidencePriority(file) === 'focus' }" :disabled="loadingEvidence" @click="openEvidenceEntry(file)"><span><strong>{{ file.relative_path }}</strong><small>{{ file.package }} · {{ file.content_class }}</small><small v-if="memoryEvidenceLabel(file.relative_path, file.memoryEvidence)">{{ memoryEvidenceLabel(file.relative_path, file.memoryEvidence) }}</small><small v-if="codeEvidenceLabel(file.codeEvidence)">{{ codeEvidenceLabel(file.codeEvidence) }}</small></span><b>{{ formatBytes(file.bytes) }}</b><em>{{ evidenceBadge(file) }}</em></button></div>
         <button v-if="visibleEvidenceFiles.length < evidenceFiles.length" class="ghost-button ks-load-more" @click="evidenceVisibleCount += 100">继续显示 {{ Math.min(100, evidenceFiles.length - visibleEvidenceFiles.length) }} 个文件</button>
         <div v-if="loadingEvidence" class="ks-loading"><span class="material-symbols-outlined spinning">sync</span>正在读取证据文件…</div>
         <article v-else-if="selectedEvidence" class="ks-evidence-preview"><header><div><strong>{{ selectedEvidence.relativePath }}</strong><small>{{ selectedEvidence.package }} · {{ formatBytes(selectedEvidence.bytes) }}{{ selectedEvidence.truncated ? ' · 预览已截断' : '' }} · {{ evidenceOriginLabel(selectedEvidence.relativePath) }}</small></div><div><b>{{ evidencePreviewKind }}</b><button class="icon-button" @click="closeEvidencePreview">×</button></div></header><div v-if="evidenceDecodedPreview" class="ks-binary-preview-grid"><section><h4>HEX</h4><pre>{{ evidencePreview }}</pre></section><section><h4>转码 / 可打印字符串</h4><pre>{{ evidenceDecodedPreview }}</pre></section></div><pre v-else>{{ evidencePreview }}</pre></article>
@@ -389,6 +389,8 @@
 
 <script setup lang="ts">
 import { buildAutoCaptureStages, buildUnifiedStageSpec, runAutoCapturePlan, runUnifiedCapturePlan, type AutoStageReceipt } from '@/services/kernsightCapturePlan'
+import { memoryCounterLabel, memoryEvidenceLabel } from '../services/kernsightMemoryEvidence'
+import { codeEvidenceLabel, allocatedEvidenceLabel, ownershipEvidenceEntries } from '../services/kernsightCodeEvidence'
 import { computed, markRaw, nextTick, onErrorCaptured, onBeforeUnmount, reactive, ref, shallowRef, watch } from 'vue'
 import { save } from '@tauri-apps/plugin-dialog'
 import { monitoringBackend, readableError } from '@/services/backend'
@@ -549,7 +551,7 @@ const selectedLocalBundle = computed(() => selectedEvidenceSource.value === 'loc
 const selectedPackageDump = computed(() => selectedEvidenceSource.value === 'device'
   ? devicePackageDumps.value.find(dump => dump.package === selectedPackage.value) || null
   : selectedLocalBundle.value?.dumpReport || packageDumps.value.find(dump => dump.package === selectedPackage.value) || null)
-const dexOwnershipEntries = computed<KernSightDexOwnershipEntry[]>(() => selectedPackageDump.value?.dex_ownership?.entries || [])
+const dexOwnershipEntries = computed<KernSightDexOwnershipEntry[]>(() => ownershipEvidenceEntries(selectedPackageDump.value?.dex_ownership?.schema_version, selectedPackageDump.value?.dex_ownership?.entries || []))
 const dexOwnershipAvailable = computed(() => Boolean(selectedPackageDump.value?.dex_ownership))
 const dexOwnershipSeeds = computed(() => selectedPackageDump.value?.dex_ownership?.inferred_internal_namespaces || [])
 const dexOwnershipOrder: KernSightDexOwnershipCategory[] = ['business', 'internal_component', 'dynamic_payload', 'third_party_sdk', 'mixed', 'unknown']
@@ -561,6 +563,7 @@ const dexOwnershipCards = computed(() => {
 const dexOwnershipPackageSummary = computed(() => {
   const ownership = selectedPackageDump.value?.dex_ownership
   if (!ownership) return ''
+  if (ownership.schema_version !== 'mobilee.kernsight-dex-ownership/v4') return '旧归属依据未核验，显示未知；原记录保留'
   const classSamples = ownership.business_class_samples
     ?? dexOwnershipEntries.value.reduce((total, entry) => total + Number(entry.business_classes || 0), 0)
   const dexSets = ownership.business_dex_sets
@@ -577,10 +580,10 @@ const visibleDexOwnershipEntries = computed(() => filteredDexOwnershipEntries.va
 
 function dexOwnershipLabel(category: KernSightDexOwnershipCategory) {
   return ({
-    business: '核心业务',
-    internal_component: '企业内部组件',
+    business: '业务线索',
+    internal_component: '内部组件线索',
     dynamic_payload: '动态载荷',
-    third_party_sdk: '第三方 SDK',
+    third_party_sdk: 'SDK 线索',
     mixed: '混合归属',
     unknown: '未判断',
   } satisfies Record<KernSightDexOwnershipCategory, string>)[category]
@@ -804,6 +807,8 @@ const evidenceFiles = computed(() => {
       package: selectedLocalBundle.value!.package,
       relative_path: file.relativePath,
       content_class: file.category,
+      memoryEvidence: file.memoryEvidence,
+      codeEvidence: file.codeEvidence,
       bytes: file.bytes,
       sha256: '',
       confirmed: false,
@@ -839,7 +844,7 @@ const evidenceFiles = computed(() => {
       confirmed: false,
     })
   }
-  return [...files.values()].filter(file => matchesCategory(file.relative_path)).sort((left, right) => left.relative_path.localeCompare(right.relative_path))
+  return [...files.values()].map(file => ({...file, codeEvidence:(dump.apk_member_evidence?.observations || []).filter(note => note.relative_path === file.relative_path)})).filter(file => matchesCategory(file.relative_path)).sort((left, right) => left.relative_path.localeCompare(right.relative_path))
 })
 const analyzableArtifacts = computed<any[]>(() => {
   const dump = selectedPackageDump.value

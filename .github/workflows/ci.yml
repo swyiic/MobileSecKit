@@ -19,6 +19,7 @@ jobs:
       - run: npm ci
       - run: npm run typecheck
       - run: npm run test:kernsight-plan
+      - run: npm run test:kernsight-evidence
       - run: npm run build
 
   rust:

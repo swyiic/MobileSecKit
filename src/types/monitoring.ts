@@ -208,6 +208,8 @@ export interface KernSightLocalEvidenceBundle {
     relativePath: string
     bytes: number
     category: string
+    memoryEvidence?: Array<Record<string, unknown>>
+    codeEvidence?: Array<Record<string, unknown>>
   }>
 }
 
@@ -364,6 +366,9 @@ export interface KernSightPackageDumpReport {
   private_files?: number
   packer_regions?: number
   plaintext_windows?: number
+  memory_window_write_failures?: number
+  memory_window_read_failures?: number
+  memory_window_short_reads?: number
   http_calls?: Array<Record<string, unknown>>
   http_code_refs?: Array<Record<string, unknown>>
   jni_exports?: Array<{ relative_path?: string; names?: string[] }>
@@ -384,6 +389,10 @@ export interface KernSightPackageDumpReport {
   total_bytes?: number
   physical_bytes?: number
   deduplicated_bytes?: number
+  local_storage_accounting?: { logical_file_bytes: number; allocated_bytes: number | null; verified_code_duplicate_bytes: number; [key: string]: unknown }
+  apk_member_evidence?: { observations?: Array<Record<string, any>>; omitted_observations?: number; status?: string }
+  storage_accounting?: string | null
+  unique_inode_bytes?: number | null
   warnings?: string[]
   graph?: {
     entities?: Array<Record<string, unknown>>

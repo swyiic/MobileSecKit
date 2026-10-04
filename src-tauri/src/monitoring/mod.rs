@@ -1,5 +1,6 @@
 mod dump_policy;
 mod stage_policy;
+mod storage_evidence;
 use crate::{run_device_adb, run_device_root_script};
 use ksight_core::{
     DexArtifactSet, DumpArtifact, MergedDumpRef, SessionGraph, SessionReport, SessionReportBuilder,
@@ -551,6 +552,8 @@ pub struct KernSightLocalEvidenceFile {
     relative_path: String,
     bytes: u64,
     category: String,
+    memory_evidence: Vec<Value>,
+    code_evidence: Vec<Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -2423,12 +2426,23 @@ pub async fn import_kernsight_evidence_directory(
 ) -> Result<KernSightLocalEvidenceBundle, String> {
     let root = PathBuf::from(path.trim());
     if !root.is_absolute() || !root.is_dir() {
-        return Err("请选择包含 dump-report.json 的本地绝对目录".into());
+        return Err("请选择含 dump-report.json 或 bounded-code-report.json 的本地绝对目录".into());
     }
     let dump_path = root.join("dump-report.json");
-    let dump_text = read_bounded_text(&dump_path, 64 * 1024 * 1024)?;
-    let mut dump_report: Value = serde_json::from_str(&dump_text)
-        .map_err(|error| format!("dump-report.json 无效：{error}"))?;
+    let mut dump_report: Value = if dump_path.is_file() {
+        let dump_text = read_bounded_text(&dump_path, 64 * 1024 * 1024)?;
+        serde_json::from_str(&dump_text)
+            .map_err(|error| format!("dump-report.json 无效：{error}"))?
+    } else {
+        let text = read_bounded_text(&root.join("bounded-code-report.json"), 32768)?;
+        let bounded: Value = serde_json::from_str(&text)
+            .map_err(|error| format!("bounded-code-report.json 无效：{error}"))?;
+        if bounded["schema"] != "kernsight.bounded-code/v1" {
+            return Err("不支持的有界代码证据 schema".into());
+        }
+        serde_json::json!({"schema_version":"mobilee.bounded-code-adapter/v1", "package":bounded["identity"]["package"],"bounded_code":bounded,
+            "warnings":["有界安装代码容器采样，非完整进程或 package dump；旧成功/完整字段未填充"]})
+    };
     let package = dump_report
         .get("package")
         .and_then(Value::as_str)
@@ -2446,7 +2460,73 @@ pub async fn import_kernsight_evidence_directory(
         None
     };
     let capture_text = std::fs::read_to_string(root.join("CAPTURE.txt")).unwrap_or_default();
-    let (file_count, total_bytes, files) = local_tree_stats(&root, 50_000)?;
+    let (file_count, total_bytes, mut files) = local_tree_stats(&root, 50_000)?;
+    dump_report["local_storage_accounting"] = storage_evidence::account(
+        &root,
+        &files
+            .iter()
+            .map(|file| (file.relative_path.clone(), file.bytes))
+            .collect::<Vec<_>>(),
+    );
+    if let Some(observations) = dump_report["local_storage_accounting"]["observations"].as_array() {
+        for file in &mut files {
+            file.code_evidence = observations
+                .iter()
+                .filter(|note| note["relative_path"].as_str() == Some(&file.relative_path))
+                .cloned()
+                .collect();
+            for note in &mut file.code_evidence {
+                if let Some(entry) =
+                    dump_report["dex_ownership"]["entries"]
+                        .as_array()
+                        .and_then(|entries| {
+                            entries
+                                .iter()
+                                .find(|entry| entry["sha256"] == note["sha256"])
+                        })
+                {
+                    note["ownership"] = serde_json::json!({"category":entry["category"],"confidence":entry["confidence"],"reasons":entry["reasons"],"basis":"DEX class namespace samples; inferred, not verified company ownership"});
+                }
+            }
+        }
+    }
+    if let Some(ranges) = dump_report["bounded_code"]["ranges"].as_array() {
+        for file in &mut files {
+            if !(file.relative_path.len() == 12
+                && file.relative_path.starts_with("range-")
+                && file.relative_path.ends_with(".bin")
+                && file.relative_path[6..8]
+                    .parse::<u8>()
+                    .is_ok_and(|index| index < 16))
+            {
+                continue;
+            }
+            for range in ranges
+                .iter()
+                .filter(|range| range["relative_path"].as_str() == Some(&file.relative_path))
+            {
+                let mut note = range.clone();
+                note["schema"] = serde_json::json!("kernsight.bounded-code-range/v1");
+                note["identity"] = dump_report["bounded_code"]["identity"].clone();
+                let verified = range["retained_bytes"].as_u64() == Some(file.bytes)
+                    && file.bytes <= 4 * 1024 * 1024
+                    && storage_evidence::hash_file(&root.join(&file.relative_path), file.bytes)
+                        .is_some_and(|hash| range["sha256"].as_str() == Some(&hash));
+                note["local_content_status"] = serde_json::json!(if verified {
+                    "complete_file_hash_verified"
+                } else {
+                    "unknown_or_failed"
+                });
+                file.code_evidence.push(note);
+            }
+        }
+        let local_total = dump_report["local_storage_accounting"]["logical_file_bytes"].as_u64();
+        dump_report["bounded_code_local_size_matches"] = serde_json::json!(
+            local_total.is_some()
+                && local_total
+                    == dump_report["bounded_code"]["total_persisted_file_bytes"].as_u64()
+        );
+    }
     Ok(KernSightLocalEvidenceBundle {
         root: root.to_string_lossy().into_owned(),
         package,
@@ -2462,7 +2542,7 @@ pub async fn import_kernsight_evidence_directory(
 fn enrich_local_dex_ownership(dump_report: &mut Value, package: &str) {
     let ownership_is_current = dump_report.get("dex_ownership").is_some_and(|ownership| {
         ownership.get("schema_version").and_then(Value::as_str)
-            == Some("mobilee.kernsight-dex-ownership/v3")
+            == Some("mobilee.kernsight-dex-ownership/v4")
             && ownership
                 .get("package")
                 .and_then(Value::as_str)
@@ -2552,10 +2632,6 @@ fn enrich_local_dex_ownership(dump_report: &mut Value, package: &str) {
         let has_non_first_party = sdk + unknown > 0;
         let category = if total == 0 {
             "unknown"
-        } else if percent(business) >= 55 {
-            "business"
-        } else if percent(internal) >= 55 {
-            "internal_component"
         } else if has_first_party && has_non_first_party {
             "mixed"
         } else if business > 0 {
@@ -2564,8 +2640,6 @@ fn enrich_local_dex_ownership(dump_report: &mut Value, package: &str) {
             "internal_component"
         } else if percent(sdk) >= 60 {
             "third_party_sdk"
-        } else if runtime_only {
-            "dynamic_payload"
         } else if classified * 100 >= total * 65 {
             if sdk >= internal {
                 "third_party_sdk"
@@ -2589,7 +2663,7 @@ fn enrich_local_dex_ownership(dump_report: &mut Value, package: &str) {
             "sha256": set.sha256,
             "canonical_relative_path": set.canonical_relative_path,
             "category": category,
-            "confidence": percent(match category { "business" => business, "internal_component" => internal, "third_party_sdk" => sdk, "mixed" => classified, _ => unknown }),
+            "confidence": if category == "unknown" { 0 } else { percent(match category { "business" => business, "internal_component" => internal, "third_party_sdk" => sdk, "mixed" => classified, _ => unknown }) },
             "sampled_classes": total,
             "business_classes": business,
             "internal_classes": internal,
@@ -2601,7 +2675,7 @@ fn enrich_local_dex_ownership(dump_report: &mut Value, package: &str) {
     }
     if let Some(object) = dump_report.as_object_mut() {
         object.insert("dex_ownership".into(), serde_json::json!({
-            "schema_version": "mobilee.kernsight-dex-ownership/v3",
+            "schema_version": "mobilee.kernsight-dex-ownership/v4",
             "package": package,
             "entries": entries,
             "business": counts.get("business").copied().unwrap_or_default(),
@@ -2680,6 +2754,13 @@ fn collect_archive_files(root: &Path) -> Result<Vec<(PathBuf, String, u64)>, Str
                 .map_err(|error| format!("无法读取证据目录项类型：{error}"))?;
             if file_type.is_symlink() {
                 continue;
+            }
+            if entry
+                .file_type()
+                .map_err(|error| error.to_string())?
+                .is_symlink()
+            {
+                return Err("证据目录含符号链接；请使用保留原始来源的普通文件目录".into());
             }
             let metadata = entry
                 .metadata()
@@ -3349,6 +3430,13 @@ fn local_tree_stats(
             .map_err(|error| format!("无法扫描 {}：{error}", directory.display()))?
         {
             let entry = entry.map_err(|error| format!("本地证据目录项无效：{error}"))?;
+            if entry
+                .file_type()
+                .map_err(|error| error.to_string())?
+                .is_symlink()
+            {
+                return Err("证据目录含符号链接；不会读取目录外内容".into());
+            }
             let metadata = entry
                 .metadata()
                 .map_err(|error| format!("无法读取本地证据元数据：{error}"))?;
@@ -3376,8 +3464,53 @@ fn local_tree_stats(
                         relative_path,
                         bytes: metadata.len(),
                         category,
+                        memory_evidence: Vec::new(),
+                        code_evidence: Vec::new(),
                     });
                 }
+            }
+        }
+    }
+    // Window notes retain source/derived relationships. Old files get an empty list,
+    // which the UI treats as unknown, never as successful or complete.
+    let mut notes = Vec::new();
+    for file in &catalog {
+        if (file.relative_path.starts_with("runtime/plaintext/")
+            || file.relative_path.starts_with("runtime/crypto-windows/"))
+            && file.relative_path.ends_with(".json")
+            && file.bytes <= 256 * 1024
+        {
+            if let Ok(bytes) = std::fs::read(root.join(&file.relative_path)) {
+                if let Ok(mut value) = serde_json::from_slice::<Value>(&bytes) {
+                    if matches!(
+                        value["schema"].as_str(),
+                        Some("kernsight.memory-window/v1" | "kernsight.memory-read/v1")
+                    ) {
+                        value["note_relative_path"] = Value::String(file.relative_path.clone());
+                        notes.push((file.relative_path.clone(), value));
+                    }
+                }
+            }
+        }
+    }
+    for file in &mut catalog {
+        for (note_path, value) in &notes {
+            let parent = note_path
+                .rsplit_once('/')
+                .map(|(parent, _)| parent)
+                .unwrap_or("");
+            let refers = ["relative_path", "source_relative_path"].iter().any(|key| {
+                value[*key]
+                    .as_str()
+                    .map(|name| {
+                        !name.contains('/')
+                            && !name.contains('\\')
+                            && format!("{parent}/{name}") == file.relative_path
+                    })
+                    .unwrap_or(false)
+            });
+            if file.relative_path == *note_path || refers {
+                file.memory_evidence.push(value.clone());
             }
         }
     }
@@ -3391,6 +3524,89 @@ mod tests {
 
     fn values(text: &str) -> HashMap<String, String> {
         parse_probe_output(text)
+    }
+
+    #[tokio::test]
+    #[ignore = "requires explicit synthetic device evidence path; never connects to a device"]
+    async fn synthetic_device_memory_evidence_import() {
+        let root = PathBuf::from(
+            std::env::var("ME_MEMORY_EVIDENCE_FIXTURE")
+                .expect("explicit synthetic device fixture path"),
+        );
+        let scope: Value =
+            serde_json::from_slice(&std::fs::read(root.join("device-probe-report.json")).unwrap())
+                .unwrap();
+        assert_eq!(
+            scope["schema"],
+            "kernsight.synthetic-memory-device-probe/v1"
+        );
+        assert_eq!(scope["global_scan"], false);
+        assert_eq!(scope["real_app_operations"], 0);
+        let bundle = import_kernsight_evidence_directory(root.to_string_lossy().into_owned())
+            .await
+            .unwrap();
+        assert_eq!(bundle.package, "fixture.memory.evidence");
+        assert!(bundle.total_bytes <= 65536);
+        let notes: Vec<&Value> = bundle
+            .files
+            .iter()
+            .filter(|file| file.relative_path.ends_with(".json"))
+            .flat_map(|file| &file.memory_evidence)
+            .collect();
+        assert!(notes
+            .iter()
+            .any(|note| note["write_status"] == "write_failed"));
+        assert!(notes.iter().any(|note| note["duplicate"] == true));
+        assert!(notes
+            .iter()
+            .any(|note| note["read_status"] == "read_failed"));
+        assert!(notes
+            .iter()
+            .any(|note| note["read"]["read_status"] == "short_read"));
+        for file in &bundle.files {
+            if file.relative_path.ends_with(".txt")
+                && file.relative_path.starts_with("runtime/plaintext/")
+            {
+                assert!(!file.memory_evidence.is_empty());
+            }
+        }
+        println!(
+            "SYNTHETIC_IMPORTED_BUNDLE:{}",
+            serde_json::to_string(&bundle).unwrap()
+        );
+    }
+
+    #[test]
+    fn memory_window_catalog_preserves_notes_and_legacy_unknown() {
+        let root = std::env::temp_dir().join(format!("memory-catalog-{}", Uuid::new_v4()));
+        let dir = root.join("runtime/plaintext");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("old.txt"), b"old").unwrap();
+        std::fs::write(dir.join("raw.bin"), b"raw").unwrap();
+        std::fs::write(dir.join("window.txt"), b"raw").unwrap();
+        let note = serde_json::json!({"schema":"kernsight.memory-window/v1", "source_relative_path":"raw.bin", "relative_path":"window.txt", "write_status":"write_failed", "read":{"schema":"kernsight.memory-read/v1", "read_status":"short_read", "requested_bytes":8,"actual_bytes":3}});
+        std::fs::write(
+            dir.join("window-note.json"),
+            serde_json::to_vec(&note).unwrap(),
+        )
+        .unwrap();
+        let (_, _, files) = local_tree_stats(&root, 16).unwrap();
+        assert!(files
+            .iter()
+            .find(|f| f.relative_path.ends_with("old.txt"))
+            .unwrap()
+            .memory_evidence
+            .is_empty());
+        for name in ["raw.bin", "window.txt", "window-note.json"] {
+            let file = files
+                .iter()
+                .find(|f| f.relative_path.ends_with(name))
+                .unwrap();
+            assert_eq!(file.memory_evidence.len(), 1);
+            assert_eq!(file.memory_evidence[0]["write_status"], "write_failed");
+            assert_eq!(file.memory_evidence[0]["read"]["actual_bytes"], 3);
+        }
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
@@ -3617,11 +3833,145 @@ mod tests {
 
         assert_eq!(
             report["dex_ownership"]["schema_version"],
-            "mobilee.kernsight-dex-ownership/v3"
+            "mobilee.kernsight-dex-ownership/v4"
         );
         assert_eq!(report["dex_ownership"]["entries"][0]["category"], "mixed");
         assert_eq!(report["dex_ownership"]["business_class_samples"], 1);
         assert_eq!(report["dex_ownership"]["business_dex_sets"], 1);
+        let mut descriptors = vec![serde_json::json!("Lcom/tencent/wework/Api;")];
+        descriptors.extend(std::iter::repeat_n(
+            serde_json::json!("Lcom/dlxx/mam/Internal/MainActivity;"),
+            99,
+        ));
+        report["dex_sets"][0]["semantic"]["class_descriptors"] = serde_json::json!(descriptors);
+        report["dex_ownership"]["schema_version"] =
+            serde_json::json!("mobilee.kernsight-dex-ownership/v3");
+        enrich_local_dex_ownership(&mut report, "com.dlxx.mam.Internal");
+        assert_eq!(report["dex_ownership"]["entries"][0]["category"], "mixed");
+        assert_eq!(
+            report["dex_ownership"]["entries"][0]["third_party_classes"],
+            1
+        );
+        report["dex_sets"][0]["semantic"]["class_descriptors"] = serde_json::json!(["La/b/c;"]);
+        report["dex_sets"][0]["sources"] = serde_json::json!(["memory-dex"]);
+        report["dex_ownership"]["schema_version"] =
+            serde_json::json!("mobilee.kernsight-dex-ownership/v3");
+        enrich_local_dex_ownership(&mut report, "com.dlxx.mam.Internal");
+        assert_eq!(report["dex_ownership"]["entries"][0]["category"], "unknown");
+        assert_eq!(report["dex_ownership"]["entries"][0]["confidence"], 0);
+    }
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn evidence_import_rejects_symlink_before_outside_content_read() {
+        let root = std::env::temp_dir().join(format!("me-no-symlink-{}", Uuid::new_v4()));
+        std::fs::create_dir(&root).unwrap();
+        std::fs::write(
+            root.join("dump-report.json"),
+            r#"{"package":"com.example.app"}"#,
+        )
+        .unwrap();
+        let outside = root.with_extension("outside-fixture");
+        std::fs::write(&outside, b"synthetic only").unwrap();
+        std::os::unix::fs::symlink(&outside, root.join("linked.dex")).unwrap();
+        let error = import_kernsight_evidence_directory(root.to_string_lossy().into_owned())
+            .await
+            .err()
+            .expect("symlink must be rejected");
+        assert!(error.contains("符号链接"));
+        std::fs::remove_dir_all(root).unwrap();
+        std::fs::remove_file(outside).unwrap();
+    }
+
+    #[tokio::test]
+    async fn bounded_directory_import_preserves_partial_scope_without_package_dump_success() {
+        let root = std::env::temp_dir().join(format!("me-bounded-import-{}", Uuid::new_v4()));
+        std::fs::create_dir(&root).unwrap();
+        let bytes = vec![7_u8; 512];
+        std::fs::write(root.join("range-00.bin"), &bytes).unwrap();
+        let mut report = serde_json::json!({"schema":"kernsight.bounded-code/v1","identity":{"package":"com.example.app","pid":123},"status":"bounded_partial","total_budget_bytes":131072,"payload_bytes":512,"ranges":[{"relative_path":"range-00.bin","path":"/data/app/fixture/base.apk","start":4096,"end":8192,"admitted_bytes":1024,"unadmitted_bytes":3072,"retained_bytes":512,"sha256":format!("{:x}",Sha256::digest(&bytes)),"write_status":"retained","read":{"schema":"kernsight.memory-read/v1","requested_start":4096,"actual_start":4096,"requested_bytes":1024,"actual_bytes":512,"read_status":"short_read","read_error":null}}]});
+        for _ in 0..8 {
+            let n = serde_json::to_vec_pretty(&report).unwrap().len();
+            report["total_persisted_file_bytes"] = serde_json::json!(n + 512);
+        }
+        std::fs::write(
+            root.join("bounded-code-report.json"),
+            serde_json::to_vec_pretty(&report).unwrap(),
+        )
+        .unwrap();
+        let bundle = import_kernsight_evidence_directory(root.to_string_lossy().into_owned())
+            .await
+            .unwrap();
+        assert_eq!(
+            bundle.dump_report["schema_version"],
+            "mobilee.bounded-code-adapter/v1"
+        );
+        assert_eq!(bundle.dump_report["bounded_code_local_size_matches"], true);
+        assert!(
+            bundle.dump_report.get("schema_version").unwrap()
+                != "mobilee.kernsight-package-dump/v2"
+        );
+        assert!(bundle.dump_report.get("heap_read_failures").is_none());
+        let note = &bundle
+            .files
+            .iter()
+            .find(|file| file.relative_path == "range-00.bin")
+            .unwrap()
+            .code_evidence[0];
+        assert_eq!(note["read"]["read_status"], "short_read");
+        assert_eq!(note["local_content_status"], "complete_file_hash_verified");
+        assert_eq!(note["unadmitted_bytes"], 3072);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires explicit synthetic production APK fixture, never connects a device"]
+    async fn synthetic_apk_member_production_import() {
+        let path =
+            std::env::var("ME_APK_MEMBER_FIXTURE").expect("explicit synthetic fixture required");
+        let bundle = import_kernsight_evidence_directory(path).await.unwrap();
+        assert_eq!(bundle.package, "com.ksight.synthetic");
+        let ledger = &bundle.dump_report["local_storage_accounting"];
+        assert_eq!(ledger["unverified_observations"], 0);
+        assert!(ledger["verified_code_duplicate_bytes"].as_u64().unwrap() > 0);
+        assert!(ledger["shared_inode_logical_bytes"].as_u64().unwrap() > 0);
+        let notes = bundle
+            .files
+            .iter()
+            .flat_map(|file| &file.code_evidence)
+            .collect::<Vec<_>>();
+        assert!(notes
+            .iter()
+            .any(|note| note["transformation"] == "repair_dex/v1"));
+        assert!(notes
+            .iter()
+            .all(|note| note["local_content_status"] == "complete_file_hash_verified"));
+        println!(
+            "MEMBER_IMPORTED_BUNDLE:{}",
+            serde_json::to_string(&bundle).unwrap()
+        );
+    }
+
+    #[tokio::test]
+    #[ignore = "requires explicit bounded Launcher code fixture, never connects a device"]
+    async fn bounded_launcher_device_evidence_import() {
+        let path = std::env::var("ME_BOUNDED_CODE_FIXTURE").expect("explicit fixture required");
+        let bundle = import_kernsight_evidence_directory(path).await.unwrap();
+        assert_eq!(bundle.package, "com.google.android.apps.nexuslauncher");
+        assert!(bundle.total_bytes <= 131072);
+        assert_eq!(bundle.dump_report["bounded_code_local_size_matches"], true);
+        let evidence = bundle
+            .files
+            .iter()
+            .flat_map(|file| &file.code_evidence)
+            .collect::<Vec<_>>();
+        assert!(!evidence.is_empty());
+        assert!(evidence
+            .iter()
+            .all(|note| note["local_content_status"] == "complete_file_hash_verified"));
+        println!(
+            "BOUNDED_IMPORTED_BUNDLE:{}",
+            serde_json::to_string(&bundle).unwrap()
+        );
     }
     #[test]
     fn old_capture_ipc_defaults_stages_to_none_and_new_field_is_not_dropped() {

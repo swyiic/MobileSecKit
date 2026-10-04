@@ -11,7 +11,8 @@
     "check": "npm run typecheck && cargo fmt --manifest-path src-tauri/Cargo.toml --all -- --check && npm run test:rust",
     "preview": "vite preview",
     "tauri": "tauri",
-    "test:kernsight-plan": "node --test tests/kernsightCapturePlan.test.mjs"
+    "test:kernsight-plan": "node --test tests/kernsightCapturePlan.test.mjs",
+    "test:kernsight-evidence": "node --test tests/kernsightMemoryEvidence.test.mjs tests/kernsightCodeEvidence.test.mjs"
   },
   "dependencies": {
     "@tauri-apps/api": "2.9.1",

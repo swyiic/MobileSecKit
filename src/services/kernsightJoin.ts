@@ -58,7 +58,7 @@ export function buildKernSightAnalyzerJoin(bundle: KernSightLocalEvidenceBundle)
   const files = bundle.files || []
   const privateFiles = files.filter(file => file.relativePath.startsWith('data-private/'))
   const privateDbs = unique(privateFiles.map(file => file.relativePath).filter(path => /\.db(?:-wal|-shm|-journal)?$/i.test(path)))
-  const heapWindows = files.filter(file => file.relativePath.startsWith('runtime/plaintext/'))
+  const heapWindows = files.filter(file => file.relativePath.startsWith('runtime/plaintext/') && file.relativePath.endsWith('.txt'))
   const readableDex = files.filter(file => file.relativePath.startsWith('readable-dex/') || file.relativePath.includes('blob-dex/'))
   const runtimeSo = files.filter(file => file.relativePath.startsWith('runtime/runtime-so/'))
   const dexOwnership = dump.dex_ownership
