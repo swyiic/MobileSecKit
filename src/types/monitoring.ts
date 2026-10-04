@@ -108,6 +108,7 @@ export interface KernSightCaptureRequest {
   inspectTls: boolean
   inspectJni: boolean
   inspectLinker: boolean
+  inspectStages?: string | null
   inspectAdapter?: 'binder_userspace' | null
   hideDebug: boolean
   sampleOneIn: number

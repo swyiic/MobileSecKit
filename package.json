@@ -10,7 +10,8 @@
     "test:rust": "cargo test --manifest-path src-tauri/Cargo.toml --lib",
     "check": "npm run typecheck && cargo fmt --manifest-path src-tauri/Cargo.toml --all -- --check && npm run test:rust",
     "preview": "vite preview",
-    "tauri": "tauri"
+    "tauri": "tauri",
+    "test:kernsight-plan": "node --test tests/kernsightCapturePlan.test.mjs"
   },
   "dependencies": {
     "@tauri-apps/api": "2.9.1",

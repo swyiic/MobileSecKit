@@ -79,7 +79,7 @@
 
     <section v-if="kernSight && workspaceMode === 'capture'" class="panel ks-capture-panel">
       <div class="section-title compact">
-        <div><div class="eyebrow">CAPTURE CONTROL</div><h2>按层采集</h2><p>L0 默认采集进程、文件、mmap、socket、DNS、Handshake（ClientHello SNI/ALPN、HTTP/1 Host、QUIC 首段）和 Binder parcel prefix。L1 TLS、JNI 明文与 Binder userspace 可同会话；Linker 仍独占。要拿到 SNI，必须在 connect 首写之前开始；包 PID 出现前不要开 Sched。</p></div>
+        <div><div class="eyebrow">CAPTURE CONTROL</div><h2>按层采集</h2><p>L0 默认采集进程、文件、mmap、socket、DNS、Handshake（ClientHello SNI/ALPN、HTTP/1 Host、QUIC 首段）和 Binder parcel prefix。L1 TLS、JNI 明文与 Binder userspace 可同会话；单窗口 Linker 仍独占；统一阶段可顺序切换。要拿到 SNI，必须在 connect 首写之前开始；包 PID 出现前不要开 Sched。</p></div>
         <span class="device-chip" :class="{ active: captureRunning }">{{ captureRunning ? `RUNNING ${captureElapsed}s` : 'READY' }}</span>
       </div>
       <div class="ks-presets">
@@ -89,14 +89,15 @@
         <button :disabled="captureRunning" @click="applyCapturePreset('linker')"><span class="material-symbols-outlined">deployed_code</span><strong>单包 Linker</strong><small>独占 SO load；不与 TLS 同会话</small></button>
         <button :disabled="captureRunning" @click="applyCapturePreset('whole')"><span class="material-symbols-outlined">public</span><strong>全设备 L0</strong><small>无包过滤 · 不要开 Inspect/Sched</small></button>
         <button :disabled="captureRunning" @click="applyCapturePreset('dump')"><span class="material-symbols-outlined">folder_zip</span><strong>单包 L2 Dump</strong><small>--launch 拷 DEX/SO/CE·DE</small></button>
-        <button :disabled="captureRunning" @click="applyCapturePreset('auto')"><span class="material-symbols-outlined">playlist_play</span><strong>完整自动采集</strong><small>L0 {{ captureForm.autoL0Seconds }}s → L0+L1 {{ captureForm.autoL1Seconds }}s → Linker {{ captureForm.autoLinkerSeconds }}s → Dump</small></button>
+        <button :disabled="captureRunning" @click="applyCapturePreset('auto')"><span class="material-symbols-outlined">playlist_play</span><strong>分阶段采集</strong><small>L0 {{ captureForm.autoL0Seconds }}s → L0+L1 {{ captureForm.autoL1Seconds }}s → Linker {{ captureForm.autoLinkerSeconds }}s → Dump</small></button>
       </div>
       <div class="ks-layer-contract"><article v-for="layer in layerContracts" :key="layer.key" :class="`layer-${layer.key}`"><header><b>{{ layer.label }}</b><small>{{ layer.stage }}</small></header><strong>{{ layer.title }}</strong><p>{{ layer.detail }}</p><ul><li v-for="item in layer.items" :key="item">{{ item }}</li></ul></article></div>
       <div class="ks-capture-form">
+        <label v-if="captureForm.plan === 'auto'" class="wide"><span>阶段生命周期</span><select v-model="captureForm.autoSessionMode" :disabled="captureRunning"><option value="startup_replay">启动重采：三个独立 session，保留各能力的启动观察</option><option value="unified">统一 session：只首次冷启动，顺序启停 Inspect（需新版 agent）</option></select><small>{{ captureForm.autoSessionMode === 'unified' ? 'L0 全程保留；L1/Linker 各有时间窗，只在会话结束取驻留快照，不能补回其它阶段的启动调用或已卸载代码。' : '每阶段重启会丢弃前一实例的驻留状态；L1 后快照属于该实例，Linker 随后是新实例。' }}</small></label>
         <label class="wide"><span>目标包（留空表示全设备 Observe）</span><input v-model.trim="captureForm.package" :disabled="captureRunning" placeholder="例如 us.hsbc.hsbcus" /></label>
         <label v-if="captureForm.plan !== 'auto'"><span>时长（秒）</span><input v-model.number="captureForm.durationSeconds" :disabled="captureRunning" type="number" min="1" max="300" /></label>
         <label><span>采样 1 / N</span><input v-model.number="captureForm.sampleOneIn" :disabled="captureRunning" type="number" min="1" max="10000" /></label>
-        <label><span>L1 Inspect 组合</span><select v-model="captureForm.inspectMode" :disabled="captureRunning"><option value="none">关闭（仅 L0）</option><option value="tls">TLS plaintext</option><option value="jni_plaintext">JNI plaintext</option><option value="binder_userspace">Binder userspace</option><option value="tls_jni">TLS + JNI</option><option value="binder_jni">Binder + JNI</option><option value="tls_binder">TLS + Binder</option><option value="tls_binder_jni">TLS + Binder + JNI</option><option value="linker_so_load">Linker SO load（独占）</option></select></label>
+        <label><span>L1 Inspect 组合{{ captureForm.plan === 'auto' ? '（L1 阶段固定组合）' : '' }}</span><select v-model="captureForm.inspectMode" :disabled="captureRunning || captureForm.plan === 'auto'"><option value="none">关闭（仅 L0）</option><option value="tls">TLS plaintext</option><option value="jni_plaintext">JNI plaintext</option><option value="binder_userspace">Binder userspace</option><option value="tls_jni">TLS + JNI</option><option value="binder_jni">Binder + JNI</option><option value="tls_binder">TLS + Binder</option><option value="tls_binder_jni">TLS + Binder + JNI</option><option value="linker_so_load">Linker SO load（独占）</option></select></label>
         <label><span>明文/命中上限</span><select v-model.number="captureForm.inspectMaxBytes" :disabled="captureRunning"><option :value="256">256 B</option><option :value="1024">1 KiB</option><option :value="4096">4 KiB</option><option :value="16384">16 KiB</option><option :value="65536">64 KiB</option></select></label>
         <label v-if="captureForm.plan === 'auto'"><span>L0 主干（秒）</span><input v-model.number="captureForm.autoL0Seconds" :disabled="captureRunning" type="number" min="1" max="300" /></label>
         <label v-if="captureForm.plan === 'auto'"><span>L0+L1 登录窗（秒）</span><input v-model.number="captureForm.autoL1Seconds" :disabled="captureRunning" type="number" min="1" max="300" /></label>
@@ -130,6 +131,13 @@
         <details><summary>查看等效命令</summary><code>{{ captureCommandPreview }}</code></details>
       </div>
       <p class="ks-control-boundary"><span class="material-symbols-outlined">info</span>当前按钮使用 MobileE 前台 ADB 执行路径；关闭 MobileE 会中断等待。常驻 daemon 的远程 StartSession / UpdatePolicy 尚未接通，界面不会伪装成后台独立控制。</p>
+      <div v-if="autoStageReceipts.length" class="ks-capture-plan">
+        <div v-for="receipt in autoStageReceipts" :key="receipt.stage.key">
+          <small>{{ receipt.stage.label }} · {{ receipt.succeeded ? '命令成功，覆盖待核对' : '命令失败/未知，后续停止' }}</small>
+          <button v-if="receipt.result.sessionId" class="ghost-button compact-button" @click="openAutoStageSession(receipt.result.sessionId)">查看会话 {{ shortSession(receipt.result.sessionId) }}</button>
+          <strong v-else>包快照产物；不代表完整提取</strong>
+        </div>
+      </div>
       <details v-if="captureResult" class="ks-capture-log" open>
         <summary>最近一次采集 · {{ shortSession(captureResult.sessionId) }} · {{ Math.max(0, Math.round((captureResult.finishedUnixMs - captureResult.startedUnixMs) / 1000)) }}s</summary>
         <code>{{ captureResult.commandPreview }}</code>
@@ -380,6 +388,7 @@
 </template>
 
 <script setup lang="ts">
+import { buildAutoCaptureStages, buildUnifiedStageSpec, runAutoCapturePlan, runUnifiedCapturePlan, type AutoStageReceipt } from '@/services/kernsightCapturePlan'
 import { computed, markRaw, nextTick, onErrorCaptured, onBeforeUnmount, reactive, ref, shallowRef, watch } from 'vue'
 import { save } from '@tauri-apps/plugin-dialog'
 import { monitoringBackend, readableError } from '@/services/backend'
@@ -482,11 +491,14 @@ const captureForm = reactive({
   inspectMaxBytes: 65_536,
   inspectMaxHits: 0,
   plan: 'capture' as 'capture' | 'dump' | 'auto',
+  autoSessionMode: 'startup_replay' as 'startup_replay' | 'unified',
   autoL0Seconds: 15,
   autoL1Seconds: 90,
   autoLinkerSeconds: 15,
 })
 const capturePhase = ref('')
+const unifiedSessionAwaiting = ref(false)
+const autoStageReceipts = ref<AutoStageReceipt[]>([])
 const AUTO_DURATION_KEY = 'mobilee.kernsightAutoDurations'
 
 function clampCaptureSeconds(value: unknown, fallback: number) {
@@ -892,7 +904,7 @@ const commandCatalog = computed(() => {
   const serial = props.device?.serial || '<serial>'
   const packageName = captureForm.package || '<package>'
   return [
-    { key: 'capture', tier: 'L0/L1/L2', label: '当前点击式采集', command: captureCommandPreview.value, detail: captureForm.plan === 'auto' ? `完整自动采集：L0 ${captureForm.autoL0Seconds}s → L0+L1 ${captureForm.autoL1Seconds}s → live/launch dump → Linker ${captureForm.autoLinkerSeconds}s。` : captureForm.plan === 'dump' ? '单包 L2 dump --launch，与 Inspect 不同时挂。' : '与上方控件完全同步；TLS、JNI 与 binder_userspace 可组合，Linker Inspect 仍独占。' },
+    { key: 'capture', tier: 'L0/L1/L2', label: '当前点击式采集', command: captureCommandPreview.value, detail: captureForm.plan === 'auto' ? (captureForm.autoSessionMode === 'unified' ? '一个 ksightd session 顺序启停 Inspect，L0 全程保留；只首阶段启动，全部阶段完成后快照。' : '兼容启动重采：L0、L1、Linker 各自冷启动；快照保留在 L1 后，进程和 session 相互独立。') : captureForm.plan === 'dump' ? '单包 L2 dump --launch，与 Inspect 不同时挂。' : '与上方控件完全同步；TLS、JNI 与 binder_userspace 可组合，Linker Inspect 仍独占。' },
     { key: 'all', tier: 'L0', label: '全设备默认传感器', command: `ksightctl device --serial ${serial} capture --all --duration-seconds 30 --spool`, detail: '--all 不包含高流量的 --network-io 与 --memory-all。' },
     { key: 'package', tier: 'L2', label: '完整冷启动取证', command: `ksightctl device --serial ${serial} pull-package --package ${packageName} --launch --dest packages`, detail: '生成 APK/DEX/SO、live memory、CE/DE 有界副本和 dump-report.json。' },
     { key: 'evidence', tier: 'L2', label: '仅证据目录', command: `ksightctl device --serial ${serial} pull-package --package ${packageName} --launch --evidence-only --dest packages`, detail: '跳过安装 APK/lib/oat，但保留 runtime、data-private、readable-dex 与报告。' },
@@ -945,13 +957,13 @@ const enabledSensorLabels = computed(() => [
   captureForm.files && 'File', captureForm.filesFd && 'FD', captureForm.network && 'Network',
   captureForm.networkIo && 'Socket I/O', captureForm.memory && 'Memory', captureForm.memoryAll && 'Memory all',
   captureForm.binder && 'Binder', captureForm.sched && 'Sched', captureForm.includeThreads && 'Threads',
-  inspectModeHasTls(captureForm.inspectMode) && 'TLS Inspect', inspectModeHasJni(captureForm.inspectMode) && 'JNI Inspect', inspectModeHasBinder(captureForm.inspectMode) && 'Binder userspace Inspect', captureForm.inspectMode === 'linker_so_load' && 'Linker Inspect',
+  (captureForm.plan === 'auto' || inspectModeHasTls(captureForm.inspectMode)) && (captureForm.plan === 'auto' ? 'TLS（L1 阶段）' : 'TLS Inspect'), (captureForm.plan === 'auto' || inspectModeHasJni(captureForm.inspectMode)) && (captureForm.plan === 'auto' ? 'JNI（L1 阶段）' : 'JNI Inspect'), (captureForm.plan === 'auto' || inspectModeHasBinder(captureForm.inspectMode)) && (captureForm.plan === 'auto' ? 'Binder userspace（L1 阶段）' : 'Binder userspace Inspect'), (captureForm.plan === 'auto' || captureForm.inspectMode === 'linker_so_load') && (captureForm.plan === 'auto' ? 'Linker（独立阶段）' : 'Linker Inspect'),
 ].filter(Boolean) as string[])
 const captureScopeLabel = computed(() => captureForm.package ? `${captureForm.package}（含冒号进程）` : '整台设备')
 const captureRisk = computed(() => {
   if (captureForm.hideDebug) return { label: '实验模式 · ADB 将暂时断开', tone: 'high' }
   if (captureForm.plan === 'dump') return { label: 'Forensic · dump --launch SIGSTOP', tone: 'high' }
-  if (captureForm.plan === 'auto') return { label: 'Observe + Inspect + Dump · 自动冷启动', tone: 'high' }
+  if (captureForm.plan === 'auto') return { label: captureForm.autoSessionMode === 'unified' ? '统一阶段 · 首次冷启动' : '启动重采 · 3 次冷启动', tone: 'high' }
   if (captureForm.inspectMode !== 'none') return { label: 'Inspect · 用户态探针可被感知', tone: 'medium' }
   if (captureForm.sched || captureForm.filesFd || captureForm.memoryAll) return { label: 'Observe · 高事件量', tone: 'medium' }
   return { label: 'Observe · 内核元数据', tone: 'low' }
@@ -991,32 +1003,38 @@ const captureCommandPreview = computed(() => {
   if (captureForm.plan === 'dump') return dumpCommandPreview.value
   if (captureForm.plan === 'auto') {
     const pkg = captureForm.package || '<package>'
+    const durations = {l0:captureForm.autoL0Seconds,l1:captureForm.autoL1Seconds,linker:captureForm.autoLinkerSeconds}
+    if (captureForm.autoSessionMode === 'unified') {
+      let spec = '无效阶段时长'; try { spec = buildUnifiedStageSpec(durations) } catch { /* form validation explains */ }
+      return [
+        '# 新版 agent：同一 spool/session，L0 传感器全程保留；Inspect 顺序切换；仅首次启动。',
+        `# 阶段参数（完整对象路径与传感器命令见运行后日志）`,
+        `ksightd capture --package ${pkg} --spool-dir /data/local/tmp/ksight/spool --inspect-stages ${spec} --duration-seconds ${durations.l0 + durations.l1 + durations.linker} --sample-one-in ${captureForm.sampleOneIn} --inspect-max-bytes ${captureForm.inspectMaxBytes} --inspect-max-hits ${captureForm.inspectMaxHits}`,
+        '# 全部阶段和主进程身份通过后才取最终驻留快照；失败停止，旧 agent 不静默降级。',
+      ].join('\n')
+    }
     return [
-      `# 完整自动采集。三档时长可在表单改，会记在本机。壳闪退把 L0+L1 留短；要登录就把 L0+L1 调到 90–180。`,
-      `# 1) 单包 L0 主干 ${captureForm.autoL0Seconds}s（无 Inspect，赶 Handshake/SNI）`,
-      captureKsightctlLine({ duration: captureForm.autoL0Seconds, inspectMode: 'none', launch: true }),
-      `# 2) 单包 L0+L1 ${captureForm.autoL1Seconds}s（TLS + JNI 明文 + Parcel。App 起来后在这段时间里登录/注册）`,
-      captureKsightctlLine({ duration: captureForm.autoL1Seconds, inspectMode: 'tls_binder_jni', launch: true }),
-      `# 3) L2 dump：进程还在则 live harvest（保留登录态 CE/DE），已死则 --launch`,
-      `ksightctl device --serial ${props.device?.serial || '<serial>'} pull-package --package ${pkg} --dest packages   # live，不要 --launch`,
-      `ksightctl device --serial ${props.device?.serial || '<serial>'} pull-package --package ${pkg} --launch --dest packages   # 仅当 pidof 为空`,
-      `# 4) 单包 Linker ${captureForm.autoLinkerSeconds}s（独占 SO load；会 force-stop，放在 dump 之后以免清掉登录态）`,
-      captureKsightctlLine({ duration: captureForm.autoLinkerSeconds, inspectMode: 'linker_so_load', launch: true }),
-      `# 壳几秒就自杀的 App 不必加长 L0+L1。要登录的把「L0+L1 登录窗」调到 90–180。`,
-    ].join('\n').split('<package>').join(pkg)
+      '# 启动重采兼容模式：三次启动、三个独立 session；快照在 L1 后、Linker 重启前。',
+      captureKsightctlLine({ duration: durations.l0, inspectMode: 'none', launch: true }),
+      captureKsightctlLine({ duration: durations.l1, inspectMode: 'tls_binder_jni', launch: true }),
+      `ksightctl device --serial ${props.device?.serial || '<serial>'} pull-package --package ${pkg} --dest packages`,
+      '# 快照必须确认当前进程仍在运行；不自动 --launch。',
+      captureKsightctlLine({ duration: durations.linker, inspectMode: 'linker_so_load', launch: true }),
+    ].join('\n')
   }
   return captureKsightctlLine({ duration: captureForm.durationSeconds, inspectMode: captureForm.inspectMode })
 })
 const captureValid = computed(() => {
   const packageValid = !captureForm.package || /^[A-Za-z0-9._]+$/.test(captureForm.package)
   const inspectValid = !(captureForm.inspectMode !== 'none' || captureForm.sched || captureForm.plan !== 'capture') || Boolean(captureForm.package)
-  const autoOk = captureForm.plan !== 'auto' || [captureForm.autoL0Seconds, captureForm.autoL1Seconds, captureForm.autoLinkerSeconds].every(n => n >= 1 && n <= 300)
+  const autoOk = captureForm.plan !== 'auto' || [captureForm.autoL0Seconds, captureForm.autoL1Seconds, captureForm.autoLinkerSeconds].every(n => Number.isInteger(n) && n >= 1 && n <= 300)
   return packageValid && inspectValid && autoOk && captureForm.durationSeconds >= 1 && captureForm.durationSeconds <= 300 && captureForm.sampleOneIn >= 1
 })
 const capturePolicyHint = computed(() => {
   if (!captureValid.value) return 'Inspect / Sched / Dump / 自动采集必须填写包名；时长 1–300 秒。'
   if (captureForm.plan === 'dump') return 'L2 dump --launch：force-stop 后由 dump 自己拉起 App，SIGSTOP 拷堆 DEX/SO/CE·DE。不是 eBPF 会话，不要同时挂 Inspect。'
-  if (captureForm.plan === 'auto') return `完整自动采集：L0 ${captureForm.autoL0Seconds}s → L0+L1 ${captureForm.autoL1Seconds}s（登录窗口）→ Dump（进程在则 live，已死则 --launch）→ Linker ${captureForm.autoLinkerSeconds}s。三档秒数可改，会记住。要注册/登录把 L0+L1 调到 90–180。不要开 Sched。`
+  if (captureForm.plan === 'auto' && captureForm.autoSessionMode === 'startup_replay') return '启动重采保留各能力自己的启动窗口：L0 → 重启 L1 → 该实例快照 → 重启 Linker。三个 session 不能冒充同一进程生命周期。失败停止并保留已有证据。'
+  if (captureForm.plan === 'auto') return `统一 session：首次冷启动 → L0 ${captureForm.autoL0Seconds}s → L0+L1 ${captureForm.autoL1Seconds}s → Linker ${captureForm.autoLinkerSeconds}s → 最终驻留快照。后续阶段不重启 App，主进程退出或代际变化则停止。界面显示计划等待，实际起止和失败由 agent 阶段记录核对。按业务顺序逐步操作；阶段成功不代表所有动态代码已覆盖。Memory all 仍是高流量选项。`
   if (captureForm.hideDebug) return 'Hide debug 会暂时断开 ADB；设备端 watchdog 在会话结束后恢复调试，MobileE 会等待重连。'
   if (captureForm.inspectMode === 'tls') return 'TLS Inspect 保留 bounded 明文 preview 与 SHA-256；AArch32 uprobe 在当前 GKI 可能返回 ENOTSUP。'
   if (captureForm.inspectMode === 'jni_plaintext') return 'JNI Inspect 挂 libart JNINativeInterface：GetStringUTFChars / NewStringUTF / byte[] 与 RegisterNatives。不读 ART 对象字段。'
@@ -1032,7 +1050,7 @@ const capturePolicyHint = computed(() => {
 const captureActionLabel = computed(() => {
   if (captureRunning.value) return `采集中 · ${captureElapsed.value}s${capturePhase.value ? ` · ${capturePhase.value}` : ''}`
   if (captureForm.plan === 'dump') return '开始 Dump --launch'
-  if (captureForm.plan === 'auto') return '开始完整自动采集'
+  if (captureForm.plan === 'auto') return captureForm.autoSessionMode === 'unified' ? '开始统一阶段会话' : '开始启动重采（3 次启动）'
   return '开始采集并自动解析'
 })
 const aiContextJson = computed(() => JSON.stringify({
@@ -1430,7 +1448,7 @@ function applyCapturePreset(preset: 'whole' | 'tls-binder' | 'binder' | 'linker'
   captureForm.networkIo = false
   captureForm.memoryAll = false
   captureForm.sched = false
-  captureForm.inspectMode = preset === 'tls-binder' ? 'tls_binder_jni' : preset === 'binder' ? 'binder_userspace' : preset === 'linker' ? 'linker_so_load' : 'none'
+  captureForm.inspectMode = (preset === 'tls-binder' || preset === 'auto') ? 'tls_binder_jni' : preset === 'binder' ? 'binder_userspace' : preset === 'linker' ? 'linker_so_load' : 'none'
   captureForm.hideDebug = false
   captureForm.plan = preset === 'dump' ? 'dump' : preset === 'auto' ? 'auto' : 'capture'
   if (preset !== 'auto') captureForm.durationSeconds = preset === 'whole' ? 30 : preset === 'dump' ? 120 : 45
@@ -1503,35 +1521,54 @@ function mergeCaptureLogs(parts: KernSightCaptureResult[]): KernSightCaptureResu
   }
 }
 
+async function openAutoStageSession(sessionId: string) {
+  workspaceMode.value = 'evidence'
+  await loadSessionReport(sessionId)
+}
+
 async function startCapture() {
   if (!props.device || !captureValid.value || captureRunning.value) return
   captureRunning.value = true
   captureElapsed.value = 0
   capturePhase.value = ''
   captureResult.value = null
+  autoStageReceipts.value = []
   probeError.value = ''
-  captureTimer = setInterval(() => { captureElapsed.value += 1 }, 1000)
+  captureTimer = setInterval(() => {
+    captureElapsed.value += 1
+    if (unifiedSessionAwaiting.value) {
+      const l0=captureForm.autoL0Seconds, l1=captureForm.autoL1Seconds, total=l0+l1+captureForm.autoLinkerSeconds
+      const phase=captureElapsed.value < l0 ? 'L0' : captureElapsed.value < l0+l1 ? 'L1' : captureElapsed.value < total ? 'Linker' : '等待 agent 退出'
+      capturePhase.value=`计划 ${phase}（时间估计；实际以 agent 记录为准）`
+    }
+  }, 1000)
   try {
     if (captureForm.plan === 'dump') {
       capturePhase.value = 'L2 dump'
       captureResult.value = await monitoringBackend.dumpKernSightPackage(props.device.serial, captureForm.package, captureForm.hideDebug, false)
     } else if (captureForm.plan === 'auto') {
-      const logs: KernSightCaptureResult[] = []
-      const l0 = clampCaptureSeconds(captureForm.autoL0Seconds, 15)
-      const l1 = clampCaptureSeconds(captureForm.autoL1Seconds, 90)
-      const linker = clampCaptureSeconds(captureForm.autoLinkerSeconds, 15)
-      capturePhase.value = `L0 主干 ${l0}s`
-      logs.push(await monitoringBackend.startKernSightCapture(buildCaptureRequest('none', l0, true)))
-      capturePhase.value = `L0+L1 ${l1}s`
-      logs.push(await monitoringBackend.startKernSightCapture(buildCaptureRequest('tls_binder_jni', l1, true)))
-      capturePhase.value = 'L2 dump'
-      logs.push(await monitoringBackend.dumpKernSightPackage(props.device.serial, captureForm.package, captureForm.hideDebug, true))
-      capturePhase.value = `Linker ${linker}s`
-      logs.push(await monitoringBackend.startKernSightCapture(buildCaptureRequest('linker_so_load', linker, true)))
-      captureResult.value = {
-        ...mergeCaptureLogs(logs),
-        sessionId: logs[1]?.sessionId || logs[0]?.sessionId || logs[3]?.sessionId,
+      const durations = {
+        l0: Number(captureForm.autoL0Seconds),
+        l1: Number(captureForm.autoL1Seconds),
+        linker: Number(captureForm.autoLinkerSeconds),
       }
+      // Validate the entire plan before the first backend/device operation.
+      buildAutoCaptureStages(durations.l0, durations.l1, durations.linker)
+      const runner = captureForm.autoSessionMode === 'unified' ? runUnifiedCapturePlan : runAutoCapturePlan
+      await runner(
+        buildCaptureRequest('none', durations.l0, false), durations, monitoringBackend,
+        stage => { capturePhase.value = stage.label; unifiedSessionAwaiting.value = stage.key === 'session' },
+        receipt => {
+          autoStageReceipts.value.push(receipt)
+          const logs = autoStageReceipts.value.map(item => item.result)
+          captureResult.value = {
+            ...mergeCaptureLogs(logs),
+            sessionId: autoStageReceipts.value.find(item => item.stage.key === 'l1' && item.succeeded)?.result.sessionId
+              || autoStageReceipts.value.find(item => item.succeeded && item.result.sessionId)?.result.sessionId,
+          }
+        },
+        captureForm.autoSessionMode === 'startup_replay',
+      )
     } else {
       captureResult.value = await monitoringBackend.startKernSightCapture(buildCaptureRequest(captureForm.inspectMode, Number(captureForm.durationSeconds), false))
     }
@@ -1542,8 +1579,12 @@ async function startCapture() {
     }
   } catch (error) {
     probeError.value = readableError(error)
+    if (autoStageReceipts.value.length) {
+      try { await loadKernSight() } catch { /* Keep the original stage error and receipts. */ }
+    }
   } finally {
     captureRunning.value = false
+    unifiedSessionAwaiting.value = false
     capturePhase.value = ''
     if (captureTimer) clearInterval(captureTimer)
     captureTimer = undefined

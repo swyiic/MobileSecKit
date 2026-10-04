@@ -1,3 +1,4 @@
+import { captureIPCCommand } from '../kernsightCapturePlan'
 import { invoke } from '@tauri-apps/api/core'
 import type {
   AndroidMonitorCapabilityProbe,
@@ -27,13 +28,13 @@ export const monitoringBackend = {
   kernSightEvents: (serial: string, sessionId: string, offset = 0, limit = 50, sensor?: string, query?: string) =>
     invoke<KernSightEventPage>('get_kernsight_session_events', { serial, sessionId, offset, limit, sensor, query }),
   startKernSightCapture: (request: KernSightCaptureRequest) =>
-    invoke<KernSightCaptureResult>('start_kernsight_capture', { request }),
+    invoke<KernSightCaptureResult>(captureIPCCommand(request), { request }),
   startKernSightMirror: (request: KernSightCaptureRequest) =>
     invoke<KernSightCaptureResult>('start_kernsight_mirror', { request }),
   stopKernSightMirror: (serial?: string, reversePort?: number) => invoke<KernSightMirrorStatus>('stop_kernsight_mirror', { serial, reversePort }),
   kernSightMirrorStatus: (serial?: string) => invoke<KernSightMirrorStatus>('kernsight_mirror_status', { serial }),
-  dumpKernSightPackage: (serial: string, packageName: string, hideDebug = false, preferLive = false) =>
-    invoke<KernSightCaptureResult>('dump_kernsight_package', { serial, package: packageName, hideDebug, preferLive }),
+  dumpKernSightPackage: (serial: string, packageName: string, hideDebug = false, preferLive = false, requireLive = false) =>
+    invoke<KernSightCaptureResult>('dump_kernsight_package', { serial, package: packageName, hideDebug, preferLive, requireLive }),
   kernSightPackageDumps: (serial: string) =>
     invoke<KernSightPackageDumpReport[]>('list_kernsight_package_dumps', { serial }),
   kernSightPackageFile: (serial: string, packageName: string, relativePath: string, maxBytes = 1_048_576) =>

@@ -1,3 +1,5 @@
+mod dump_policy;
+mod stage_policy;
 use crate::{run_device_adb, run_device_root_script};
 use ksight_core::{
     DexArtifactSet, DumpArtifact, MergedDumpRef, SessionGraph, SessionReport, SessionReportBuilder,
@@ -471,6 +473,8 @@ pub struct KernSightCaptureRequest {
     inspect_jni: bool,
     #[serde(default)]
     inspect_linker: bool,
+    #[serde(default)]
+    inspect_stages: Option<String>,
     #[serde(default)]
     inspect_adapter: Option<String>,
     #[serde(default)]
@@ -1360,14 +1364,36 @@ pub async fn cleanup_kernsight_session(serial: String, session_id: String) -> Re
     }
 }
 
+/// A new IPC command keeps an old backend from silently ignoring the new field.
+#[tauri::command]
+pub async fn start_kernsight_staged_capture(
+    request: KernSightCaptureRequest,
+) -> Result<KernSightCaptureResult, String> {
+    if request.inspect_stages.is_none() {
+        return Err("统一会话缺少阶段计划".into());
+    }
+    start_kernsight_capture(request).await
+}
+
 #[tauri::command]
 pub async fn start_kernsight_capture(
     request: KernSightCaptureRequest,
 ) -> Result<KernSightCaptureResult, String> {
     validate_serial(&request.serial)?;
-    if !(1..=300).contains(&request.duration_seconds) {
-        return Err("采集时长必须在 1 到 300 秒之间".into());
-    }
+    let stages = request.inspect_stages.as_deref();
+    stage_policy::validate_mode(
+        stages,
+        request.duration_seconds,
+        request
+            .package
+            .as_deref()
+            .is_some_and(|p| !p.trim().is_empty()),
+        request.inspect_tls
+            || request.inspect_jni
+            || request.inspect_linker
+            || request.inspect_adapter.is_some()
+            || request.mirror_burp.is_some(),
+    )?;
     if request.sample_one_in == 0 || request.sample_one_in > 10_000 {
         return Err("采样倍率必须在 1 到 10000 之间".into());
     }
@@ -1417,6 +1443,15 @@ pub async fn start_kernsight_capture(
         && package.is_none()
     {
         return Err("TLS、JNI、Binder userspace、Linker、Burp mirror 或调度语义采集必须选择一个包，避免无边界的全设备 Inspect".into());
+    }
+    if stages.is_some() {
+        // Capability check is read-only and precedes any force-stop or capture.
+        let help =
+            run_device_root_script(&request.serial, &format!("{KSIGHT_AGENT} capture --help"))
+                .await?;
+        if help.code != Some(0) || !help.stdout.contains("--inspect-stages") {
+            return Err("设备 ksightd 未证明支持 --inspect-stages；统一会话未启动。可显式选择旧版启动重采模式，不能静默降级".into());
+        }
     }
     if mirror.is_some() {
         let forward =
@@ -1504,6 +1539,11 @@ pub async fn start_kernsight_capture(
     }
     if let Some(adapter) = inspect_adapter {
         args.push(format!("--inspect-adapter {adapter}"));
+    }
+    if let Some(text) = stages {
+        args.push(format!("--inspect-stages {text}"));
+        args.push(format!("--inspect-max-bytes {}", request.inspect_max_bytes));
+        args.push(format!("--inspect-max-hits {}", request.inspect_max_hits));
     }
     if inspect_tls || request.inspect_jni || request.inspect_linker || inspect_adapter.is_some() {
         args.push(format!("--inspect-max-secs {}", request.duration_seconds));
@@ -2033,22 +2073,21 @@ pub async fn dump_kernsight_package(
     package: String,
     hide_debug: bool,
     prefer_live: bool,
+    require_live: Option<bool>,
 ) -> Result<KernSightCaptureResult, String> {
     validate_serial(&serial)?;
     validate_package(&package)?;
     let remote = format!("{KSIGHT_PACKAGES}/{package}");
     let live = if prefer_live {
-        let pids = run_device_root_script(&serial, &format!("pidof {package}"))
+        run_device_root_script(&serial, &format!("pidof {package}"))
             .await
-            .ok()
-            .map(|output| output.stdout)
-            .unwrap_or_default();
-        pids.split_whitespace()
-            .any(|token| !token.is_empty() && token.bytes().all(|byte| byte.is_ascii_digit()))
+            .is_ok_and(|output| dump_policy::live_pid_confirmed(output.code, &output.stdout))
     } else {
         false
     };
-    let launch_flag = if live { "" } else { " --launch" };
+    // Decide before removing the previous dump directory or launching anything.
+    let launch_flag =
+        dump_policy::dump_launch_flag(prefer_live, require_live.unwrap_or(false), live)?;
     let mut dump = format!(
         "rm -rf {remote} && mkdir -p {remote} && {KSIGHT_AGENT} dump-package --package {package} --dest {remote}{launch_flag}"
     );
@@ -3583,5 +3622,17 @@ mod tests {
         assert_eq!(report["dex_ownership"]["entries"][0]["category"], "mixed");
         assert_eq!(report["dex_ownership"]["business_class_samples"], 1);
         assert_eq!(report["dex_ownership"]["business_dex_sets"], 1);
+    }
+    #[test]
+    fn old_capture_ipc_defaults_stages_to_none_and_new_field_is_not_dropped() {
+        let old: KernSightCaptureRequest = serde_json::from_value(
+            serde_json::json!({"serial":"offline-fixture","durationSeconds":45}),
+        )
+        .unwrap();
+        assert!(old.inspect_stages.is_none());
+        assert!(!old.inspect_tls);
+        assert!(!old.memory_all);
+        let new: KernSightCaptureRequest = serde_json::from_value(serde_json::json!({"serial":"offline-fixture","durationSeconds":120,"inspectStages":"l0:15,l1:90,linker:15"})).unwrap();
+        assert_eq!(new.inspect_stages.as_deref(), Some("l0:15,l1:90,linker:15"));
     }
 }

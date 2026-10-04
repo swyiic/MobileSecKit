@@ -1086,6 +1086,7 @@ pub fn run() {
             monitoring::cleanup_kernsight_session,
             monitoring::get_kernsight_session_events,
             monitoring::start_kernsight_capture,
+            monitoring::start_kernsight_staged_capture,
             monitoring::start_kernsight_mirror,
             monitoring::stop_kernsight_mirror,
             monitoring::kernsight_mirror_status,
