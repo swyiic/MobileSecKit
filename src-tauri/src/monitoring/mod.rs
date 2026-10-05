@@ -3347,11 +3347,12 @@ pub async fn import_kernsight_evidence_archive(
     }
     if archive_objects::is_v2(&archive_path)? {
         let root = archive_objects::restore(&archive_path)?;
-        let result = import_kernsight_evidence_directory(root.to_string_lossy().into_owned()).await;
-        if result.is_err() {
-            let _ = std::fs::remove_dir_all(root.parent().unwrap());
-        }
-        return result;
+        // This content-addressed cache can predate this import and be shared by
+        // other bundles. Semantic metadata failure does not grant ownership of
+        // its verified content; retain it for recovery and report the failure.
+        return import_kernsight_evidence_directory(root.to_string_lossy().into_owned())
+            .await
+            .map_err(|error| format!("{error}；已核验的内容缓存已保留，未作为成功案例导入"));
     }
     let file = File::open(&archive_path).map_err(|error| format!("无法打开证据包：{error}"))?;
     let mut archive =
@@ -5089,3 +5090,6 @@ mod qualified_source_tests {
         assert!(qualified_dump_sources(Some(&n), "p").is_err());
     }
 }
+
+#[cfg(test)]
+mod recovery_reliability_tests;
