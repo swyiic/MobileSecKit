@@ -189,6 +189,9 @@ async fn run_adb_once(
 ) -> Result<std::process::Output, String> {
     let mut command = Command::new("adb");
     command.args(args).kill_on_drop(true);
+    if monitoring::session_deadline::current().is_some() {
+        return monitoring::session_deadline::output(&mut command, command_timeout).await;
+    }
     timeout(command_timeout, command.output())
         .await
         .map_err(|_| {
@@ -224,8 +227,19 @@ async fn run_adb_with_timeout(
     // behind one process-wide gate; normal adb calls are short and the device
     // detail fan-out remains fast enough while startup/restart stays reliable.
     let _guard = adb_command_gate().lock().await;
+    monitoring::session_deadline::check()?;
     let mut output = run_adb_once(args, command_timeout, operation).await?;
     if !output.status.success() && is_adb_daemon_failure(&output) {
+        if monitoring::session_deadline::current().is_some() {
+            // A parent capture must not kill a shared server during recovery.
+            monitoring::session_deadline::check()?;
+            output = run_adb_once(args, command_timeout, operation).await?;
+            return Ok(RawOutput {
+                stdout: String::from_utf8_lossy(&output.stdout).trim().into(),
+                stderr: String::from_utf8_lossy(&output.stderr).trim().into(),
+                code: output.status.code(),
+            });
+        }
         // Recovery is deliberately limited to daemon-transport failures. Do
         // not restart a healthy server for ordinary device/command errors.
         let _ = Command::new("adb")
@@ -1083,8 +1097,16 @@ pub fn run() {
             monitoring::provision_latest_kernsight_agent,
             monitoring::get_kernsight_overview,
             monitoring::get_kernsight_session_report,
+            monitoring::get_kernsight_group_session_report,
             monitoring::cleanup_kernsight_session,
             monitoring::get_kernsight_session_events,
+            monitoring::capture_groups::get_local_kernsight_child_report,
+            monitoring::capture_groups::begin_kernsight_group,
+            monitoring::capture_groups::begin_kernsight_isolated_group,
+            monitoring::capture_groups::list_kernsight_groups,
+            monitoring::capture_groups::cancel_kernsight_group,
+            monitoring::capture_groups::run_kernsight_group_stage,
+            monitoring::capture_groups::run_kernsight_unified_group,
             monitoring::start_kernsight_capture,
             monitoring::start_kernsight_staged_capture,
             monitoring::start_kernsight_mirror,

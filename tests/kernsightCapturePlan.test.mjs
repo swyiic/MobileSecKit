@@ -9,7 +9,7 @@ const source = readFileSync(new URL('../src/services/kernsightCapturePlan.ts', i
 const compiled = ts.transpileModule(source, {
   compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.ES2022 },
 }).outputText
-const { buildAutoCaptureStages, runAutoCapturePlan, runUnifiedCapturePlan, buildUnifiedStageSpec, captureIPCCommand } =
+const { buildAutoCaptureStages, runAutoCapturePlan, runUnifiedCapturePlan, buildUnifiedStageSpec, captureIPCCommand, captureCodeOnlyChoice, startupEvidenceLabel, qualifiedSourceLabel, captureGroupIPC } =
   await import(`data:text/javascript;base64,${Buffer.from(compiled).toString('base64')}`)
 
 const base = {
@@ -160,4 +160,36 @@ test('unified durations are validated before any call and old/new IPC commands a
   assert.equal(buildUnifiedStageSpec({l0:300,l1:300,linker:300}),'l0:300,l1:300,linker:300')
   assert.equal(captureIPCCommand(base),'start_kernsight_capture')
   assert.equal(captureIPCCommand({...base,inspectStages:'l1:1'}),'start_kernsight_staged_capture')
+})
+
+test('code-only is an explicit independent choice, not inferred from auto mode', () => {
+  assert.equal(captureCodeOnlyChoice(false), false); assert.equal(captureCodeOnlyChoice(true), true)
+  const view = readFileSync(new URL('../src/views/AndroidRuntimeMonitorView.vue', import.meta.url),'utf8')
+  assert.ok(view.includes('codeOnly:captureCodeOnlyChoice(captureForm.codeOnly)'))
+  assert.ok(!view.includes("codeOnly:captureForm.plan==='auto'"))
+})
+
+test('actual attach display keeps missing and old startup records unknown', () => {
+  assert.match(startupEvidenceLabel(), /未知/)
+  assert.match(startupEvidenceLabel({startup:{schema:'legacy'}}), /未知/)
+  const label = startupEvidenceLabel({startup:{schema:'kernsight.startup/v1',generation_state:'new_instance_observed',timing:{force_stop_status:'completed',launcher_status:'completed',launcher_started_ms:10,first_attach_ms:{tls:25}}}})
+  assert.match(label, /tls=25ms/); assert.match(label, /可能缺失/)
+})
+
+test('production qualification display leaves old data unknown and refuses foreign ancestry', () => {
+  assert.match(qualifiedSourceLabel(null), /未知/)
+  assert.match(qualifiedSourceLabel({ complete: true }), /未知/)
+  const note = { token: 't', relation: { attempt_id: 'a' }, qualification: { schema: 'kernsight.qualified-source/v1', token: 't', relation: { attempt_id: 'a' }, source: 'MetadataObserver physical pidfd lease', sources: [{ package: 'p', pid: 1, uid: 10001, birth_ns: 2, exec_id: 0, boot_id: 'b' }] } }
+  assert.match(qualifiedSourceLabel(note), /此前生产者/)
+  note.qualification.token = 'foreign'
+  assert.match(qualifiedSourceLabel(note), /未知/)
+})
+
+test('isolation uses a new native IPC so old Me cannot silently run the default agent',()=>{
+ assert.equal(captureGroupIPC({}), 'begin_kernsight_group')
+ const request={runtimePaths:{root:'/data/local/tmp/ksight-candidate',agentPath:'/data/local/tmp/ksight-candidate/ksightd',expectedSha256:'a'.repeat(64)}}
+ let deviceActions=0
+ const oldBackend={begin_kernsight_group(){deviceActions++}}
+ assert.throws(()=>{const fn=oldBackend[captureGroupIPC(request)];if(!fn) throw new Error('unknown IPC');fn()},/unknown IPC/)
+ assert.equal(deviceActions,0)
 })

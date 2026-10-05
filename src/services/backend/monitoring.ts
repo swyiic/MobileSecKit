@@ -1,8 +1,11 @@
+import { captureGroupIPC } from '../kernsightCapturePlan'
 import { captureIPCCommand } from '../kernsightCapturePlan'
 import { invoke } from '@tauri-apps/api/core'
 import type {
   AndroidMonitorCapabilityProbe,
   KernSightOverview,
+  KernSightCaptureGroup,
+  KernSightGroupStageResult,
   KernSightProvisionResult,
   KernSightCaptureRequest,
   KernSightCaptureResult,
@@ -15,6 +18,13 @@ import type {
 } from '@/types/monitoring'
 
 export const monitoringBackend = {
+  kernSightGroupSessionReport:(parentId:string,serial:string,packageName:string,sessionId:string)=>invoke<KernSightSessionReportDocument>('get_kernsight_group_session_report',{parentId,serial,package:packageName,sessionId}),
+  localKernSightChildReport:(root:string,parentId:string,sessionId:string)=>invoke<KernSightSessionReportDocument>('get_local_kernsight_child_report',{root,parentId,sessionId}),
+  beginKernSightGroup:(request:KernSightCaptureRequest,durations:number[],startupReplay:boolean)=>invoke<KernSightCaptureGroup>(captureGroupIPC(request),{request,durations,startupReplay}),
+  listKernSightGroups:(serial?:string)=>invoke<KernSightCaptureGroup[]>('list_kernsight_groups',{serial:serial||null}),
+  runKernSightUnifiedGroup:(parentId:string)=>invoke<KernSightGroupStageResult>('run_kernsight_unified_group',{parentId}),
+  runKernSightGroupStage:(parentId:string,stageKey:string)=>invoke<KernSightGroupStageResult>('run_kernsight_group_stage',{parentId,stageKey}),
+  cancelKernSightGroup:(parentId:string)=>invoke<KernSightCaptureGroup>('cancel_kernsight_group',{parentId}),
   probeCapabilities: (serial: string) =>
     invoke<AndroidMonitorCapabilityProbe>('probe_android_monitor_capabilities', { serial }),
   provisionLatestAgent: (serial: string) =>
@@ -47,8 +57,8 @@ export const monitoringBackend = {
     invoke<string>('export_kernsight_evidence_archive', { root, outputPath }),
   pullKernSightPackageEvidence: (serial: string, packageName: string, destination: string) =>
     invoke<KernSightLocalEvidenceBundle>('pull_kernsight_package_evidence', { serial, package: packageName, destination }),
-  pullKernSightPackageArchive: (serial: string, packageName: string, outputPath: string) =>
-    invoke<KernSightLocalEvidenceBundle>('pull_kernsight_package_archive', { serial, package: packageName, outputPath }),
+  pullKernSightPackageArchive: (serial: string, packageName: string, outputPath: string, parentId?:string) =>
+    invoke<KernSightLocalEvidenceBundle>('pull_kernsight_package_archive', { serial, package: packageName, outputPath, parentId:parentId||null }),
   localKernSightEvidenceFile: (root: string, packageName: string, relativePath: string, maxBytes = 1_048_576) =>
     invoke<KernSightEvidenceFileContent>('read_local_kernsight_evidence_file', { root, package: packageName, relativePath, maxBytes }),
   cleanupKernSightPackageDump: (serial: string, packageName: string) =>

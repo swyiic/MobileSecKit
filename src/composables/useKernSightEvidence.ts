@@ -1,3 +1,4 @@
+import { sameImportedCapture } from '../services/kernsightCaptureGroups'
 import { computed, markRaw, ref, shallowRef, type MaybeRef, unref } from 'vue'
 import { open } from '@tauri-apps/plugin-dialog'
 import { monitoringBackend } from '@/services/backend'
@@ -20,7 +21,7 @@ function rememberParent(root: string) {
 
 export function upsertKernSightBundle(bundle: KernSightLocalEvidenceBundle) {
   bundles.value = [
-    ...bundles.value.filter(item => item.root !== bundle.root && item.package !== bundle.package),
+    ...bundles.value.filter(item => !sameImportedCapture(item,bundle)),
     markRaw(bundle),
   ]
   rememberParent(bundle.root)

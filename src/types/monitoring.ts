@@ -93,6 +93,16 @@ export interface KernSightSessionReportDocument {
 }
 
 export interface KernSightCaptureRequest {
+  runtimePaths?:{root:string;agentPath:string;expectedSha256:string}|null
+  sessionBudget?:{totalBytes:number;maxSeconds:number}|null
+  codeOnly?:boolean
+  collectKeys?:boolean
+  collectPrivate?:boolean
+  collectMemoryWindows?:boolean
+  outputBudgetBytes?:number|null
+  outputBudgetMs?:number|null
+  captureRelation?:KernSightCaptureRelation|null
+  captureRelations?:KernSightCaptureRelation[]|null
   serial: string
   package?: string | null
   durationSeconds: number
@@ -389,7 +399,10 @@ export interface KernSightPackageDumpReport {
   total_bytes?: number
   physical_bytes?: number
   deduplicated_bytes?: number
-  local_storage_accounting?: { logical_file_bytes: number; allocated_bytes: number | null; verified_code_duplicate_bytes: number; [key: string]: unknown }
+  mobilee_archive_coverage?: { status: 'partial' | 'unknown'; scope?: string; complete_collection?: false }
+  mobilee_transport_status?: { complete: false; status: 'partial'; notes: Array<Record<string, unknown>>; scope: string }
+  local_storage_accounting?: { logical_file_bytes: number; allocated_bytes: number | null; verified_code_duplicate_bytes: number; runtime_observations?: Array<Record<string, any>>; elf_module_observations?: Array<Record<string, any>>; runtime_source_diagnostics?: Array<Record<string, unknown>>; [key: string]: unknown }
+  content_dex_class_index?: { schema: string; scope: string; objects: Array<{sha256: string; bytes: number; sources: Array<Record<string, any>>; ownership: string; declared_classes: number | null; indexed_classes: number | null; class_index_status: string; layout_diagnostics?: Record<string, any>; validation_status?: string; sha1_signature_verified?: boolean | null; adler32_checksum_verified?: boolean | null; class_hints?: Record<string, number>}> }
   apk_member_evidence?: { observations?: Array<Record<string, any>>; omitted_observations?: number; status?: string }
   storage_accounting?: string | null
   unique_inode_bytes?: number | null
@@ -399,3 +412,13 @@ export interface KernSightPackageDumpReport {
     edges?: Array<Record<string, unknown>>
   }
 }
+
+export interface KernSightCaptureRelation {parentId:string;stageId:string;attemptId:string;attempt:number;stageKey:string}
+export interface KernSightCaptureGroup {
+  budget?:{schema:string;limits:{totalBytes:number;maxSeconds:number};deadlineUnixMs:number;reservations:Array<{id:string;kind:string;reservedBytes:number;chargedBytes:number|null;status:string}>}|null
+  schema:'mobilee.capture-group/v1';id:string;serial:string;package:string;createdUnixMs:number;cancelRequested:boolean;
+  state:string;unified?:boolean;base:Record<string,unknown>;
+  stages:Array<{id:string;key:string;mode:string;durationSeconds:number;launchAfterAttach:boolean;required:boolean;
+    attempts:Array<{relation:KernSightCaptureRelation;state:string;startedUnixMs:number;finishedUnixMs:number|null;sessionId:string|null;error:string|null;remoteArtifactRoot:string|null;remoteLifecycle?:Record<string,unknown>|null;processInstances:Array<Record<string,unknown>>;observationError:string|null;omittedProcessInstances:number;stageRecords:Array<Record<string,unknown>>}>}>
+}
+export interface KernSightGroupStageResult {group:KernSightCaptureGroup;result:KernSightCaptureResult|null;error:string|null;continueAfterPartial?:boolean}

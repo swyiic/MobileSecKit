@@ -1,4 +1,11 @@
+mod archive_objects;
+pub mod capture_groups;
+mod dex_class_index;
 mod dump_policy;
+mod elf_runtime;
+mod runtime_paths;
+mod session_budget;
+pub(crate) mod session_deadline;
 mod stage_policy;
 mod storage_evidence;
 use crate::{run_device_adb, run_device_root_script};
@@ -443,9 +450,31 @@ pub struct KernSightSessionReport {
     report: Value,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct KernSightCaptureRequest {
+    #[serde(default)]
+    session_budget: Option<session_budget::Limits>,
+    #[serde(default)]
+    runtime_paths: Option<runtime_paths::RuntimePaths>,
+    #[serde(default)]
+    code_only: bool,
+    #[serde(default)]
+    expected_code_sources: Option<Value>,
+    #[serde(default)]
+    collect_keys: bool,
+    #[serde(default)]
+    collect_private: bool,
+    #[serde(default)]
+    collect_memory_windows: bool,
+    #[serde(default)]
+    output_budget_bytes: Option<u64>,
+    #[serde(default)]
+    output_budget_ms: Option<u64>,
+    #[serde(default)]
+    capture_relation: Option<capture_groups::Relation>,
+    #[serde(default)]
+    capture_relations: Option<Vec<capture_groups::Relation>>,
     serial: String,
     #[serde(default)]
     package: Option<String>,
@@ -1150,8 +1179,18 @@ struct KernSightConnection {
 
 impl KernSightConnection {
     async fn connect(serial: &str) -> Result<Self, String> {
+        Self::connect_scoped(serial, None).await
+    }
+    async fn connect_scoped(
+        serial: &str,
+        paths: Option<&runtime_paths::RuntimePaths>,
+    ) -> Result<Self, String> {
         validate_serial(serial)?;
-        let remote = format!("su -c \"{KSIGHT_AGENT} serve --spool-root {KSIGHT_SPOOL}\"");
+        let script = runtime_paths::route(
+            paths,
+            &format!("{KSIGHT_AGENT} serve --spool-root {KSIGHT_SPOOL}"),
+        )?;
+        let remote = crate::root_shell_command(&script);
         let mut child = Command::new("adb")
             .args(["-s", serial, "shell", &remote])
             .stdin(Stdio::piped())
@@ -1307,9 +1346,34 @@ pub async fn get_kernsight_session_report(
     serial: String,
     session_id: String,
 ) -> Result<KernSightSessionReport, String> {
+    get_kernsight_session_report_scoped(serial, session_id, None).await
+}
+/// Parent-owned live report uses the same runtime selection; an old Me rejects this IPC.
+#[tauri::command]
+pub async fn get_kernsight_group_session_report(
+    app: tauri::AppHandle,
+    parent_id: Uuid,
+    serial: String,
+    package: String,
+    session_id: String,
+) -> Result<KernSightSessionReport, String> {
+    let group = capture_groups::selected(&app, parent_id, &serial, &package)?;
+    let id = Uuid::parse_str(&session_id).map_err(|e| e.to_string())?;
+    if !group.session_ids().contains(&id) {
+        return Err("子会话不属于所选parent".into());
+    }
+    let paths = runtime_paths_from_group(Some(&group))?;
+    require_runtime_paths(&serial, paths.as_ref()).await?;
+    get_kernsight_session_report_scoped(serial, session_id, paths.as_ref()).await
+}
+async fn get_kernsight_session_report_scoped(
+    serial: String,
+    session_id: String,
+    paths: Option<&runtime_paths::RuntimePaths>,
+) -> Result<KernSightSessionReport, String> {
     let session_id = Uuid::parse_str(&session_id)
         .map_err(|error| format!("KernSight session UUID 无效：{error}"))?;
-    let mut connection = KernSightConnection::connect(&serial).await?;
+    let mut connection = KernSightConnection::connect_scoped(&serial, paths).await?;
     let request_id = Uuid::new_v4();
     connection
         .send(&Message::ReplayBatches(ReplayBatches {
@@ -1378,11 +1442,52 @@ pub async fn start_kernsight_staged_capture(
     start_kernsight_capture(request).await
 }
 
+fn capture_launch_command(
+    mut command: String,
+    code_only: bool,
+    launch: bool,
+    has_relation: bool,
+    hide_debug: bool,
+    package: Option<&str>,
+) -> Result<String, String> {
+    if !launch {
+        return Ok(command);
+    }
+    let package = package.ok_or("启动采集必须选择一个包")?;
+    if has_relation {
+        if hide_debug {
+            return Err("parent 启动要求关闭 hide-debug".into());
+        }
+        command.push_str(" --launch-after-attach");
+    } else if code_only {
+        return Err("code-only 启动要求 parent attempt lease".into());
+    } else {
+        command = format!("am force-stop {package}; (sleep 2; monkey -p {package} -c android.intent.category.LAUNCHER 1 >/dev/null 2>&1) & {command}");
+    }
+    Ok(command)
+}
+
 #[tauri::command]
 pub async fn start_kernsight_capture(
     request: KernSightCaptureRequest,
 ) -> Result<KernSightCaptureResult, String> {
     validate_serial(&request.serial)?;
+    require_runtime_paths(&request.serial, request.runtime_paths.as_ref()).await?;
+    if request.runtime_paths.is_some()
+        && (request.capture_relation.is_none()
+            || request.hide_debug
+            || request.mirror_burp.is_some())
+    {
+        return Err("隔离模式仅支持父会话，关闭hide-debug/mirror".into());
+    }
+    capture_launch_command(
+        String::new(),
+        request.code_only,
+        request.launch_after_attach,
+        request.capture_relation.is_some(),
+        request.hide_debug,
+        request.package.as_deref(),
+    )?;
     let stages = request.inspect_stages.as_deref();
     stage_policy::validate_mode(
         stages,
@@ -1397,6 +1502,59 @@ pub async fn start_kernsight_capture(
             || request.inspect_adapter.is_some()
             || request.mirror_burp.is_some(),
     )?;
+    if request.code_only {
+        require_code_scope_capability(&request.serial, request.runtime_paths.as_ref()).await?;
+        let help = run_device_root_script(
+            &request.serial,
+            &runtime_paths::route(
+                request.runtime_paths.as_ref(),
+                &format!("{KSIGHT_AGENT} capture --help"),
+            )?,
+        )
+        .await?;
+        if help.code != Some(0)
+            || !help.stdout.contains("--code-only")
+            || !help.stdout.contains("--output-budget-bytes")
+            || (request.launch_after_attach && !help.stdout.contains("--launch-after-attach"))
+        {
+            return Err("设备 agent 缺明确范围/输出预算能力，未启动；不降级为旧宽采集".into());
+        }
+    }
+    if let Some(r) = request.capture_relation.as_ref() {
+        require_parent_lifecycle_capability(&request.serial, request.runtime_paths.as_ref())
+            .await?;
+        if request.hide_debug
+            || request.collect_keys
+            || request.collect_memory_windows
+            || request.collect_private
+        {
+            return Err(
+                "此 parent 生命周期暂不支持 hide-debug/独立额外采集；普通阶段可单独运行".into(),
+            );
+        }
+        if r.parent_id.is_nil()
+            || r.stage_id.is_nil()
+            || r.attempt_id.is_nil()
+            || r.attempt == 0
+            || !["l0", "l1", "linker"].contains(&r.stage_key.as_str())
+        {
+            return Err("无效阶段关联参数".into());
+        }
+        let help = run_device_root_script(
+            &request.serial,
+            &runtime_paths::route(
+                request.runtime_paths.as_ref(),
+                &format!("{KSIGHT_AGENT} capture --help"),
+            )?,
+        )
+        .await?;
+        if help.code != Some(0)
+            || !help.stdout.contains("--parent-session")
+            || (request.launch_after_attach && !help.stdout.contains("--launch-after-attach"))
+        {
+            return Err("设备 agent 不支持父子会话；未启动，不降级混入旧会话".into());
+        }
+    }
     if request.sample_one_in == 0 || request.sample_one_in > 10_000 {
         return Err("采样倍率必须在 1 到 10000 之间".into());
     }
@@ -1449,9 +1607,14 @@ pub async fn start_kernsight_capture(
     }
     if stages.is_some() {
         // Capability check is read-only and precedes any force-stop or capture.
-        let help =
-            run_device_root_script(&request.serial, &format!("{KSIGHT_AGENT} capture --help"))
-                .await?;
+        let help = run_device_root_script(
+            &request.serial,
+            &runtime_paths::route(
+                request.runtime_paths.as_ref(),
+                &format!("{KSIGHT_AGENT} capture --help"),
+            )?,
+        )
+        .await?;
         if help.code != Some(0) || !help.stdout.contains("--inspect-stages") {
             return Err("设备 ksightd 未证明支持 --inspect-stages；统一会话未启动。可显式选择旧版启动重采模式，不能静默降级".into());
         }
@@ -1519,6 +1682,65 @@ pub async fn start_kernsight_capture(
         "--batch-events 64".into(),
         "--quiet".into(),
     ];
+    if request.code_only {
+        args.push("--code-only".into());
+    }
+    if request.collect_keys {
+        args.push("--collect-keys".into());
+    }
+    if request.collect_memory_windows {
+        args.push("--collect-memory-windows".into());
+    }
+    match (request.output_budget_bytes, request.output_budget_ms) {
+        (Some(n), Some(t)) => args.push(format!(
+            "--output-budget-bytes {n} --output-budget-ms {}",
+            session_deadline::remaining_ms(t)?
+        )),
+        (None, None) => {}
+        _ => return Err("写盘预算缺字节/期限".into()),
+    }
+    if let Some(r) = request.capture_relation.as_ref() {
+        args.push(format!(
+            "--parent-session {} --stage-id {} --stage-attempt {} --attempt-id {} --stage-key {}",
+            r.parent_id, r.stage_id, r.attempt, r.attempt_id, r.stage_key
+        ));
+    }
+    if let Some(links) = request.capture_relations.as_ref() {
+        let Some(primary) = request.capture_relation.as_ref() else {
+            return Err("stage links 缺主关联".into());
+        };
+        if links.len() != 3
+            || request.inspect_stages.is_none()
+            || links.iter().any(|r| {
+                r.parent_id != primary.parent_id
+                    || r.attempt == 0
+                    || !["l0", "l1", "linker"].contains(&r.stage_key.as_str())
+            })
+            || links
+                .iter()
+                .map(|r| &r.stage_key)
+                .collect::<BTreeSet<_>>()
+                .len()
+                != 3
+        {
+            return Err("无效 stage links".into());
+        }
+        let help = run_device_root_script(
+            &request.serial,
+            &runtime_paths::route(
+                request.runtime_paths.as_ref(),
+                &format!("{KSIGHT_AGENT} capture --help"),
+            )?,
+        )
+        .await?;
+        if help.code != Some(0) || !help.stdout.contains("--stage-links") {
+            return Err("设备不支持统一阶段父子合同；未启动，不降级".into());
+        }
+        args.push(format!(
+            "--stage-links {}",
+            crate::shell_quote(&serde_json::to_string(links).map_err(|e| e.to_string())?)
+        ));
+    }
     for (enabled, flag) in [
         (request.files, "--files"),
         (request.files_fd, "--files-fd"),
@@ -1561,15 +1783,15 @@ pub async fn start_kernsight_capture(
         };
         args.push(format!("--mirror-burp {target}"));
     }
-    let mut capture_command = args.join(" ");
-    if request.launch_after_attach {
-        let Some(package) = package else {
-            return Err("冷启动采集必须选择一个包".into());
-        };
-        capture_command = format!(
-            "am force-stop {package}; (sleep 2; monkey -p {package} -c android.intent.category.LAUNCHER 1 >/dev/null 2>&1) & {capture_command}"
-        );
-    }
+    let capture_command = capture_launch_command(
+        args.join(" "),
+        request.code_only,
+        request.launch_after_attach,
+        request.capture_relation.is_some(),
+        request.hide_debug,
+        package,
+    )?;
+    let capture_command = runtime_paths::route(request.runtime_paths.as_ref(), &capture_command)?;
     let command_preview = capture_command.replace(KSIGHT_AGENT, "ksightd");
     let started_unix_ms = now_millis();
 
@@ -1578,13 +1800,14 @@ pub async fn start_kernsight_capture(
             "{KSIGHT_HIDE_DEBUG} {} {capture_command}",
             request.duration_seconds
         );
-        let remote = format!("su -c \"{wrapped}\"");
-        let output = Command::new("adb")
-            .args(["-s", &request.serial, "shell", &remote])
-            .kill_on_drop(true)
-            .output()
-            .await
-            .map_err(|error| format!("无法启动 hide-debug 采集：{error}"))?;
+        let remote = format!("su -c {}", crate::shell_quote(&wrapped));
+        let mut command = Command::new("adb");
+        command.args(["-s", &request.serial, "shell", &remote]);
+        let output = session_deadline::output(
+            &mut command,
+            Duration::from_secs(request.duration_seconds.saturating_add(30)),
+        )
+        .await?;
         wait_for_adb_return(&request.serial, request.duration_seconds.saturating_add(25)).await?;
         let log = run_device_root_script(&request.serial, &format!("cat {KSIGHT_CAPTURE_LOG}"))
             .await
@@ -1596,28 +1819,22 @@ pub async fn start_kernsight_capture(
             output.status.code(),
         )
     } else {
-        let remote = format!("su -c \"{capture_command}\"");
+        let remote = format!("su -c {}", crate::shell_quote(&capture_command));
         let capture_timeout = Duration::from_secs(request.duration_seconds.saturating_add(30));
-        let output = timeout(
-            capture_timeout,
-            Command::new("adb")
-                .args(["-s", &request.serial, "shell", &remote])
-                .kill_on_drop(true)
-                .output(),
-        )
-        .await
-        .map_err(|_| {
-            "KernSight 采集超过预期时长；设备端 watchdog/lease 会保留完整性状态".to_string()
-        })?
-        .map_err(|error| format!("无法启动 KernSight 采集：{error}"))?;
+        let mut command = Command::new("adb");
+        command.args(["-s", &request.serial, "shell", &remote]);
+        let output = session_deadline::output(&mut command, capture_timeout).await?;
         (
             String::from_utf8_lossy(&output.stdout).trim().to_string(),
             String::from_utf8_lossy(&output.stderr).trim().to_string(),
             output.status.code(),
         )
     };
-    let session_id = extract_session_id(&format!("{stdout}\n{stderr}"))
-        .or(read_last_session_id(&request.serial).await);
+    let mut session_id = extract_session_id(&format!("{stdout}\n{stderr}"));
+    // Keep the legacy bridge fallback; parent captures must never guess identity.
+    if request.capture_relation.is_none() && session_id.is_none() {
+        session_id = read_last_session_id(&request.serial).await;
+    }
     if session_id.is_none() {
         return Err(format!(
             "采集命令结束但没有生成 session id。stdout={stdout} stderr={stderr}"
@@ -1883,7 +2100,7 @@ pub async fn start_kernsight_mirror(
         );
     }
     let command_preview = capture_command.replace(KSIGHT_AGENT, "ksightd");
-    let remote = format!("su -c \"{capture_command}\"");
+    let remote = format!("su -c {}", crate::shell_quote(&capture_command));
     let mut child = Command::new("adb")
         .args(["-s", &request.serial, "shell", &remote])
         .stdout(Stdio::piped())
@@ -2078,9 +2295,45 @@ pub async fn dump_kernsight_package(
     prefer_live: bool,
     require_live: Option<bool>,
 ) -> Result<KernSightCaptureResult, String> {
+    dump_kernsight_package_scoped(
+        serial,
+        package,
+        hide_debug,
+        prefer_live,
+        require_live,
+        None,
+        None,
+    )
+    .await
+}
+async fn dump_kernsight_package_scoped(
+    serial: String,
+    package: String,
+    hide_debug: bool,
+    prefer_live: bool,
+    require_live: Option<bool>,
+    relation: Option<capture_groups::Relation>,
+    scope: Option<&KernSightCaptureRequest>,
+) -> Result<KernSightCaptureResult, String> {
+    let paths = scope.and_then(|s| s.runtime_paths.as_ref());
+    require_runtime_paths(&serial, paths).await?;
     validate_serial(&serial)?;
     validate_package(&package)?;
-    let remote = format!("{KSIGHT_PACKAGES}/{package}");
+    if relation.is_some() {
+        require_parent_lifecycle_capability(&serial, paths).await?;
+    }
+    if scope.is_some_and(|s| s.code_only) {
+        require_code_scope_capability(&serial, paths).await?;
+    }
+    let remote = relation.as_ref().map_or_else(
+        || format!("{KSIGHT_PACKAGES}/{package}"),
+        |r| {
+            format!(
+                "/data/local/tmp/ksight/captures/{}/{}/{}/dump",
+                r.parent_id, r.stage_id, r.attempt_id
+            )
+        },
+    );
     let live = if prefer_live {
         run_device_root_script(&serial, &format!("pidof {package}"))
             .await
@@ -2091,9 +2344,62 @@ pub async fn dump_kernsight_package(
     // Decide before removing the previous dump directory or launching anything.
     let launch_flag =
         dump_policy::dump_launch_flag(prefer_live, require_live.unwrap_or(false), live)?;
+    if relation.is_some() {
+        let help = run_device_root_script(
+            &serial,
+            &runtime_paths::route(paths, &format!("{KSIGHT_AGENT} dump-package --help"))?,
+        )
+        .await?;
+        if help.code != Some(0)
+            || !help.stdout.contains("--parent-session")
+            || (scope.is_some_and(|r| r.code_only)
+                && (!help.stdout.contains("--code-only")
+                    || !help.stdout.contains("--output-budget-bytes")))
+        {
+            return Err("设备 dump 不支持父子会话；未启动".into());
+        }
+    }
+    let prefix = if relation.is_some() {
+        format!("test ! -e {remote} && mkdir -p {remote}")
+    } else {
+        format!("rm -rf {remote} && mkdir -p {remote}")
+    };
     let mut dump = format!(
-        "rm -rf {remote} && mkdir -p {remote} && {KSIGHT_AGENT} dump-package --package {package} --dest {remote}{launch_flag}"
+        "{prefix} && {KSIGHT_AGENT} dump-package --package {package} --dest {remote}{launch_flag}"
     );
+    if let Some(r) = relation.as_ref() {
+        dump.push_str(&format!(" --parent-session {} --stage-id {} --stage-attempt {} --attempt-id {} --stage-key dump",r.parent_id,r.stage_id,r.attempt,r.attempt_id));
+    }
+    if let Some(s) = scope {
+        if relation.is_some() {
+            let sources = s
+                .expected_code_sources
+                .as_ref()
+                .ok_or("前一阶段具体实例资格缺失；不按 pidof 推测 dump 来源")?;
+            dump.push_str(&format!(
+                " --expected-code-sources {}",
+                crate::shell_quote(&serde_json::to_string(sources).map_err(|e| e.to_string())?)
+            ));
+        }
+        if s.code_only {
+            dump.push_str(" --code-only");
+        }
+        if s.collect_keys {
+            dump.push_str(" --collect-keys");
+        }
+        if s.collect_private {
+            dump.push_str(" --collect-private");
+        }
+        if s.collect_memory_windows {
+            dump.push_str(" --collect-memory-windows");
+        }
+        if let (Some(n), Some(t)) = (s.output_budget_bytes, s.output_budget_ms) {
+            dump.push_str(&format!(
+                " --output-budget-bytes {n} --output-budget-ms {}",
+                session_deadline::remaining_ms(t)?
+            ));
+        }
+    }
     if hide_debug {
         dump.push_str(" --hide-debug");
     }
@@ -2102,20 +2408,14 @@ pub async fn dump_kernsight_package(
         if hide_debug { " --hide-debug" } else { "" }
     );
     let started_unix_ms = now_millis();
-    let remote_shell = format!("su -c \"{dump}\"");
-    let output = timeout(
-        Duration::from_secs(600),
-        Command::new("adb")
-            .args(["-s", &serial, "shell", &remote_shell])
-            .kill_on_drop(true)
-            .output(),
-    )
-    .await
-    .map_err(|_| "L2 dump 超过 10 分钟".to_string())?
-    .map_err(|error| format!("无法启动 dump-package：{error}"))?;
+    let dump = runtime_paths::route(paths, &dump)?;
+    let remote_shell = crate::root_shell_command(&dump);
+    let mut command = Command::new("adb");
+    command.args(["-s", &serial, "shell", &remote_shell]);
+    let output = session_deadline::output(&mut command, Duration::from_secs(600)).await?;
     let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
     let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-    if !output.status.success() {
+    if !output.status.success() && relation.is_none() {
         return Err(format!("dump-package 失败：{stderr}{stdout}"));
     }
     Ok(KernSightCaptureResult {
@@ -2196,7 +2496,14 @@ pub async fn get_kernsight_session_events(
 }
 
 async fn replay_session_events(serial: &str, session_id: Uuid) -> Result<Vec<Event>, String> {
-    let mut connection = KernSightConnection::connect(serial).await?;
+    replay_session_events_scoped(serial, session_id, None).await
+}
+async fn replay_session_events_scoped(
+    serial: &str,
+    session_id: Uuid,
+    paths: Option<&runtime_paths::RuntimePaths>,
+) -> Result<Vec<Event>, String> {
+    let mut connection = KernSightConnection::connect_scoped(serial, paths).await?;
     let request_id = Uuid::new_v4();
     connection
         .send(&Message::ReplayBatches(ReplayBatches {
@@ -2443,6 +2750,49 @@ pub async fn import_kernsight_evidence_directory(
         serde_json::json!({"schema_version":"mobilee.bounded-code-adapter/v1", "package":bounded["identity"]["package"],"bounded_code":bounded,
             "warnings":["有界安装代码容器采样，非完整进程或 package dump；旧成功/完整字段未填充"]})
     };
+    let transport_notes = std::fs::read_dir(&root)
+        .map_err(|e| e.to_string())?
+        .filter_map(Result::ok)
+        .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_file()))
+        .filter(|entry| {
+            entry.file_name().to_str().is_some_and(|name| {
+                name.starts_with("transport-partial-") && name.ends_with(".json")
+            })
+        })
+        .take(32)
+        .map(|entry| {
+            read_bounded_text(&entry.path(), 65536)
+                .and_then(|text| serde_json::from_str::<Value>(&text).map_err(|e| e.to_string()))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    if !transport_notes.is_empty() {
+        dump_report["mobilee_transport_status"] = serde_json::json!({"complete":false,"status":"partial","notes":transport_notes,"scope":"received local tree; original producer report preserved"});
+    }
+    let mut coverage_status = None;
+    for entry in std::fs::read_dir(&root)
+        .map_err(|e| e.to_string())?
+        .filter_map(Result::ok)
+        .filter(|e| e.file_type().is_ok_and(|t| t.is_file()))
+        .filter(|e| {
+            e.file_name().to_str().is_some_and(|n| {
+                n.starts_with("archive-content-references-") && n.ends_with(".json")
+            })
+        })
+        .take(32)
+    {
+        let note: Value =
+            serde_json::from_str(&read_bounded_text(&entry.path(), 64 * 1024 * 1024)?)
+                .map_err(|e| e.to_string())?;
+        let partial = note["archiveCoverage"]["status"] == "partial";
+        coverage_status = Some(if partial || coverage_status == Some("partial") {
+            "partial"
+        } else {
+            "unknown"
+        });
+    }
+    if let Some(status) = coverage_status {
+        dump_report["mobilee_archive_coverage"] = serde_json::json!({"status":status,"complete_collection":false,"scope":"archived retained paths; semantic and full collection coverage not attested"});
+    }
     let package = dump_report
         .get("package")
         .and_then(Value::as_str)
@@ -2451,7 +2801,7 @@ pub async fn import_kernsight_evidence_directory(
     validate_package(&package)?;
     enrich_local_dex_ownership(&mut dump_report, &package);
     let session_path = root.join("session-report.json");
-    let session_report = if session_path.is_file() {
+    let mut session_report: Option<Value> = if session_path.is_file() {
         Some(
             serde_json::from_str(&read_bounded_text(&session_path, 64 * 1024 * 1024)?)
                 .map_err(|error| format!("session-report.json 无效：{error}"))?,
@@ -2459,6 +2809,21 @@ pub async fn import_kernsight_evidence_directory(
     } else {
         None
     };
+    if let Some(group) = capture_groups::read_import(&root)? {
+        if group.package != package {
+            return Err("主会话清单和 dump 包归属冲突".into());
+        }
+        let value = session_report.get_or_insert_with(|| serde_json::json!({}));
+        value["mobilee_capture_group"] = serde_json::to_value(&group).map_err(|e| e.to_string())?;
+        value["mobilee_capture_edges"] = serde_json::json!(group.evidence_edges());
+        value["mobilee_capture_source_status"] =
+            serde_json::json!(if root.join("capture-relation.json").is_file() {
+                "agent_relation_matched"
+            } else {
+                "unknown_missing_agent_relation"
+            });
+        value["mobilee_session_scope"] = serde_json::json!("explicit-parent-session-ids");
+    }
     let capture_text = std::fs::read_to_string(root.join("CAPTURE.txt")).unwrap_or_default();
     let (file_count, total_bytes, mut files) = local_tree_stats(&root, 50_000)?;
     dump_report["local_storage_accounting"] = storage_evidence::account(
@@ -2468,6 +2833,59 @@ pub async fn import_kernsight_evidence_directory(
             .map(|file| (file.relative_path.clone(), file.bytes))
             .collect::<Vec<_>>(),
     );
+    let static_identity_records = read_bounded_text(&root.join("static-references.json"), 16384)
+        .ok().and_then(|text|serde_json::from_str::<Value>(&text).ok())
+        .and_then(|v|v["objects"].as_array().cloned()).unwrap_or_default()
+        .into_iter().take(16).map(|v|serde_json::json!({"apk_sha256":v["sha256"],"source_path":v["source"],"producer_status":v["status"],"verification":"producer_reference; APK bytes not rechecked by this import"})).collect::<Vec<_>>();
+    let mut indexed_static_sets = dump_report["dex_sets"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    if let Ok(text) = read_bounded_text(&root.join("runtime-dex-verification.json"), 16384) {
+        if let Ok(note) = serde_json::from_str::<Value>(&text) {
+            if note["schema"] == "kernsight.actual-runtime-dex-readback/v1"
+                && note["static_full_bytes_equal"] == true
+                && dump_report["local_storage_accounting"]["runtime_observations"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .any(|row| {
+                        row["source"] == note["source"]
+                            && row["read"]["sha256"] == note["read"]["sha256"]
+                            && row["object_inspection"]["derived_objects"]
+                                .as_array()
+                                .into_iter()
+                                .flatten()
+                                .any(|dex| {
+                                    dex["sha256"] == note["static_sha256"]
+                                        && dex["length"] == note["dex_bytes"]
+                                })
+                    })
+            {
+                indexed_static_sets.push(serde_json::json!({"sha256":note["static_sha256"],"bytes":note["dex_bytes"],"source_kind":"static_comparison_reference","canonical_relative_path":null,"observations":[{"comparison_record":"runtime-dex-verification.json","apk_identity_records":static_identity_records,"scope":"earlier retained APK DEX; imported local comparison assertion, static bytes not rehashed here","package":package,"parent_instance":null}]}));
+            }
+        }
+    }
+    dump_report["content_dex_class_index"] = dex_class_index::objects(
+        dump_report["local_storage_accounting"]["runtime_observations"]
+            .as_array()
+            .map(Vec::as_slice)
+            .unwrap_or_default(),
+        &serde_json::json!(indexed_static_sets),
+        &package,
+        &dump_report["registered_component_classes"],
+        &session_report
+            .as_ref()
+            .map(|r| r["mobilee_capture_group"]["id"].clone())
+            .unwrap_or(Value::Null),
+    );
+    if let Some(report) = session_report
+        .as_mut()
+        .filter(|r| r.get("mobilee_capture_group").is_some())
+    {
+        report["mobilee_capture_accounting"] = dump_report["local_storage_accounting"].clone();
+        report["mobilee_capture_accounting_scope"]=serde_json::json!("this imported artifact tree only; no child-stage byte summation; unverified content remains unknown");
+    }
     if let Some(observations) = dump_report["local_storage_accounting"]["observations"].as_array() {
         for file in &mut files {
             file.code_evidence = observations
@@ -2488,6 +2906,17 @@ pub async fn import_kernsight_evidence_directory(
                     note["ownership"] = serde_json::json!({"category":entry["category"],"confidence":entry["confidence"],"reasons":entry["reasons"],"basis":"DEX class namespace samples; inferred, not verified company ownership"});
                 }
             }
+        }
+    }
+    if let Some(ranges) = dump_report["local_storage_accounting"]["runtime_observations"].as_array()
+    {
+        for file in &mut files {
+            file.code_evidence.extend(
+                ranges
+                    .iter()
+                    .filter(|note| note["relative_path"].as_str() == Some(&file.relative_path))
+                    .cloned(),
+            );
         }
     }
     if let Some(ranges) = dump_report["bounded_code"]["ranges"].as_array() {
@@ -2753,7 +3182,14 @@ fn collect_archive_files(root: &Path) -> Result<Vec<(PathBuf, String, u64)>, Str
                 .file_type()
                 .map_err(|error| format!("无法读取证据目录项类型：{error}"))?;
             if file_type.is_symlink() {
-                continue;
+                return Err("证据目录含符号链接；未跳过来源或读取目录外内容".into());
+            }
+            if entry
+                .file_type()
+                .map_err(|error| error.to_string())?
+                .is_symlink()
+            {
+                return Err("证据目录含符号链接；请使用保留原始来源的普通文件目录".into());
             }
             if entry
                 .file_type()
@@ -2793,6 +3229,10 @@ fn collect_archive_files(root: &Path) -> Result<Vec<(PathBuf, String, u64)>, Str
 }
 
 fn write_kernsight_evidence_archive(root: &Path, output: &Path) -> Result<(), String> {
+    archive_objects::write(root, output)
+}
+#[cfg(test)]
+fn write_kernsight_evidence_archive_v1(root: &Path, output: &Path) -> Result<(), String> {
     if !root.join("dump-report.json").is_file() {
         return Err("所选目录缺少 dump-report.json".into());
     }
@@ -2828,6 +3268,9 @@ fn write_kernsight_evidence_archive(root: &Path, output: &Path) -> Result<(), St
         "dumpId": dump_report.get("dump_id").and_then(Value::as_str),
         "agentVersion": dump_report.get("agent_version").and_then(Value::as_str),
         "fileCount": files.len(),
+        "storageRepresentation":"expanded-logical-files/v1",
+        "hardLinksPreserved":false,
+        "physicalBytes":"unknown-until-local-stat",
         "uncompressedBytes": files.iter().map(|item| item.2).sum::<u64>(),
     });
     writer
@@ -2888,7 +3331,9 @@ pub fn export_kernsight_evidence_archive(
     if output.file_name().is_none() {
         return Err(format!("输出文件名无效：{}", output.display()));
     }
-    write_kernsight_evidence_archive(&root, &output)?;
+    archive_objects::write_local_retained(&root, &output)?;
+    archive_objects::restore_from_export_source(&output, &root)
+        .map_err(|e| format!("归档已保存，但本地对象复用未确认（可保留归档单独导入）：{e}"))?;
     Ok(output.to_string_lossy().into_owned())
 }
 
@@ -2899,6 +3344,14 @@ pub async fn import_kernsight_evidence_archive(
     let archive_path = PathBuf::from(path.trim());
     if !archive_path.is_absolute() || !archive_path.is_file() {
         return Err("请选择有效的 MobileE 案例文件绝对路径".into());
+    }
+    if archive_objects::is_v2(&archive_path)? {
+        let root = archive_objects::restore(&archive_path)?;
+        let result = import_kernsight_evidence_directory(root.to_string_lossy().into_owned()).await;
+        if result.is_err() {
+            let _ = std::fs::remove_dir_all(root.parent().unwrap());
+        }
+        return result;
     }
     let file = File::open(&archive_path).map_err(|error| format!("无法打开证据包：{error}"))?;
     let mut archive =
@@ -2955,8 +3408,15 @@ pub async fn import_kernsight_evidence_archive(
         }
         let mut target =
             File::create(&output).map_err(|error| format!("无法解压证据文件：{error}"))?;
-        std::io::copy(&mut entry, &mut target)
-            .map_err(|error| format!("无法解压证据文件：{error}"))?;
+        if entry.unix_mode().is_some_and(|m| m & 0o170000 == 0o120000) {
+            return Err("旧归档含符号链接，拒绝".into());
+        }
+        let expected = entry.size();
+        let copied = std::io::copy(&mut entry.take(expected.saturating_add(1)), &mut target)
+            .map_err(|e| e.to_string())?;
+        if copied != expected {
+            return Err("旧归档短读/膨胀长度错误，原归档保留".into());
+        }
     }
     if !manifest_valid {
         let _ = std::fs::remove_dir_all(&extraction_root);
@@ -2971,6 +3431,70 @@ pub async fn pull_kernsight_package_evidence(
     package: String,
     destination: String,
 ) -> Result<KernSightLocalEvidenceBundle, String> {
+    pull_kernsight_package_evidence_scoped(serial, package, destination, None, None).await
+}
+fn runtime_paths_from_group(
+    group: Option<&capture_groups::Group>,
+) -> Result<Option<runtime_paths::RuntimePaths>, String> {
+    group
+        .and_then(|g| g.base.get("runtimePaths"))
+        .filter(|v| !v.is_null())
+        .map(|v| serde_json::from_value(v.clone()).map_err(|e| e.to_string()))
+        .transpose()
+}
+fn reuse_verified_transfer(
+    source: &Path,
+    destination: &Path,
+    bytes: u64,
+    hash: &str,
+) -> Result<bool, String> {
+    if std::fs::symlink_metadata(source)
+        .map_err(|e| e.to_string())?
+        .file_type()
+        .is_symlink()
+        || storage_evidence::hash_file(source, bytes).as_deref() != Some(hash)
+    {
+        return Ok(false);
+    }
+    session_budget::charge(destination, 0).map_err(|e| e.to_string())?;
+    if let Some(parent) = destination.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
+    if destination.exists() {
+        return Err("内容引用目标已存在，不覆盖".into());
+    }
+    match std::fs::hard_link(source, destination) {
+        Ok(()) => Ok(true),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Err(e.to_string()),
+        Err(_) => Ok(false),
+    }
+}
+
+async fn pull_kernsight_package_evidence_scoped(
+    serial: String,
+    package: String,
+    destination: String,
+    remote_override: Option<String>,
+    paths: Option<&runtime_paths::RuntimePaths>,
+) -> Result<KernSightLocalEvidenceBundle, String> {
+    pull_kernsight_package_evidence_with_objects(
+        serial,
+        package,
+        destination,
+        remote_override,
+        paths,
+        BTreeMap::new(),
+    )
+    .await
+}
+async fn pull_kernsight_package_evidence_with_objects(
+    serial: String,
+    package: String,
+    destination: String,
+    remote_override: Option<String>,
+    paths: Option<&runtime_paths::RuntimePaths>,
+    known_objects: BTreeMap<(String, u64), PathBuf>,
+) -> Result<KernSightLocalEvidenceBundle, String> {
     validate_serial(&serial)?;
     validate_package(&package)?;
     let destination = PathBuf::from(destination.trim());
@@ -2979,7 +3503,7 @@ pub async fn pull_kernsight_package_evidence(
     }
     std::fs::create_dir_all(&destination)
         .map_err(|error| format!("无法创建本地拉取目录：{error}"))?;
-    let remote = format!("{KSIGHT_PACKAGES}/{package}");
+    let remote = remote_override.unwrap_or_else(|| format!("{KSIGHT_PACKAGES}/{package}"));
     let remote_report_path = format!("{remote}/dump-report.json");
     let report_output =
         run_device_root_script(&serial, &format!("cat {remote_report_path}")).await?;
@@ -3032,6 +3556,105 @@ pub async fn pull_kernsight_package_evidence(
                 "目标目录已保存另一轮包证据（{local_dump_id}），为避免新旧文件混合，请选择一个新的空目录"
             ));
         }
+        // Existing evidence is read-only. Avoid adb nesting another source
+        // directory into an already populated target on repeated pulls.
+        return import_kernsight_evidence_directory(local_root.to_string_lossy().into_owned())
+            .await;
+    }
+
+    if paths.is_some() || remote.starts_with("/data/local/tmp/ksight/captures/") {
+        let inventory = run_device_root_script(
+            &serial,
+            &format!(
+                "{} evidence-inventory --root {}",
+                runtime_paths::route(paths, &format!("{KSIGHT_AGENT} "))?,
+                crate::shell_quote(&remote)
+            ),
+        )
+        .await?;
+        if inventory.code != Some(0) {
+            return Err("agent 缺安全逐文件清单能力，未执行旧 adb 整目录拉取".into());
+        }
+        let note: Value = serde_json::from_str(&inventory.stdout).map_err(|e| e.to_string())?;
+        if note["schema"] != "kernsight.evidence-inventory/v1" {
+            return Err("清单 schema 未确认".into());
+        }
+        let rows = note["files"].as_array().ok_or("清单缺原路径")?;
+        if rows.len() > 100000 {
+            return Err("清单文件数超限".into());
+        }
+        let mut seen = BTreeSet::new();
+        let mut logical = 0u64;
+        for row in rows {
+            let rel = row["path"].as_str().ok_or("无来源路径")?;
+            validate_evidence_relative_path(rel)?;
+            if !seen.insert(rel) {
+                return Err("清单重复路径".into());
+            }
+            let n = row["bytes"].as_u64().ok_or("无实际源长度")?;
+            logical = logical.checked_add(n).ok_or("清单大小溢出")?;
+            let hash = row["sha256"].as_str().ok_or("无完整内容 hash")?;
+            if hash.len() != 64
+                || !hash
+                    .bytes()
+                    .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+            {
+                return Err("无效源 hash".into());
+            }
+        }
+        if logical > MAX_EVIDENCE_ARCHIVE_BYTES || note["logical_bytes"].as_u64() != Some(logical) {
+            return Err("清单总量不可信".into());
+        }
+        let mut verified_transfer_objects = known_objects;
+        for row in rows {
+            let rel = row["path"].as_str().unwrap();
+            let content_key = (
+                row["sha256"].as_str().unwrap().to_owned(),
+                row["bytes"].as_u64().unwrap(),
+            );
+            let destination = local_root.join(rel);
+            if let Some(prior) = verified_transfer_objects.get(&content_key) {
+                if reuse_verified_transfer(prior, &destination, content_key.1, &content_key.0)? {
+                    continue;
+                }
+            }
+            let source = format!("{remote}/{rel}");
+            let cmd = format!("cat {}", crate::shell_quote(&source));
+            let remote_shell = crate::root_shell_command(&cmd);
+            let mut child = Command::new("adb")
+                .args(["-s", &serial, "exec-out", &remote_shell])
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::null())
+                .kill_on_drop(true)
+                .spawn()
+                .map_err(|e| e.to_string())?;
+            let reader = child.stdout.take().ok_or("无传输管道")?;
+            timeout(
+                Duration::from_secs(120),
+                session_budget::stream_verified(
+                    reader,
+                    &local_root.join(rel),
+                    row["bytes"].as_u64().unwrap(),
+                    row["sha256"].as_str().unwrap(),
+                ),
+            )
+            .await
+            .map_err(|_| {
+                format!(
+                    "逐文件传输期限耗尽，partial 保留于 {}",
+                    local_root.display()
+                )
+            })??;
+            if !child.wait().await.map_err(|e| e.to_string())?.success() {
+                return Err(format!(
+                    "源读取失败，已保存证据保留于 {}",
+                    local_root.display()
+                ));
+            }
+            verified_transfer_objects.insert(content_key, destination);
+        }
+        return import_kernsight_evidence_directory(local_root.to_string_lossy().into_owned())
+            .await;
     }
 
     // `ksightctl pull-package` always performs dump-package first. This action
@@ -3045,7 +3668,7 @@ pub async fn pull_kernsight_package_evidence(
             format!("无法读取手机端已存信息：{}", chmod.stderr)
         });
     }
-    let destination_text = destination.to_string_lossy().into_owned();
+    let destination_text = local_root.to_string_lossy().into_owned();
     let pull = crate::run_device_adb_with_timeout(
         &serial,
         &["pull", &remote, &destination_text],
@@ -3076,10 +3699,36 @@ pub async fn pull_kernsight_package_evidence(
 
 #[tauri::command]
 pub async fn pull_kernsight_package_archive(
+    app: tauri::AppHandle,
+    parent_id: Option<Uuid>,
     serial: String,
     package: String,
     output_path: String,
 ) -> Result<KernSightLocalEvidenceBundle, String> {
+    let groups = parent_id.map(|_| capture_groups::root(&app)).transpose()?;
+    pull_kernsight_package_archive_at(groups, parent_id, serial, package, output_path).await
+}
+async fn pull_kernsight_package_archive_at(
+    group_root: Option<PathBuf>,
+    parent_id: Option<Uuid>,
+    serial: String,
+    package: String,
+    output_path: String,
+) -> Result<KernSightLocalEvidenceBundle, String> {
+    let mut group = parent_id
+        .map(|id| {
+            capture_groups::selected_at(
+                group_root.as_deref().ok_or("parent 根缺失")?,
+                id,
+                &serial,
+                &package,
+            )
+        })
+        .transpose()?;
+    let remote = group
+        .as_ref()
+        .map(capture_groups::export_root)
+        .transpose()?;
     let output = PathBuf::from(output_path.trim());
     if !output.is_absolute() {
         return Err("MobileE 证据包输出文件必须是绝对路径".into());
@@ -3089,56 +3738,151 @@ pub async fn pull_kernsight_package_archive(
             .map_err(|error| format!("无法创建证据输出目录：{error}"))?;
     }
     let mut partial_name = output.as_os_str().to_os_string();
-    partial_name.push(".part");
+    partial_name.push(format!(".progress-{}", Uuid::new_v4()));
     let partial = PathBuf::from(partial_name);
     std::fs::write(
         &partial,
         b"ME evidence transfer in progress. This file will be replaced atomically.\n",
     )
     .map_err(|error| format!("无法创建拉取进度文件：{error}"))?;
+    let allocations = if let Some(g) = group.as_mut() {
+        capture_groups::reserve_export_at(
+            group_root.as_deref().ok_or("parent 根缺失")?,
+            g,
+            &output,
+        )?
+    } else {
+        None
+    };
     let staging = std::env::temp_dir().join(format!("mobilee-pull-{}", Uuid::new_v4()));
     if let Err(error) = std::fs::create_dir_all(&staging) {
         let _ = std::fs::remove_file(&partial);
         return Err(format!("无法创建拉取缓存目录：{error}"));
     }
-    let bundle = pull_kernsight_package_evidence(
+    let transfer_guard = allocations
+        .as_ref()
+        .map(|a| {
+            session_budget::Guard::install(vec![staging.clone()], a.0.saturating_sub(65536), a.3)
+        })
+        .transpose()
+        .map_err(|e| e.to_string())?;
+    let bundle = pull_kernsight_package_evidence_scoped(
         serial.clone(),
         package.clone(),
         staging.to_string_lossy().into_owned(),
+        remote,
+        runtime_paths_from_group(group.as_ref())?.as_ref(),
     )
     .await;
     let bundle = match bundle {
         Ok(bundle) => bundle,
         Err(error) => {
-            let _ = std::fs::remove_dir_all(&staging);
+            if group.is_none() {
+                let _ = std::fs::remove_dir_all(&staging);
+            }
             let _ = std::fs::remove_file(&partial);
+            if let Some(g) = group.as_mut() {
+                if let Some(guard) = transfer_guard.as_ref() {
+                    let mut note =
+                        serde_json::to_value(guard.receipt()).map_err(|e| e.to_string())?;
+                    note["partial"] = serde_json::json!(true);
+                    capture_groups::settle_export_at(
+                        group_root.as_deref().ok_or("parent 根缺失")?,
+                        g,
+                        &output,
+                        "transfer",
+                        &note,
+                    )?;
+                    capture_groups::release_unstarted_export_at(
+                        group_root.as_deref().ok_or("parent 根缺失")?,
+                        g,
+                        &output,
+                        &["archive", "import"],
+                    )?;
+                    retain_transport_partial(&staging.join(&package), &package, g, &note, &error)?;
+                }
+                return Err(format!(
+                    "{error}；partial 已保留，可按本地目录导入：{}",
+                    staging.join(&package).display()
+                ));
+            }
             return Err(error);
         }
     };
     let session_result = timeout(
         Duration::from_secs(120),
-        append_device_sessions_to_package_evidence(&serial, &package, Path::new(&bundle.root)),
+        append_device_sessions_to_package_evidence(
+            &serial,
+            &package,
+            Path::new(&bundle.root),
+            group.as_ref(),
+        ),
     )
     .await;
     if session_result.is_err() {
-        let _ = std::fs::remove_dir_all(&staging);
+        if group.is_none() {
+            let _ = std::fs::remove_dir_all(&staging);
+        }
         let _ = std::fs::remove_file(&partial);
         return Err(format!(
             "包文件已拉取，但关联会话处理超过 120 秒；未生成不完整证据包"
         ));
     }
     if let Err(error) = session_result.expect("timeout result already checked") {
-        let _ = std::fs::remove_dir_all(&staging);
+        if group.is_none() {
+            let _ = std::fs::remove_dir_all(&staging);
+        }
         let _ = std::fs::remove_file(&partial);
         return Err(format!(
             "包文件已拉取，但无法读取手机端关联会话；未生成不完整证据包：{error}"
         ));
     }
-    if let Err(error) = write_kernsight_evidence_archive(Path::new(&bundle.root), &output) {
-        let _ = std::fs::remove_dir_all(&staging);
-        let _ = std::fs::remove_file(&partial);
-        return Err(error);
+    if let Some(g) = transfer_guard.as_ref() {
+        let note = serde_json::to_value(g.receipt()).map_err(|e| e.to_string())?;
+        if let Some(group) = group.as_mut() {
+            capture_groups::settle_export_at(
+                group_root.as_deref().ok_or("parent 根缺失")?,
+                group,
+                &output,
+                "transfer",
+                &note,
+            )?;
+        }
     }
+    drop(transfer_guard);
+    if let Some((_, archive_cap, import_cap, ms)) = allocations {
+        let mut note = serde_json::json!({"schema":"mobilee.archive-output-limits/v1","archive_bytes":archive_cap,"import_bytes":import_cap,"max_ms":ms,"deadline_unix_ms":group.as_ref().and_then(|g|g.budget.as_ref()).map(|b|b.deadline_unix_ms)});
+        note["parent_id"] = serde_json::json!(parent_id);
+        std::fs::write(
+            Path::new(&bundle.root).join("archive-output-limits.json"),
+            serde_json::to_vec(&note).map_err(|e| e.to_string())?,
+        )
+        .map_err(|e| e.to_string())?;
+    }
+    let archive_result = write_kernsight_evidence_archive(Path::new(&bundle.root), &output);
+    if let Some(g) = group.as_mut() {
+        let path = PathBuf::from(format!("{}.budget.json", output.display()));
+        if path.is_file() {
+            let note: Value = serde_json::from_str(&read_bounded_text(&path, 65536)?)
+                .map_err(|e| e.to_string())?;
+            capture_groups::settle_export_at(
+                group_root.as_deref().ok_or("parent 根缺失")?,
+                g,
+                &output,
+                "archive",
+                &note,
+            )?;
+        }
+    }
+    if let Err(error) = archive_result {
+        if group.is_none() {
+            let _ = std::fs::remove_dir_all(&staging);
+        }
+        let _ = std::fs::remove_file(&partial);
+        return Err(format!("{error}；已保存源目录仍可导入：{}", bundle.root));
+    }
+    archive_objects::share_fresh_pull(Path::new(&bundle.root), &output)
+        .map_err(|e| format!("v2 归档已保留，fresh 缓存共享未确认：{e}"))?;
     // The directory already contains the bytes represented by the newly written
     // archive. Re-index it in place instead of immediately extracting the archive
     // into a second multi-gigabyte cache.
@@ -3149,8 +3893,20 @@ async fn append_device_sessions_to_package_evidence(
     serial: &str,
     package: &str,
     evidence_root: &Path,
+    group: Option<&capture_groups::Group>,
 ) -> Result<(), String> {
-    let overview = get_kernsight_overview(serial.to_owned()).await?;
+    let Some(group) = group else {
+        session_budget::write(evidence_root.join("session-index.json"),serde_json::to_vec_pretty(&serde_json::json!({"schemaVersion":"mobilee.kernsight-package-sessions/v2","scope":"legacy-parent-unknown","includedSessions":[],"warning":"无父会话依据，未按包名推测或回放设备历史会话"})).map_err(|e|e.to_string())?).map_err(|e|e.to_string())?;
+        return Ok(());
+    };
+    group.validate()?;
+    session_budget::write(
+        evidence_root.join("capture-group.json"),
+        serde_json::to_vec_pretty(group).map_err(|e| e.to_string())?,
+    )
+    .map_err(|e| e.to_string())?;
+    let paths = runtime_paths_from_group(Some(group))?;
+    let selected_ids = group.session_ids();
     let sessions_root = evidence_root.join("sessions");
     std::fs::create_dir_all(&sessions_root)
         .map_err(|error| format!("无法创建 Session 证据目录：{error}"))?;
@@ -3159,9 +3915,34 @@ async fn append_device_sessions_to_package_evidence(
     let mut included_ids = Vec::new();
     let mut matched_ids = Vec::new();
     let mut failures = Vec::new();
-    for summary in overview.sessions {
-        let session_id = summary.session_id;
-        let events = match replay_session_events(serial, session_id).await {
+    for session_id in selected_ids.iter().copied() {
+        let remote = runtime_paths::route(
+            paths.as_ref(),
+            &format!("{KSIGHT_SPOOL}/{session_id}/capture-relation.json"),
+        )?;
+        let relation_result = async {
+            let result = run_device_root_script(
+                serial,
+                &format!("head -c 32769 {}", crate::shell_quote(&remote)),
+            )
+            .await?;
+            if result.code != Some(0) || result.stdout.len() > 32768 {
+                return Err("session 原始关联缺失/读取超预算，未回放".to_owned());
+            }
+            let note: Value = serde_json::from_str(&result.stdout)
+                .map_err(|e| format!("session 原始关联无效：{e}"))?;
+            capture_groups::verify_session_relation(group, session_id, &note)?;
+            Ok::<_, String>(result.stdout)
+        }
+        .await;
+        let relation_text = match relation_result {
+            Ok(text) => text,
+            Err(error) => {
+                failures.push(serde_json::json!({"sessionId":session_id,"error":error}));
+                continue;
+            }
+        };
+        let events = match replay_session_events_scoped(serial, session_id, paths.as_ref()).await {
             Ok(events) => events,
             Err(error) => {
                 failures.push(serde_json::json!({
@@ -3197,20 +3978,22 @@ async fn append_device_sessions_to_package_evidence(
                         })
             });
         if !belongs_to_package {
-            continue;
+            failures.push(serde_json::json!({"sessionId":session_id,"error":"父会话引用的子 session 尚无匹配包身份事件；保留父引用，未猜归属"}));
         }
         let session_dir = sessions_root.join(session_id.to_string());
         std::fs::create_dir_all(&session_dir)
             .map_err(|error| format!("无法创建 Session {session_id} 目录：{error}"))?;
+        session_budget::write(session_dir.join("capture-relation.json"), &relation_text)
+            .map_err(|e| format!("子 session 原始关联落盘失败：{e}"))?;
         let report_path = session_dir.join("session-report.json");
         let events_path = session_dir.join("events.json");
-        std::fs::write(
+        session_budget::write(
             &report_path,
             serde_json::to_vec_pretty(&report)
                 .map_err(|error| format!("无法编码 Session {session_id} 报告：{error}"))?,
         )
         .map_err(|error| format!("无法保存 Session {session_id} 报告：{error}"))?;
-        std::fs::write(
+        session_budget::write(
             &events_path,
             serde_json::to_vec(&events)
                 .map_err(|error| format!("无法编码 Session {session_id} 事件：{error}"))?,
@@ -3229,12 +4012,24 @@ async fn append_device_sessions_to_package_evidence(
         serde_json::to_value(aggregate_report).map_err(|error| error.to_string())?;
     if let Some(object) = aggregate_value.as_object_mut() {
         object.insert(
+            "execution_complete".into(),
+            serde_json::json!(
+                group.state == "succeeded"
+                    && failures.is_empty()
+                    && included_ids.len() == selected_ids.len()
+            ),
+        );
+        object.insert(
+            "mobilee_capture_execution_state".into(),
+            serde_json::json!(group.state),
+        );
+        object.insert(
             "mobilee_source_sessions".into(),
             serde_json::json!(matched_ids),
         );
         object.insert(
             "mobilee_session_scope".into(),
-            Value::String("all-package-associated-sessions-preserved-and-aggregated".into()),
+            Value::String("explicit-parent-session-ids".into()),
         );
         object.insert(
             "mobilee_included_sessions".into(),
@@ -3245,7 +4040,7 @@ async fn append_device_sessions_to_package_evidence(
             serde_json::json!(failures),
         );
     }
-    std::fs::write(
+    session_budget::write(
         evidence_root.join("session-report.json"),
         serde_json::to_vec_pretty(&aggregate_value)
             .map_err(|error| format!("无法编码汇总 Session 报告：{error}"))?,
@@ -3254,19 +4049,19 @@ async fn append_device_sessions_to_package_evidence(
     let index = serde_json::json!({
         "schemaVersion": "mobilee.kernsight-package-sessions/v1",
         "package": package,
-        "scannedSessions": overview.status.session_count,
+        "scannedSessions": selected_ids.len(),
         "includedSessions": included_ids,
         "matchedSessions": matched_ids,
         "failures": failures,
-        "scope": "完整保留所有能够关联到当前包的手机 Session；跳过其他 App 的会话",
+        "scope": "仅本主会话明确引用的子 session/attempt；不按包名混入其他轮次",
     });
-    std::fs::write(
+    session_budget::write(
         evidence_root.join("session-index.json"),
         serde_json::to_vec_pretty(&index)
             .map_err(|error| format!("无法编码 Session 索引：{error}"))?,
     )
     .map_err(|error| format!("无法保存 Session 索引：{error}"))?;
-    std::fs::write(
+    session_budget::write(
         evidence_root.join("capture.txt"),
         format!(
             "package={package}\nincluded_sessions={}\nmatched_sessions={}\nfailed_sessions={}\n",
@@ -3521,6 +4316,67 @@ fn local_tree_stats(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn code_only_launch_is_owned_and_legacy_startup_is_separate() {
+        let command = capture_launch_command(
+            "ksightd capture --code-only".into(),
+            true,
+            true,
+            true,
+            false,
+            Some("org.example.fixture"),
+        )
+        .unwrap();
+        assert_eq!(command, "ksightd capture --code-only --launch-after-attach");
+        assert_eq!(
+            capture_launch_command(
+                "capture".into(),
+                false,
+                true,
+                true,
+                false,
+                Some("org.example.fixture")
+            )
+            .unwrap(),
+            "capture --launch-after-attach"
+        );
+        for forbidden in ["sleep", "monkey", "force-stop", "&"] {
+            assert!(!command.contains(forbidden));
+        }
+        assert!(capture_launch_command(
+            "capture".into(),
+            true,
+            true,
+            false,
+            false,
+            Some("org.example.fixture")
+        )
+        .is_err());
+        assert!(capture_launch_command(
+            "capture".into(),
+            true,
+            true,
+            true,
+            true,
+            Some("org.example.fixture")
+        )
+        .is_err());
+        assert_eq!(
+            capture_launch_command("capture".into(), true, false, false, false, None).unwrap(),
+            "capture"
+        );
+        assert!(capture_launch_command(
+            "capture".into(),
+            false,
+            true,
+            false,
+            false,
+            Some("org.example.fixture")
+        )
+        .unwrap()
+        .contains("sleep 2"));
+    }
 
     fn values(text: &str) -> HashMap<String, String> {
         parse_probe_output(text)
@@ -3973,6 +4829,7 @@ mod tests {
             serde_json::to_string(&bundle).unwrap()
         );
     }
+
     #[test]
     fn old_capture_ipc_defaults_stages_to_none_and_new_field_is_not_dropped() {
         let old: KernSightCaptureRequest = serde_json::from_value(
@@ -3984,5 +4841,251 @@ mod tests {
         assert!(!old.memory_all);
         let new: KernSightCaptureRequest = serde_json::from_value(serde_json::json!({"serial":"offline-fixture","durationSeconds":120,"inspectStages":"l0:15,l1:90,linker:15"})).unwrap();
         assert_eq!(new.inspect_stages.as_deref(), Some("l0:15,l1:90,linker:15"));
+    }
+}
+
+pub(super) fn qualified_dump_sources(note: Option<&Value>, package: &str) -> Result<Value, String> {
+    let q = note
+        .and_then(|n| n.get("qualification"))
+        .ok_or("前一阶段实例资格缺失，来源未知")?;
+    if q["schema"] != "kernsight.qualified-source/v1" {
+        return Err("旧资格 schema 不当作已验证".into());
+    }
+    let n = note.unwrap();
+    if q["relation"] != n["relation"]
+        || q["token"] != n["token"]
+        || q["token"].as_str().is_none_or(str::is_empty)
+        || q["source"] != "MetadataObserver physical pidfd lease"
+    {
+        return Err("资格回执不属于此前具体生产者".into());
+    }
+    let sources = q["sources"].as_array().ok_or("资格 sources 缺失")?;
+    if sources.is_empty()
+        || sources.len() > 32
+        || sources.iter().any(|s| {
+            s["package"] != package
+                || s["pid"].as_u64().is_none_or(|v| v == 0)
+                || s["birth_ns"].as_u64().is_none_or(|v| v == 0)
+                || !s["uid"].is_u64()
+                || !s["exec_id"].is_u64()
+                || s["boot_id"].as_str().is_none_or(str::is_empty)
+        })
+    {
+        return Err("具体实例来源不完整或跨包，未启动 dump".into());
+    }
+    Ok(q["sources"].clone())
+}
+fn validate_parent_lifecycle_capability(code: Option<i32>, text: &str) -> Result<(), String> {
+    let note: Value =
+        serde_json::from_str(text).map_err(|_| "parent 生命周期能力未知；未操作目标")?;
+    if code != Some(0)
+        || note["schema"] != "kernsight.code-capabilities/v1"
+        || note["parent_lifecycle_supported"] != true
+        || note["lifecycle_schema"] != "kernsight.capture-lifecycle/v1"
+        || note["code_copy_pause"] != "forbidden"
+    {
+        return Err(
+            "parent 生命周期能力未知或旧 agent 仅支持 code-only lease；未启动，不降级旧后台 shell"
+                .into(),
+        );
+    }
+    // Code qualification is a separate feature. Its current refusal cannot block ordinary parent stages.
+    Ok(())
+}
+async fn require_runtime_paths(
+    serial: &str,
+    paths: Option<&runtime_paths::RuntimePaths>,
+) -> Result<(), String> {
+    if let Some(paths) = paths {
+        paths.validate()?;
+        let script = paths.route(&format!("{KSIGHT_AGENT} code-capabilities"))?;
+        let out = run_device_root_script(serial, &script).await?;
+        paths.check_capability(out.code, &out.stdout)?;
+    }
+    Ok(())
+}
+async fn require_parent_lifecycle_capability(
+    serial: &str,
+    paths: Option<&runtime_paths::RuntimePaths>,
+) -> Result<(), String> {
+    let out = run_device_root_script(
+        serial,
+        &runtime_paths::route(paths, &format!("{KSIGHT_AGENT} code-capabilities"))?,
+    )
+    .await?;
+    validate_parent_lifecycle_capability(out.code, &out.stdout)
+}
+fn validate_code_scope_capability(code: Option<i32>, text: &str) -> Result<(), String> {
+    let note: Value = serde_json::from_str(text).map_err(|_| "代码采集范围能力未知，未操作目标")?;
+    if code != Some(0)
+        || note["schema"] != "kernsight.code-capabilities/v1"
+        || note["supported"] != true
+    {
+        return Err(format!(
+            "代码一键范围门禁未通过；未 force-stop/启动/采样：{}",
+            note["reason"].as_str().unwrap_or("旧 agent 或身份范围未知")
+        ));
+    }
+    if note["lifecycle_schema"] != "kernsight.capture-lifecycle/v1"
+        || note["code_copy_pause"] != "forbidden"
+    {
+        return Err("代码采集范围能力未知：父生命周期/无暂停合同未验证，未操作目标".into());
+    }
+    Ok(())
+}
+async fn require_code_scope_capability(
+    serial: &str,
+    paths: Option<&runtime_paths::RuntimePaths>,
+) -> Result<(), String> {
+    let out = run_device_root_script(
+        serial,
+        &runtime_paths::route(paths, &format!("{KSIGHT_AGENT} code-capabilities"))?,
+    )
+    .await?;
+    validate_code_scope_capability(out.code, &out.stdout)
+}
+#[cfg(test)]
+mod code_scope_gate_tests {
+    use super::*;
+    #[test]
+    fn corrected_ordinary_parent_accepts_lifecycle_independent_of_code_gate_and_rejects_old_agent()
+    {
+        let current = serde_json::json!({"schema":"kernsight.code-capabilities/v1","supported":false,"parent_lifecycle_supported":true,"lifecycle_schema":"kernsight.capture-lifecycle/v1","code_copy_pause":"forbidden"}).to_string();
+        validate_parent_lifecycle_capability(Some(0), &current).unwrap();
+        assert!(validate_code_scope_capability(Some(0), &current).is_err());
+        assert!(validate_parent_lifecycle_capability(Some(0), "{}").is_err());
+        let old = serde_json::json!({"schema":"kernsight.code-capabilities/v1","supported":false,"lifecycle_schema":"kernsight.capture-lifecycle/v1","code_copy_pause":"forbidden"}).to_string();
+        assert!(validate_parent_lifecycle_capability(Some(0), &old).is_err());
+    }
+    #[test]
+    fn old_unknown_and_current_unverified_cannot_launch() {
+        assert!(validate_code_scope_capability(Some(0), "{}").is_err());
+        assert!(validate_code_scope_capability(Some(0),r#"{"schema":"kernsight.code-capabilities/v1","supported":false,"reason":"numeric TGID instance binding unverified"}"#).unwrap_err().contains("未 force-stop"));
+        assert!(validate_code_scope_capability(
+            Some(1),
+            r#"{"schema":"kernsight.code-capabilities/v1","supported":true}"#
+        )
+        .is_err());
+    }
+}
+
+fn retain_transport_partial(
+    root: &Path,
+    package: &str,
+    group: &capture_groups::Group,
+    note: &Value,
+    error: &str,
+) -> Result<(), String> {
+    std::fs::create_dir_all(root).map_err(|e| e.to_string())?;
+    let index=serde_json::to_vec(&serde_json::json!({"schema_version":"mobilee.kernsight-package-dump/v2","package":package,"dump_id":null,"collection_status":"partial","transport_partial":true,"source_parent_id":group.id,"artifacts":[],"warnings":["transport did not retain every declared path; raw partial files remain; source coverage unknown"]})).map_err(|e|e.to_string())?;
+    let terminal=serde_json::to_vec(&serde_json::json!({"schema":"mobilee.transport-partial/v1","source_parent_id":group.id,"budget":note,"reason":error.chars().take(4096).collect::<String>(),"coverage":"partial","original_paths":"complete received paths preserved; incomplete stream filenames marked partial"})).map_err(|e|e.to_string())?;
+    let full = serde_json::to_vec(group).map_err(|e| e.to_string())?;
+    if index.len() + terminal.len() + full.len() > 65536 {
+        return Err(format!(
+            "终态 metadata 超64KiB；原始 partial 保留于 {}，未宣称可完整索引",
+            root.display()
+        ));
+    }
+    if !root.join("dump-report.json").exists() {
+        std::fs::write(root.join("dump-report.json"), index).map_err(|e| e.to_string())?;
+    }
+    if !root.join("capture-group.json").exists() {
+        std::fs::write(root.join("capture-group.json"), full).map_err(|e| e.to_string())?;
+    }
+    std::fs::write(
+        root.join(format!("transport-partial-{}.json", Uuid::new_v4())),
+        terminal,
+    )
+    .map_err(|e| e.to_string())
+}
+#[cfg(test)]
+mod transfer_reference_tests {
+    use super::*;
+    #[test]
+    fn production_transfer_reference_reuses_only_complete_actual_hash_and_keeps_sources() {
+        let root = std::env::temp_dir().join(format!("transfer-ref-{}", Uuid::new_v4()));
+        std::fs::create_dir(&root).unwrap();
+        let mut a = vec![7_u8; 256];
+        let mut b = a.clone();
+        a[255] = 1;
+        b[255] = 2;
+        let source = root.join("source-a.bin");
+        std::fs::write(&source, &a).unwrap();
+        let hash = format!("{:x}", Sha256::digest(&a));
+        assert!(
+            reuse_verified_transfer(&source, &root.join("other-source.bin"), 256, &hash).unwrap()
+        );
+        assert!(!reuse_verified_transfer(
+            &source,
+            &root.join("different-tail.bin"),
+            256,
+            &format!("{:x}", Sha256::digest(&b))
+        )
+        .unwrap());
+        assert!(
+            !reuse_verified_transfer(&source, &root.join("truncated.bin"), 257, &hash).unwrap()
+        );
+        assert_eq!(std::fs::read(root.join("other-source.bin")).unwrap(), a);
+        assert!(
+            reuse_verified_transfer(&source, &root.join("other-source.bin"), 256, &hash).is_err()
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod partial_terminal_tests {
+    use super::*;
+    #[tokio::test]
+    async fn exhausted_transfer_terminal_import_preserves_raw_and_unknown() {
+        let root = std::env::temp_dir().join(format!("partial-import-{}", Uuid::new_v4()));
+        std::fs::create_dir(&root).unwrap();
+        std::fs::write(root.join("base.apk.partial"), b"raw prefix").unwrap();
+        let g:capture_groups::Group=serde_json::from_value(serde_json::json!({"schema":"mobilee.capture-group/v1","id":Uuid::new_v4(),"serial":"fixture","package":"org.example.fixture","createdUnixMs":1,"cancelRequested":false,"unified":false,"state":"partial","base":{},"stages":(["l0","l1","dump","linker"].iter().map(|k|serde_json::json!({"id":Uuid::new_v4(),"key":k,"mode":"observe","durationSeconds":1,"launchAfterAttach":false,"required":true,"attempts":[]})).collect::<Vec<_>>())})).unwrap();
+        retain_transport_partial(
+            &root,
+            &g.package,
+            &g,
+            &serde_json::json!({"partial":true,"admitted_write_bytes":0}),
+            "output budget exhausted",
+        )
+        .unwrap();
+        let result = import_kernsight_evidence_directory(root.to_string_lossy().into_owned())
+            .await
+            .unwrap();
+        assert_eq!(result.dump_report["collection_status"], "partial");
+        assert!(result.dump_report["dump_id"].is_null());
+        assert_eq!(
+            std::fs::read(root.join("base.apk.partial")).unwrap(),
+            b"raw prefix"
+        );
+        assert!(
+            result.session_report.unwrap()["mobilee_capture_source_status"]
+                .as_str()
+                .unwrap()
+                .starts_with("unknown")
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod qualified_source_tests {
+    use super::*;
+    #[test]
+    fn production_source_handoff_rejects_legacy_foreign_and_incomplete_receipts() {
+        assert!(qualified_dump_sources(None, "p").is_err());
+        assert!(qualified_dump_sources(Some(&serde_json::json!({"complete":true})), "p").is_err());
+        let mut n = serde_json::json!({"relation":{"attempt_id":"a"},"token":"t","qualification":{"schema":"kernsight.qualified-source/v1","relation":{"attempt_id":"a"},"token":"t","source":"MetadataObserver physical pidfd lease","sources":[{"package":"p","pid":123,"uid":10001,"birth_ns":9,"exec_id":0,"boot_id":"b"}]}});
+        assert!(qualified_dump_sources(Some(&n), "p").is_ok());
+        assert!(qualified_dump_sources(Some(&n), "foreign").is_err());
+        n["qualification"]["token"] = serde_json::json!("foreign");
+        assert!(qualified_dump_sources(Some(&n), "p").is_err());
+        n["qualification"]["token"] = serde_json::json!("t");
+        n["qualification"]["sources"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("birth_ns");
+        assert!(qualified_dump_sources(Some(&n), "p").is_err());
     }
 }

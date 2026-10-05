@@ -1,6 +1,10 @@
 export function codeEvidenceLabel(notes?: Array<Record<string, any>>): string {
   if (!notes?.length) return ''
   return notes.map(note => {
+    if (note.schema === 'mobilee.bound-runtime-range/v1') {
+      const read = note.read || {}
+      return `${note.mapping?.path || '映射来源未知'} · 请求 ${read.requested_length ?? '未知'} B / 实际读 ${read.actual_length ?? '未知'} B / 留存 ${note.retained_file_bytes ?? '未知'} B · ${note.local_content_status === 'complete_range_hash_verified' ? '完整范围 hash 已核对' : '范围内容未验证'} · 读取 ${read.read_status || '未知'} / 落盘 ${read.write_status || '未知'} · torn ${typeof read.torn === 'boolean' ? String(read.torn) : '未知'} · ${note.source_identity_status || '实例来源未知'} · DEX/SO 解析与分类未知（范围 hash 不证明完整映射）`
+    }
     if (note.schema === 'kernsight.bounded-code-range/v1') {
       const read = note.read || {}
       const count = (n:unknown) => typeof n === 'number' && Number.isSafeInteger(n) && n >= 0
@@ -23,4 +27,84 @@ export function allocatedEvidenceLabel(value: unknown): string {
 
 export function ownershipEvidenceEntries(schema: unknown, entries: Array<Record<string, any>>): any[] {
   return schema === 'mobilee.kernsight-dex-ownership/v4' ? entries : entries.map(entry => ({...entry, category:'unknown',confidence:0,reasons:['旧归属 schema 缺少本轮可重建依据；原记录保留，不能当作已验证归属']}))
+}
+
+/** Display only. Merge verified complete retained content and keep every source/status row. */
+export function codeNoiseLayers(files: Array<Record<string, any>>): Array<{ key: string; label: string; groups: Array<{ key: string; paths: string[]; rows: Array<Record<string, any>>; sha256: string | null }> }> {
+  const layers = [
+    { key: 'attention', label: 'partial / 失败 / 来源状态未知（不折叠隐藏）', groups: [] as any[] },
+    { key: 'business', label: '业务候选（类线索，不是已验证所有权）', groups: [] as any[] },
+    { key: 'system', label: '系统代码（平台内容签名依据）', groups: [] as any[] },
+    { key: 'sdk', label: '第三方 SDK（内容签名依据）', groups: [] as any[] },
+    { key: 'mixed', label: '混合 / 未知（包名、文件名、SDK 命名空间不足以排除业务）', groups: [] as any[] },
+  ]
+  const merged = new Map<string, any>()
+  files.forEach((file, index) => {
+    const notes = file.codeEvidence || file.code_evidence || []
+    if (!notes.length && !['dex', 'elf'].includes(file.content_class || file.category)) return
+    const verified = notes.find((n: any) => n.local_content_status === 'complete_file_hash_verified' && /^[a-f0-9]{64}$/.test(n.sha256 || ''))
+    const incomplete = notes.some((n: any) => n.source_complete === false || ['short_read', 'read_failed'].includes(n.read?.read_status || n.read_status) || ['write_failed', 'failed'].includes(n.write_status))
+    const complete = !incomplete && verified && verified.source_complete === true && ['retained', 'hard_link', 'existing_verified'].includes(verified.write_status)
+    const ownership = notes.find((n: any) => n.ownership)?.ownership
+    const layer = !complete ? 'attention' : ownership?.category === 'mixed' ? 'mixed' : ownership?.category === 'business' || ownership?.category === 'internal_component' ? 'business' : 'mixed'
+    const key = complete ? `${verified.sha256}:${file.bytes}` : `source:${index}`
+    const row = { path: file.relativePath || file.relative_path || '来源未知', bytes: file.bytes, notes }
+    if (complete && merged.has(key)) {
+      const group = merged.get(key)
+      group.paths.push(row.path); group.rows.push(row)
+      if (group.layer !== layer) group.layer = 'mixed'
+    } else {
+      const group = { key, layer, paths: [row.path], rows: [row], sha256: complete ? verified.sha256 : null }
+      merged.set(key, group)
+    }
+  })
+  for (const group of Array.from(merged.values())) layers.find(l => l.key === group.layer)!.groups.push(group)
+  return layers
+}
+
+export function archiveCoverageLabel(coverage?: Record<string, unknown>): string {
+  return coverage?.status === 'partial' ? 'partial：有效归档仅包含已留存路径，缺段未补齐' : '未知：旧schema或尚无归档覆盖依据'
+}
+
+export function elfLoadCoverageLabel(value: unknown): string {
+  return value === true ? '列示范围全部覆盖' : value === false ? '仍有缺口' : '未知（缺字段）'
+}
+
+/** Resolve a full class index through the exact displayed runtime source, never a stale row pointer. */
+export function runtimeDexClassMatches(ledger: any, object: any, query: string): {total:number;classes:string[]} {
+  const source=object?.sources?.find((s:any)=>s.kind==='runtime')
+  const row=source ? ledger?.runtime_observations?.[source.row_index] : undefined
+  if (!row || row.source_report!==source.source_report || row.read?.sha256!==source.range_sha256 || ['package','pid','uid','birth_ns','exec_id','boot_id'].some(k=>row.source?.[k]!==source.source?.[k])) return {total:0,classes:[]}
+  const dex=row.object_inspection?.derived_objects?.find((d:any)=>d.sha256===object.sha256 && d.length===object.bytes)
+  const classes:string[]=dex?.class_index?.classes || []
+  const matches=classes.filter(c=>c.toLowerCase().includes(query.toLowerCase()))
+  return {total:matches.length,classes:matches.slice(0,100)}
+}
+
+export function indexedDexCount(dump:any):number|null {
+  const sets=[...(dump?.dex_sets || []),...(dump?.content_dex_class_index?.objects || [])]
+  const keys=new Set(sets.filter((s:any)=>/^[a-f0-9]{64}$/i.test(s.sha256 || '') && Number.isSafeInteger(s.bytes) && s.bytes>=0).map((s:any)=>`${s.sha256}:${s.bytes}`))
+  if(keys.size || dump?.content_dex_class_index) return keys.size
+  const old=dump?.dex_index?.unique_dex ?? dump?.readable_dex
+  return Number.isSafeInteger(old) && old>=0 ? old : null
+}
+
+export function indexedElfModuleCount(dump:any):number|null {
+  const modules=dump?.local_storage_accounting?.elf_module_observations
+  if(Array.isArray(modules)) return new Set(modules.map((m:any)=>m.path).filter((p:any)=>typeof p==='string')).size
+  return Number.isSafeInteger(dump?.runtime_libs) && dump.runtime_libs>=0 ? dump.runtime_libs : null
+}
+
+/** Diagnostic objects stay searchable but never enter the checksum/declared-span verified group. */
+export function dexObjectGroups(objects:any[] = []):Array<{kind:string;label:string;objects:any[]}> {
+  const verified=(o:any)=>o.sha1_signature_verified===true && o.adler32_checksum_verified===true && o.validation_status==='checksum_and_bounded_structure_verified' && o.layout_diagnostics?.status==='declared_spans_cover_file'
+  return [
+    {kind:'verified',label:'校验通过的结构对象（有界检查，仍不证明完整业务恢复）',objects:objects.filter(verified)},
+    {kind:'diagnostic',label:'诊断对象：校验失败、布局异常或未知（不进入校验通过计数）',objects:objects.filter(o=>!verified(o))},
+  ].filter(g=>g.objects.length>0)
+}
+export function verifiedDexObjectCount(dump:any):number|null {
+  const objects=dump?.content_dex_class_index?.objects
+  if(!Array.isArray(objects))return null
+  return new Set((dexObjectGroups(objects).find(g=>g.kind==='verified')?.objects||[]).map(o=>`${o.sha256}:${o.bytes}`)).size
 }

@@ -132,3 +132,29 @@ export async function runUnifiedCapturePlan(
 export function captureIPCCommand(request: KernSightCaptureRequest): string {
   return request.inspectStages ? "start_kernsight_staged_capture" : "start_kernsight_capture"
 }
+
+/** Code evidence scope is an explicit choice, independent of auto orchestration. */
+export function captureCodeOnlyChoice(selected: boolean): boolean { return selected === true }
+
+/** Legacy/missing startup fields remain unknown; this display never upgrades coverage. */
+export function startupEvidenceLabel(note?: Record<string, unknown> | null): string {
+  const startup = note?.startup as Record<string, any> | undefined
+  if (!startup || startup.schema !== 'kernsight.startup/v1' || !startup.timing) return '启动/挂载时间未知（旧数据或未完成）'
+  const t = startup.timing
+  const time = (value: unknown) => typeof value === 'number' && Number.isFinite(value) ? `${value}ms` : '未知'
+  const attach = Object.entries(t.first_attach_ms || {}).map(([key,value]) => `${key}=${time(value)}`).join(' · ') || '未确认'
+  return `force-stop=${t.force_stop_status || '未知'} · launcher=${t.launcher_status || '未知'} · 启动 ${time(t.launcher_started_ms)} · 首次挂载 ${attach} · 实例 ${startup.generation_state || '未知'}；挂载前启动事件可能缺失`
+}
+
+/** Qualification is evidence from a completed producer, never current device attestation. */
+export function qualifiedSourceLabel(note?: Record<string, unknown> | null): string {
+  const q = note?.qualification as Record<string, any> | undefined
+  if (!q || q.schema !== 'kernsight.qualified-source/v1' || q.source !== 'MetadataObserver physical pidfd lease' || q.token !== note?.token || JSON.stringify(q.relation) !== JSON.stringify(note?.relation) || !Array.isArray(q.sources) || !q.sources.length) return '代码来源资格未知（旧数据或未完成）'
+  if (q.sources.some((s: any) => !s.package || !s.pid || !s.birth_ns || typeof s.exec_id !== 'number' || typeof s.uid !== 'number' || !s.boot_id)) return '代码来源资格字段不完整'
+  return `此前生产者具体来源：${q.sources.map((s: any) => `${s.package} PID ${s.pid} birth ${s.birth_ns} exec ${s.exec_id}`).join('；')}；dump 会重新核验，不保证无撕裂或完整恢复`
+}
+
+/** An older native backend must reject isolation before executing any device work. */
+export function captureGroupIPC(request: Pick<KernSightCaptureRequest, 'runtimePaths'>): string {
+  return request.runtimePaths ? 'begin_kernsight_isolated_group' : 'begin_kernsight_group'
+}

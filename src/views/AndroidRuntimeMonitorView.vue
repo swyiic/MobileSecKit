@@ -89,18 +89,25 @@
         <button :disabled="captureRunning" @click="applyCapturePreset('linker')"><span class="material-symbols-outlined">deployed_code</span><strong>单包 Linker</strong><small>独占 SO load；不与 TLS 同会话</small></button>
         <button :disabled="captureRunning" @click="applyCapturePreset('whole')"><span class="material-symbols-outlined">public</span><strong>全设备 L0</strong><small>无包过滤 · 不要开 Inspect/Sched</small></button>
         <button :disabled="captureRunning" @click="applyCapturePreset('dump')"><span class="material-symbols-outlined">folder_zip</span><strong>单包 L2 Dump</strong><small>--launch 拷 DEX/SO/CE·DE</small></button>
-        <button :disabled="captureRunning" @click="applyCapturePreset('auto')"><span class="material-symbols-outlined">playlist_play</span><strong>分阶段采集</strong><small>L0 {{ captureForm.autoL0Seconds }}s → L0+L1 {{ captureForm.autoL1Seconds }}s → Linker {{ captureForm.autoLinkerSeconds }}s → Dump</small></button>
+        <button :disabled="captureRunning" @click="applyCapturePreset('auto')"><span class="material-symbols-outlined">playlist_play</span><strong>分阶段采集</strong><small>L0 {{ captureForm.autoL0Seconds }}s → L0+L1 {{ captureForm.autoL1Seconds }}s → {{ captureForm.autoSessionMode === 'startup_replay' ? '该实例 Dump → ' : '' }}Linker {{ captureForm.autoLinkerSeconds }}s{{ captureForm.autoSessionMode === 'unified' ? ' → Dump' : '' }}</small></button>
       </div>
       <div class="ks-layer-contract"><article v-for="layer in layerContracts" :key="layer.key" :class="`layer-${layer.key}`"><header><b>{{ layer.label }}</b><small>{{ layer.stage }}</small></header><strong>{{ layer.title }}</strong><p>{{ layer.detail }}</p><ul><li v-for="item in layer.items" :key="item">{{ item }}</li></ul></article></div>
       <div class="ks-capture-form">
-        <label v-if="captureForm.plan === 'auto'" class="wide"><span>阶段生命周期</span><select v-model="captureForm.autoSessionMode" :disabled="captureRunning"><option value="startup_replay">启动重采：三个独立 session，保留各能力的启动观察</option><option value="unified">统一 session：只首次冷启动，顺序启停 Inspect（需新版 agent）</option></select><small>{{ captureForm.autoSessionMode === 'unified' ? 'L0 全程保留；L1/Linker 各有时间窗，只在会话结束取驻留快照，不能补回其它阶段的启动调用或已卸载代码。' : '每阶段重启会丢弃前一实例的驻留状态；L1 后快照属于该实例，Linker 随后是新实例。' }}</small></label>
+        <label v-if="captureForm.plan === 'auto'" class="wide"><span>阶段生命周期</span><select v-model="captureForm.autoSessionMode" :disabled="captureRunning"><option value="startup_replay">启动重采：三次冷启动，分别观察各能力启动窗口</option><option value="unified">统一 session：只首次冷启动，顺序启停 Inspect（需新版 agent）</option></select><small>{{ captureForm.autoSessionMode === 'unified' ? 'L0 全程保留；L1/Linker 各有时间窗，只在会话结束取驻留快照，不能补回其它阶段的启动调用或已卸载代码。' : 'L0/L1/Linker 各由本 attempt 强制停止并启动新实例；L1 后快照属于该实例。实际挂载前的事件可能缺失，失败/未知会停止后续阶段。' }}</small></label>
         <label class="wide"><span>目标包（留空表示全设备 Observe）</span><input v-model.trim="captureForm.package" :disabled="captureRunning" placeholder="例如 us.hsbc.hsbcus" /></label>
         <label v-if="captureForm.plan !== 'auto'"><span>时长（秒）</span><input v-model.number="captureForm.durationSeconds" :disabled="captureRunning" type="number" min="1" max="300" /></label>
         <label><span>采样 1 / N</span><input v-model.number="captureForm.sampleOneIn" :disabled="captureRunning" type="number" min="1" max="10000" /></label>
         <label><span>L1 Inspect 组合{{ captureForm.plan === 'auto' ? '（L1 阶段固定组合）' : '' }}</span><select v-model="captureForm.inspectMode" :disabled="captureRunning || captureForm.plan === 'auto'"><option value="none">关闭（仅 L0）</option><option value="tls">TLS plaintext</option><option value="jni_plaintext">JNI plaintext</option><option value="binder_userspace">Binder userspace</option><option value="tls_jni">TLS + JNI</option><option value="binder_jni">Binder + JNI</option><option value="tls_binder">TLS + Binder</option><option value="tls_binder_jni">TLS + Binder + JNI</option><option value="linker_so_load">Linker SO load（独占）</option></select></label>
         <label><span>明文/命中上限</span><select v-model.number="captureForm.inspectMaxBytes" :disabled="captureRunning"><option :value="256">256 B</option><option :value="1024">1 KiB</option><option :value="4096">4 KiB</option><option :value="16384">16 KiB</option><option :value="65536">64 KiB</option></select></label>
+        <label v-if="captureForm.plan === 'auto'"><span>累计输出写入预算（MiB）</span><input v-model.number="captureForm.totalBudgetMiB" type="number" min="4" max="16384" :disabled="captureRunning" /></label>
+        <label v-if="captureForm.plan === 'auto'"><span>总期限（秒）</span><input v-model.number="captureForm.maxSessionSeconds" type="number" min="30" max="3600" :disabled="captureRunning" /></label>
+        <label v-if="captureForm.plan === 'auto'" class="wide"><span>隔离候选运行根（留空使用旧默认路径）</span><input v-model="captureForm.isolatedRoot" :disabled="captureRunning" placeholder="/data/local/tmp/ksight-candidate-本轮ID" /><small>目录、agent、BPF、资产与证据均需处于此根；不安装或替换默认工具。</small></label>
+        <label v-if="captureForm.plan === 'auto' && captureForm.isolatedRoot.trim()" class="wide"><span>隔离agent绝对路径（留空为运行根/ksightd）</span><input v-model="captureForm.isolatedAgent" :disabled="captureRunning" /><span>候选完整SHA256（必填）</span><input v-model="captureForm.isolatedSha256" :disabled="captureRunning" /></label>
+        <label v-if="captureForm.plan === 'auto'" class="wide"><span>独立采集范围</span><span><input v-model="captureForm.codeOnly" type="checkbox" :disabled="captureRunning" /> 仅代码证据（独立选择，默认关闭）</span><small>普通与仅代码范围均按计划执行强制停止和冷启动；不暂停进程。仅代码先核验真实 BTF/task-storage 后端，启动后再资格化具体实例。新父会话两种范围均限定独占 UID 主进程的已登记代码/执行映射，不等于旧全内存采集；共享 UID、容器和未登记匿名堆/FD 扫描不支持。L1仍按阶段开启TLS/JNI/Binder Inspect，“仅代码”不是禁止所有Inspect字节的承诺。事件从实际挂载时刻起可观察，最早事件可能缺失。</small></label>
+        <label v-if="captureForm.plan === 'auto'" class="wide"><span>独立额外能力（默认关闭）</span><span><input v-model="captureForm.collectKeys" type="checkbox" :disabled="captureRunning" /> 密钥轮询 <input v-model="captureForm.collectPrivate" type="checkbox" :disabled="captureRunning" /> CE/DE 私有存储 <input v-model="captureForm.collectMemoryWindows" type="checkbox" :disabled="captureRunning" /> 通用内存窗口</span><small>代码发现、APK/split 原件、阶段能力仍保留。额外能力需单独范围校验；身份或范围不能证明时拒绝。预算耗尽停止新输出，标为 partial，原件保留可导入；预算计入设备产物、传输缓存、归档及导入输出，元数据每操作预留64KiB，父清单原子保存计入2MiB管理额度。逻辑字节、唯一内容和物理占用分别显示，硬链接不丢原路径。</small></label>
         <label v-if="captureForm.plan === 'auto'"><span>L0 主干（秒）</span><input v-model.number="captureForm.autoL0Seconds" :disabled="captureRunning" type="number" min="1" max="300" /></label>
-        <label v-if="captureForm.plan === 'auto'"><span>L0+L1 登录窗（秒）</span><input v-model.number="captureForm.autoL1Seconds" :disabled="captureRunning" type="number" min="1" max="300" /></label>
+        <label v-if="captureForm.plan === 'auto'"><span>L0+L1 观察窗（秒）</span><input v-model.number="captureForm.autoL1Seconds" :disabled="captureRunning" type="number" min="1" max="300" /></label>
+        <p v-if="captureForm.plan === 'auto'" class="muted">90 秒默认值仅指 L1 观察窗；L0、L1、Linker 默认合计 120 秒。总期限另计冷启动、挂载、提取与本父会话内的输出操作；阶段结束不表示动态代码覆盖或解析完整。</p>
         <label v-if="captureForm.plan === 'auto'"><span>Linker（秒）</span><input v-model.number="captureForm.autoLinkerSeconds" :disabled="captureRunning" type="number" min="1" max="300" /></label>
       </div>
       <div class="ks-sensor-switches">
@@ -169,11 +176,41 @@
     </section>
 
     <section v-if="workspaceMode === 'evidence'" class="panel ks-session-panel">
-      <div class="section-title compact"><div><div class="eyebrow">L0 / L1 SESSION</div><h2>{{ sessionMatchedPackage ? `${sessionMatchedPackage} · 会话链` : 'KernSight 会话' }}</h2><p>Session 与 L2 包证据独立加载。每条手机 Session 可单独删除；Mac 本地 Session 属于包证据，只能随整个包目录管理。</p></div><div class="ks-title-actions"><button v-if="selectedSession || selectedReport" class="ghost-button" title="只关闭当前详情，不删除任何数据" @click="clearCurrentSession">关闭详情</button><span class="device-chip">{{ visibleLocalSessionBundles.length + (kernSight?.sessions.length || 0) }} SESSIONS</span></div></div>
+      <div class="section-title compact"><div><div class="eyebrow">L0 / L1 SESSION</div><h2>{{ sessionMatchedPackage ? `${sessionMatchedPackage} · 会话链` : 'KernSight 会话' }}</h2><p>一次自动采集显示一个主会话，展开实际阶段与所有 attempts；无父 ID 的旧记录独立为 legacy，不按包名合并。</p></div><div class="ks-title-actions"><button v-if="selectedSession || selectedReport" class="ghost-button" title="只关闭当前详情，不删除任何数据" @click="clearCurrentSession">关闭详情</button><span class="device-chip">{{ visibleCaptureGroups.length + visibleLocalSessionBundles.length + legacyDeviceSessions.length }} SESSIONS</span></div></div>
       <div class="ks-session-list">
-        <article v-for="session in kernSight?.sessions || []" :key="session.session_id" class="ks-session-row" :class="{ active: selectedSession === session.session_id, 'pending-delete': pendingDeleteSession === session.session_id }">
+        <details v-for="group in visibleCaptureGroups" :key="group.id" class="ks-session-row" :open="selectedCaptureGroup===group.id">
+          <summary @click.prevent="selectedCaptureGroup=selectedCaptureGroup===group.id?'':group.id"><strong>{{ group.package }} · {{ shortSession(group.id) }}</strong> · {{ formatDate(group.createdUnixMs) }} · {{ group.state }} · {{ group.unified?'统一进程阶段':'启动重采' }} · 主会话</summary>
+          <p class="muted">{{ group.budget ? `会话写入预算 ${formatBytes(group.budget.limits.totalBytes)} · 期限 ${group.budget.limits.maxSeconds}s · 预留 ${group.budget.reservations.length} 个输出操作；计量为写入准入 + 终态预留，物理占用见本地统计` : '旧会话预算 / 采集范围未知，不视为完整或受限成功' }}</p>
+          <small v-for="operation in group.budget?.reservations || []" :key="operation.id">{{ operation.kind }} · {{ operation.status }} · 预留 {{ formatBytes(operation.reservedBytes) }} · 准入与终态预留 {{ operation.chargedBytes==null ? '未知' : formatBytes(operation.chargedBytes) }}</small>
+          <p>预算累计写入准入及终态预留；读取不计入此计量。唯一内容、传输量和磁盘峰值另核算。有效 partial 归档仅保存已收到路径，不补齐缺页或失败字节。</p>
+          <p>阶段独立进程与启动；未拉取时唯一内容/物理占用未知，执行成功不等于数据覆盖完整。</p>
+          <p v-for="item in importedCaptureGroups.filter(i=>i.group.id===group.id)" :key="item.bundle.root">本次导入树：逻辑 {{ formatBytes(Number(groupLedger(item.bundle)?.logical_file_bytes||0)) }} · 唯一 inode {{ groupLedger(item.bundle)?.unique_inode_bytes==null?'未知':formatBytes(Number(groupLedger(item.bundle)?.unique_inode_bytes)) }} · 实际分配 {{ allocatedEvidenceLabel(groupLedger(item.bundle)?.allocated_bytes) }} · 已核验代码唯一 {{ formatBytes(Number(groupLedger(item.bundle)?.verified_code_unique_bytes||0)) }}（其余内容未核验）；归档范围 {{ archiveCoverageLabel(item.bundle.dumpReport.mobilee_archive_coverage) }}；{{ item.bundle.sessionReport?.mobilee_capture_source_status }} · 传输 {{ item.bundle.dumpReport.mobilee_transport_status ? 'partial（收到的目录不完整，归档可能未生成）' : '无 partial 终态记录；完整性另按预算与源清单核对' }}</p>
+          <details v-for="item in importedCaptureGroups.filter(i=>i.group.id===group.id)" :key="`classes-${item.bundle.root}`"><summary>DEX 完整类索引与独立来源</summary><p v-if="!item.bundle.dumpReport.content_dex_class_index">旧数据：完整类索引未知。</p><section v-for="bucket in dexObjectGroups(item.bundle.dumpReport.content_dex_class_index?.objects)" :key="bucket.kind" :data-dex-group="bucket.kind"><h4>{{ bucket.label }}</h4><article v-for="object in bucket.objects" :key="`${object.sha256}:${object.bytes}`"><p>{{ object.sha256 }} · {{ object.sources.length }} 来源 · {{ object.indexed_classes ?? '未知' }} / {{ object.declared_classes ?? '未知' }} 类 · {{ object.class_index_status }} · {{ object.validation_status || '校验未知（旧字段）' }} · {{ object.ownership }}</p><pre>{{ object.class_hints }}</pre><details><summary>来源与实例</summary><pre>{{ object.sources }}</pre></details><input v-model="dexClassQuery" placeholder="类名片段（最多显示100项）" /><pre>{{ runtimeDexClassMatches(item.bundle.dumpReport.local_storage_accounting,object,dexClassQuery).classes.join('\n') }}</pre></article></section></details>
+          <details v-for="item in importedCaptureGroups.filter(i=>i.group.id===group.id)" :key="`elf-${item.bundle.root}`"><summary>ELF 加载段覆盖（不是完整 SO 文件）</summary><p v-if="!groupLedger(item.bundle)?.elf_module_observations?.length">旧数据或未验证加载段：解析与覆盖未知。</p><article v-for="module in groupLedger(item.bundle)?.elf_module_observations || []" :key="`${module.source_report}:${module.path}`"><p>{{ module.path }} · PID {{ module.source?.pid ?? '未知' }} / birth {{ module.source?.birth_ns ?? '未知' }} · {{ module.source_report }}</p><p>PT_LOAD 文件部分：{{ elfLoadCoverageLabel(module.all_load_file_bytes_covered) }} · 内存部分（含 BSS）：{{ elfLoadCoverageLabel(module.all_load_memory_bytes_covered) }} · 完整 SO 未重建 · live/torn · 业务/SDK 归属未知</p><p>文件偏移关联由保留的 ELF 头推导，原 maps 未记录文件偏移；未补缺失节表、重定位或未读字节。</p><table v-if="module.segments?.length"><thead><tr><th>文件偏移</th><th>虚拟地址</th><th>文件字节</th><th>内存字节</th><th>文件缺口</th><th>内存缺口</th></tr></thead><tbody><tr v-for="(segment,index) in module.segments" :key="index"><td>{{ segment.file_offset }}</td><td>{{ segment.virtual_start }}</td><td>{{ segment.file_bytes }}</td><td>{{ segment.memory_bytes }}</td><td>{{ segment.file_backed_gaps?.length ? segment.file_backed_gaps : '无（列示范围）' }}</td><td>{{ segment.memory_gaps?.length ? segment.memory_gaps : '无（列示范围）' }}</td></tr></tbody></table><details><summary>原始范围、hash 与派生偏移链</summary><pre>{{ module }}</pre></details></article></details>
+          <details v-for="item in importedCaptureGroups.filter(i=>i.group.id===group.id)" :key="`source-diagnostics-${item.bundle.root}`"><summary>运行时来源记录诊断</summary><p v-if="!groupLedger(item.bundle)?.runtime_source_diagnostics">旧数据：逐来源诊断未知。</p><p>来源上限 {{ groupLedger(item.bundle)?.runtime_source_limit ?? '未知' }} · 未处理来源 {{ groupLedger(item.bundle)?.runtime_sources_omitted ?? '未知' }}</p><pre>{{ groupLedger(item.bundle)?.runtime_source_diagnostics }}</pre></details>
+          <details v-for="item in importedCaptureGroups.filter(i=>i.group.id===group.id)" :key="`runtime-${item.bundle.root}`"><summary>运行时代码范围（不代表完整 DEX/SO 或总覆盖率）</summary><p v-if="!groupLedger(item.bundle)?.runtime_observations?.length">旧数据或无范围记录：已提取、解析与来源状态未知。</p><article v-for="(range,index) in groupLedger(item.bundle)?.runtime_observations || []" :key="index"><p>{{ range.mapping?.path || '映射来源未知' }} · PID {{ range.source?.pid ?? '未知' }} / birth {{ range.source?.birth_ns ?? '未知' }} / exec {{ range.source?.exec_id ?? '未知' }} · {{ range.source_identity_status }}</p><p>请求 {{ range.read?.requested_length ?? '未知' }} B · 实际读 {{ range.read?.actual_length ?? '未知' }} B · 留存 {{ range.retained_file_bytes ?? '未知' }} B · {{ range.local_content_status }} · 映射完整 {{ range.mapping_complete == null ? '未知' : range.mapping_complete ? '是' : '否' }} · torn {{ range.read?.torn == null ? '未知' : range.read.torn ? '是' : '否' }}</p><p>映射 {{ range.requested_mapping_bytes ?? '未知' }} B · 选区 {{ range.selection_limit_bytes ?? '未知' }} B · 选区原因 {{ range.selection_limit_reason || '未知（旧数据缺字段）' }}；预算截断选区不等于读取失败。</p><p>读取 {{ range.read?.read_status || '未知' }} · 落盘 {{ range.read?.write_status || '未知' }} · 解析 {{ range.parse_status }} · 分类 {{ range.ownership }} · {{ range.relative_path }} · {{ range.source_report }}</p><p>派生关联：{{ range.derived == null ? '未知（缺字段）' : range.derived.length ? '原生产者记录，未在此范围核验语义' : '未记录提取 DEX/SO 的关联' }}</p><pre v-if="range.derived?.length">{{ range.derived }}</pre><p>本地对象检查：{{ range.object_inspection?.status || '未知（旧数据未检查）' }} · 已检查 {{ range.object_inspection?.scanned_bytes ?? '未知' }} B · DEX 候选 {{ range.object_inspection?.dex_magic_count ?? '未知' }} · ELF 标记（未验证为完整对象）{{ range.object_inspection?.elf_magic_count ?? '未知' }}；只检查留存范围，不代表 headerless JIT 或未读页没有代码。</p><pre v-if="range.object_inspection?.derived_objects?.length || range.object_inspection?.rejected_candidates?.length">{{ range.object_inspection }}</pre></article></details>
+          <article v-for="stage in group.stages" :key="stage.id">
+            <strong>{{ stage.key }} · {{ stage.mode }} · {{ stage.launchAfterAttach?'冷启动':'驻留' }} · {{ stage.required?'required':'optional' }}</strong>
+            <small>{{ stage.id }} · {{ stage.durationSeconds }}s</small>
+            <p v-if="!stage.attempts.length">planned（尚未执行）</p>
+            <div v-for="attempt in stage.attempts" :key="attempt.relation.attemptId">
+              <b>attempt {{ attempt.relation.attempt }} · {{ attempt.state }}</b>
+              <small>{{ formatDate(attempt.startedUnixMs) }} → {{ attempt.finishedUnixMs?formatDate(attempt.finishedUnixMs):'运行中/终态未知' }}</small>
+              <button v-if="attempt.sessionId" class="ghost-button" @click="openGroupedSession(group,attempt.sessionId)">{{ shortSession(attempt.sessionId) }} · 子证据</button>
+              <small v-for="instance in attempt.processInstances" :key="String(instance.process_instance_id)">{{ instance.process_instance_id || 'agent 阶段身份' }} · PID {{ instance.pid }} · {{ instance.process_start_ticks?'start ticks='+instance.process_start_ticks:'start ns='+(instance.start_time_ns ?? '未知') }}</small><small v-if="attempt.omittedProcessInstances">清单省略 {{ attempt.omittedProcessInstances }} 实例，完整内容见子报告</small><small v-if="attempt.observationError">{{ attempt.observationError }}</small>
+              <code v-if="attempt.remoteArtifactRoot">{{ attempt.remoteArtifactRoot }}</code>
+              <small v-if="stage.launchAfterAttach">{{ startupEvidenceLabel(attempt.remoteLifecycle) }}</small>
+              <small>{{ qualifiedSourceLabel(attempt.remoteLifecycle) }}</small>
+              <p v-if="attempt.error">{{ attempt.error }}</p>
+            </div>
+          </article>
+          <button v-if="!group.cancelRequested && group.state!=='succeeded' && group.state!=='running'" class="ghost-button" :disabled="captureRunning" @click="resumeCaptureGroup(group)">继续 / 重试未成功阶段</button>
+          <button v-if="group.state==='running'" class="ghost-button" @click="cancelCaptureGroup(group)">请求取消（当前阶段封存后停止）</button>
+          <button v-if="group.stages.some(s=>s.key==='dump'&&['succeeded','partial','failed'].includes(s.attempts[s.attempts.length-1]?.state||'')) && captureGroups.some(g=>g.id===group.id)" class="ghost-button" :disabled="pullingPackage" @click="pullCaptureGroup(group)">拉取本次主会话全部信息</button>
+        </details>
+        <article v-for="session in legacyDeviceSessions" :key="session.session_id" class="ks-session-row" :class="{ active: selectedSession === session.session_id, 'pending-delete': pendingDeleteSession === session.session_id }">
           <button class="ks-session-open" :disabled="loadingReport || deletingSession === session.session_id" @click="loadSessionReport(session.session_id)">
-            <span :title="session.session_id"><strong>{{ shortSession(session.session_id) }}</strong><small>{{ formatDate(session.started_unix_ms) }} · 设备会话</small></span>
+            <span :title="session.session_id"><strong>{{ shortSession(session.session_id) }}</strong><small>{{ formatDate(session.started_unix_ms) }} · legacy（无父 ID）</small></span>
             <span><strong>{{ Number(session.event_count || 0).toLocaleString() }} 条事件</strong><small>{{ session.batch_count || 0 }} 批次 · {{ formatBytes(session.used_bytes || 0) }}</small></span>
             <span class="ks-session-state"><b>{{ session.state }}</b><small>{{ session.stop_reason || (session.compressed ? 'LZ4 batches' : 'uncompressed') }}</small></span>
           </button>
@@ -186,10 +223,11 @@
           </div>
         </article>
         <article v-for="bundle in visibleLocalSessionBundles" :key="`${bundle.root}:${bundle.package}`" class="ks-session-row local" :class="{ active: selectedSession === bundleSessionId(bundle) }"><button class="ks-session-open" :disabled="loadingReport" @click="loadLocalBundleSession(bundle)"><span><strong>{{ shortSession(bundleSessionId(bundle)) }}</strong><small>{{ bundle.package }} · Mac 本地</small></span><span><strong>{{ Number(bundle.sessionReport?.total_events || 0).toLocaleString() }} events</strong><small>{{ bundle.fileCount.toLocaleString() }} files · {{ formatBytes(bundle.totalBytes) }}</small></span><span class="ks-session-state"><b>LOCAL</b><small>{{ bundle.sessionReport?.execution_complete ? 'complete' : 'incomplete' }}</small></span></button><span class="ks-session-owned">随整包证据管理</span></article>
-        <p v-if="!visibleLocalSessionBundles.length && !kernSight?.sessions.length" class="ks-empty">{{ selectedPackage ? '当前包没有已导入的 Session，设备端也没有可重放会话。L2 文件证据仍可独立分析。' : '尚未导入或采集 Session。连接 KernSight 后，设备会话会直接列在这里。' }}</p>
+        <p v-if="!visibleLocalSessionBundles.length && !legacyDeviceSessions.length && !visibleCaptureGroups.length" class="ks-empty">{{ selectedPackage ? '当前包没有已导入的 Session，设备端也没有可重放会话。L2 文件证据仍可独立分析。' : '尚未导入或采集 Session。连接 KernSight 后，设备会话会直接列在这里。' }}</p>
       </div>
       <div v-if="loadingReport" class="ks-loading"><span class="material-symbols-outlined spinning">sync</span>正在重放会话事件（不合并 dump）…</div>
       <template v-if="sessionReport && !loadingReport">
+        <details v-if="Array.isArray(sessionReport.mobilee_capture_edges)" class="ks-artifact-chain"><summary>主会话 → 阶段 → attempt → 子证据引用 · 子来源 {{ sessionReport.mobilee_child_source_status || '未核验' }}</summary><article v-for="(edge,index) in sessionReport.mobilee_capture_edges" :key="index"><code>{{ edge.from }}</code><strong>{{ edge.relation }}</strong><code>{{ edge.to }}</code></article></details>
         <div class="ks-case-head">
           <div>
             <small>{{ shortSession(selectedSession) }} · Observe {{ Number(sessionReport.mode_counts?.observe || 0).toLocaleString() }} · Inspect {{ Number(sessionReport.mode_counts?.inspect || 0).toLocaleString() }} · 丢失 {{ reportLostRecords.toLocaleString() }}</small>
@@ -330,8 +368,8 @@
       <div class="ks-package-list">
         <article v-for="dump in packageDumps" :key="dump.package" :class="{ selected: selectedPackage === dump.package }" @click="selectPackage(dump.package)">
           <div><strong>{{ dump.package }}</strong><small class="ks-source-badges"><b v-for="source in evidenceSources(dump.package)" :key="source.kind" :class="`source-${source.kind}`">{{ source.label }}</b></small><small>{{ evidenceLocationLabel(dump.package) }} · {{ dump.schema_version || 'legacy schema · 建议 recatalog' }}</small></div>
-          <span><b>{{ dump.dex_index?.unique_dex ?? dump.readable_dex ?? 0 }}</b><small>唯一 DEX</small></span>
-          <span><b>{{ dump.runtime_libs || 0 }}</b><small>SO</small></span>
+          <span><b>{{ verifiedDexObjectCount(dump) ?? '未知' }}</b><small>校验通过 DEX</small></span><span><b>{{ indexedDexCount(dump) ?? '未知' }}</b><small>DEX结构对象</small></span>
+          <span><b>{{ indexedElfModuleCount(dump) ?? '未知' }}</b><small>SO 加载视图</small></span>
           <span><b>{{ dump.native_framework_matches?.length || 0 }}</b><small>框架识别</small></span>
           <span><b>{{ sensitiveCount(dump, 'plaintext_candidate', dump.plaintext_windows) }}</b><small>明文候选文件</small></span>
           <span><b>{{ sensitiveCount(dump, 'key_candidate', dump.key_slots) }}</b><small>Key 候选文件</small></span>
@@ -345,11 +383,19 @@
     <section v-if="workspaceMode === 'evidence' && selectedPackageDump" class="panel ks-package-evidence-panel">
       <div class="section-title compact"><div><div class="eyebrow">FORENSIC EVIDENCE</div><h2>{{ selectedPackage }} · 产物与私有文件</h2><p>MobileE 会在载入后自动整理文件、内存、会话与映射关系；文件存在本身不代表本次运行已经执行或外发。</p></div><span class="device-chip">{{ evidenceFiles.length.toLocaleString() }} FILES · {{ allocatedEvidenceLabel(selectedPackageDump.local_storage_accounting?.allocated_bytes ?? selectedPackageDump.physical_bytes) }}</span></div>
       <template v-if="selectedPackageDump">
-      <div class="ks-selected-package-bar"><button v-if="device && selectedEvidenceSource === 'device'" class="primary-button" :disabled="pullingPackage" @click="pullSelectedPackageEvidence">{{ pullingPackage ? '正在拉取并解析…' : '拉取全部信息' }}</button><button v-else-if="selectedLocalBundle" class="ghost-button" :disabled="pullingPackage" @click="exportSelectedEvidenceArchive">{{ pullingPackage ? '正在封装…' : '导出 .mee' }}</button><b :class="`source-${selectedEvidenceSource}`">{{ selectedEvidenceSource === 'local' ? 'MAC 本地证据' : '手机端证据' }}</b><span>Dump {{ selectedPackageDump.dump_id || 'legacy' }}</span><span v-if="selectedPackageDump.local_storage_accounting">本地逻辑 {{ formatBytes(Number(selectedPackageDump.local_storage_accounting.logical_file_bytes)) }} · 分配 {{ allocatedEvidenceLabel(selectedPackageDump.local_storage_accounting.allocated_bytes) }} · 已验证代码重复 {{ formatBytes(Number(selectedPackageDump.local_storage_accounting.verified_code_duplicate_bytes)) }}（账面，非物理节省）</span><span>{{ selectedPackageDump.launched ? '已执行 launch harvest' : '未执行 launch harvest' }}</span><span>物理 {{ allocatedEvidenceLabel(selectedPackageDump.local_storage_accounting?.allocated_bytes ?? selectedPackageDump.physical_bytes) }}</span><span v-if="selectedPackageDump.storage_accounting === 'kernsight.inode-accounting/v1'">硬链接共享逻辑字节 {{ formatBytes(Number(selectedPackageDump.deduplicated_bytes ?? 0)) }}</span></div>
+      <div class="ks-selected-package-bar"><button v-if="device && selectedEvidenceSource === 'device'" class="primary-button" :disabled="pullingPackage" @click="pullSelectedPackageEvidence()">{{ pullingPackage ? '正在拉取并解析…' : '拉取全部信息' }}</button><button v-else-if="selectedLocalBundle" class="ghost-button" :disabled="pullingPackage" @click="exportSelectedEvidenceArchive">{{ pullingPackage ? '正在封装…' : '导出 .mee' }}</button><b :class="`source-${selectedEvidenceSource}`">{{ selectedEvidenceSource === 'local' ? 'MAC 本地证据' : '手机端证据' }}</b><span>Dump {{ selectedPackageDump.dump_id || 'legacy' }}</span><span v-if="selectedPackageDump.local_storage_accounting">本地逻辑 {{ formatBytes(Number(selectedPackageDump.local_storage_accounting.logical_file_bytes)) }} · 分配 {{ allocatedEvidenceLabel(selectedPackageDump.local_storage_accounting.allocated_bytes) }} · 已验证代码重复 {{ formatBytes(Number(selectedPackageDump.local_storage_accounting.verified_code_duplicate_bytes)) }}（账面，非物理节省）</span><span>{{ selectedPackageDump.launched ? '已执行 launch harvest' : '未执行 launch harvest' }}</span><span>物理 {{ allocatedEvidenceLabel(selectedPackageDump.local_storage_accounting?.allocated_bytes ?? selectedPackageDump.physical_bytes) }}</span><span v-if="selectedPackageDump.storage_accounting === 'kernsight.inode-accounting/v1'">硬链接共享逻辑字节 {{ formatBytes(Number(selectedPackageDump.deduplicated_bytes ?? 0)) }}</span></div>
+      <details v-if="selectedEvidenceSource === 'local'"><summary>本地运行时来源诊断与逐库加载段</summary><p v-if="!selectedPackageDump.local_storage_accounting?.runtime_source_diagnostics">旧数据：来源诊断未知。</p><pre>{{ selectedPackageDump.local_storage_accounting?.runtime_source_diagnostics }}</pre><article v-for="module in selectedPackageDump.local_storage_accounting?.elf_module_observations || []" :key="`${module.source_report}:${module.path}`"><p>{{ module.path }} · 已观察/已读范围 {{ module.verified_range_count ?? '未知' }} · 留存 {{ module.verified_range_bytes ?? '未知' }} B · PT_LOAD 可分析 {{ elfLoadCoverageLabel(module.all_load_file_bytes_covered) }} · 完整文件缺失（未重建）</p><details><summary>来源与缺口</summary><pre>{{ module }}</pre></details></article></details>
       <section v-if="evidenceError" class="notice error-notice ks-pull-notice" role="alert"><span class="material-symbols-outlined">error</span><span>{{ evidenceError }}</span><button @click="evidenceError = ''">关闭</button></section>
       <section v-if="evidenceMessage" class="notice ks-pull-notice" role="status"><span class="material-symbols-outlined">task_alt</span><span>{{ evidenceMessage }}</span><button @click="evidenceMessage = ''">关闭</button></section>
+      <section v-if="selectedPackageDump.content_dex_class_index" class="ks-dex-ownership"><header><strong>DEX结构对象与类索引（校验通过与诊断分列）</strong><small>按完整 hash + 长度计对象，保留所有来源；包名与现有 SDK 命名空间只作候选线索。manifest 组件缺失不能当作已确认业务归属。</small></header><section v-for="bucket in dexObjectGroups(selectedPackageDump.content_dex_class_index.objects)" :key="bucket.kind" :data-dex-group="bucket.kind"><h4>{{ bucket.label }}</h4><article v-for="object in bucket.objects" :key="`${object.sha256}:${object.bytes}`"><p>{{ object.sha256 }} · {{ object.bytes }} B · {{ object.sources.length }} 来源 · {{ object.ownership }}</p><p>声明 {{ object.declared_classes ?? '未知' }} 类 · 已索引 {{ object.indexed_classes ?? '未知' }} · {{ object.class_index_status }} · {{ object.validation_status || '校验未知（旧字段）' }} · {{ object.class_hints }}</p><details><summary>独立来源、父会话与实例</summary><pre>{{ object.sources }}</pre></details><details><summary>类名索引（有界检索）</summary><input v-model="dexClassQuery" placeholder="输入类名片段" /><p>{{ dexClassMatches(object).total }} 个匹配，最多显示 100 项；空查询只显示前 100 项。</p><pre>{{ dexClassMatches(object).classes.join('\n') }}</pre></details></article></section></section>
+      <section class="ks-dex-ownership"><header><strong>代码证据去噪视图</strong><small>仅按已验证完整保留内容合并展示，所有路径、来源与状态仍保留；不删除文件、不改变采集范围。旧字段或partial不合并。系统/SDK分层需内容签名依据，命名空间线索仍归混合/未知。此视图不受文件浏览器筛选影响；本地核验预算或目录计数上限之外的内容仍未验证，不会宣称全部去重。</small></header>
+        <details v-for="layer in evidenceNoiseLayers" :key="layer.key" :open="layer.key === 'attention' || layer.key === 'business'" :class="`noise-${layer.key}`" @toggle="keepAttentionOpen($event, layer.key)">
+          <summary>{{ layer.label }} · {{ layer.groups.length }} 内容组 / {{ layer.groups.reduce((n,g) => n + g.rows.length,0) }} 来源</summary>
+          <article v-for="group in layer.groups" :key="group.key"><code>{{ group.sha256 || '未验证完整内容' }}</code><div v-for="row in group.rows" :key="row.path"><b>{{ row.path }}</b><small>{{ codeEvidenceLabel(row.notes) || '读取/完整性依据缺失，原件保留' }}</small></div></article>
+        </details>
+      </section>
       <section class="ks-dex-ownership">
-        <header><div><strong>DEX 业务归属</strong><small>{{ dexOwnershipAvailable ? '类命名空间与清单线索分类；不代表已验证企业所有权' : '旧记录缺少可核验归属依据；可继续查看原始文件' }}</small></div><b>{{ dexOwnershipEntries.length }} UNIQUE DEX</b></header>
+        <header><div><strong>DEX 业务归属</strong><small>{{ dexOwnershipAvailable ? '类命名空间与清单线索分类；不代表已验证企业所有权' : '旧记录缺少可核验归属依据；可继续查看原始文件' }}</small></div><b>{{ dexOwnershipEntries.length }} 归属记录</b></header>
         <div v-if="dexOwnershipAvailable" class="ks-dex-ownership-summary">
           <button v-for="item in dexOwnershipCards" :key="item.key" type="button" :class="[`ownership-${item.key}`, { active: selectedDexOwnership === item.key }]" @click="selectedDexOwnership = selectedDexOwnership === item.key ? '' : item.key"><b>{{ item.count }}</b><span>{{ item.label }}</span></button>
         </div>
@@ -388,9 +434,10 @@
 </template>
 
 <script setup lang="ts">
-import { buildAutoCaptureStages, buildUnifiedStageSpec, runAutoCapturePlan, runUnifiedCapturePlan, type AutoStageReceipt } from '@/services/kernsightCapturePlan'
+import { mergeCaptureGroups,groupSessionIds,captureGroupEdges } from '../services/kernsightCaptureGroups'
 import { memoryCounterLabel, memoryEvidenceLabel } from '../services/kernsightMemoryEvidence'
-import { codeEvidenceLabel, allocatedEvidenceLabel, ownershipEvidenceEntries } from '../services/kernsightCodeEvidence'
+import { dexObjectGroups, verifiedDexObjectCount, indexedElfModuleCount, indexedDexCount, runtimeDexClassMatches, elfLoadCoverageLabel, codeEvidenceLabel, allocatedEvidenceLabel, ownershipEvidenceEntries, codeNoiseLayers, archiveCoverageLabel } from '../services/kernsightCodeEvidence'
+import { buildAutoCaptureStages, captureCodeOnlyChoice, startupEvidenceLabel, qualifiedSourceLabel, buildUnifiedStageSpec, type AutoStageReceipt } from '@/services/kernsightCapturePlan'
 import { computed, markRaw, nextTick, onErrorCaptured, onBeforeUnmount, reactive, ref, shallowRef, watch } from 'vue'
 import { save } from '@tauri-apps/plugin-dialog'
 import { monitoringBackend, readableError } from '@/services/backend'
@@ -401,6 +448,7 @@ import type {
   DeviceDetails,
   DeviceSummary,
   KernSightOverview,
+  KernSightCaptureGroup,
   KernSightProvisionResult,
   KernSightCaptureRequest,
   KernSightCaptureResult,
@@ -415,6 +463,16 @@ import type {
 const props = defineProps<{ device?: DeviceSummary; details: DeviceDetails | null }>()
 const emit = defineEmits<{ 'open-devices': []; 'open-ai': [] }>()
 
+const captureGroups=ref<KernSightCaptureGroup[]>([])
+const selectedCaptureGroup=ref('')
+const runningCaptureGroup=ref('')
+const groupedSessionIds=computed(()=>groupSessionIds(visibleCaptureGroups.value))
+const legacyDeviceSessions=computed(()=>kernSight.value?.sessions.filter(s=>!groupedSessionIds.value.has(s.session_id))||[])
+const importedCaptureGroups=computed(()=>localEvidenceBundles.value.flatMap(bundle=>{
+  const g=bundle.sessionReport?.mobilee_capture_group as KernSightCaptureGroup|undefined
+  return g?.schema==='mobilee.capture-group/v1'?[{group:g,bundle}]:[]
+}))
+const visibleCaptureGroups=computed(()=>mergeCaptureGroups(captureGroups.value,importedCaptureGroups.value.map(i=>i.group)))
 const capabilityProbe = ref<AndroidMonitorCapabilityProbe | null>(null)
 const probing = ref(false)
 const provisioning = ref(false)
@@ -493,6 +551,11 @@ const captureForm = reactive({
   inspectMaxBytes: 65_536,
   inspectMaxHits: 0,
   plan: 'capture' as 'capture' | 'dump' | 'auto',
+  codeOnly:false,
+  isolatedRoot:"",isolatedAgent:"",isolatedSha256:"",
+  totalBudgetMiB:2048,
+  maxSessionSeconds:300,
+  collectKeys:false,collectPrivate:false,collectMemoryWindows:false,
   autoSessionMode: 'startup_replay' as 'startup_replay' | 'unified',
   autoL0Seconds: 15,
   autoL1Seconds: 90,
@@ -551,6 +614,8 @@ const selectedLocalBundle = computed(() => selectedEvidenceSource.value === 'loc
 const selectedPackageDump = computed(() => selectedEvidenceSource.value === 'device'
   ? devicePackageDumps.value.find(dump => dump.package === selectedPackage.value) || null
   : selectedLocalBundle.value?.dumpReport || packageDumps.value.find(dump => dump.package === selectedPackage.value) || null)
+function keepAttentionOpen(event: Event, key: string) { const element = event.target as HTMLDetailsElement; if (key === 'attention' && !element.open) element.open = true }
+const evidenceNoiseLayers = computed(() => codeNoiseLayers(allEvidenceFiles.value as any[]))
 const dexOwnershipEntries = computed<KernSightDexOwnershipEntry[]>(() => ownershipEvidenceEntries(selectedPackageDump.value?.dex_ownership?.schema_version, selectedPackageDump.value?.dex_ownership?.entries || []))
 const dexOwnershipAvailable = computed(() => Boolean(selectedPackageDump.value?.dex_ownership))
 const dexOwnershipSeeds = computed(() => selectedPackageDump.value?.dex_ownership?.inferred_internal_namespaces || [])
@@ -588,7 +653,7 @@ function dexOwnershipLabel(category: KernSightDexOwnershipCategory) {
     unknown: '未判断',
   } satisfies Record<KernSightDexOwnershipCategory, string>)[category]
 }
-const visibleLocalSessionBundles = computed(() => localEvidenceBundles.value.filter(bundle => bundle.sessionReport))
+const visibleLocalSessionBundles = computed(() => localEvidenceBundles.value.filter(bundle => bundle.sessionReport && !bundle.sessionReport.mobilee_capture_group))
 const completedSessions = computed(() => kernSight.value?.sessions.filter(session => session.state === 'completed').length || 0)
 const sensitiveFileCount = computed(() => packageDumps.value.reduce((total, dump) => total + (dump.sensitive_files?.length || 0), 0))
 const latestExecutionComplete = computed(() => Boolean(sessionReport.value?.execution_complete))
@@ -709,7 +774,7 @@ const dumpSummaries = computed(() => {
       return {
         package: dump.package,
         profile: ruleProfile || (Number(dump.runtime_blob_dex || dump.readable_dex || 0) ? '运行时 DEX / 壳形态候选' : '常规安装包 / 运行时工件'),
-        dex: dump.dex_index?.unique_dex ?? dump.readable_dex ?? 0,
+        dex: indexedDexCount(dump) ?? 0,
         dexObservations: dump.dex_index?.observations ?? 0,
         indexedClasses: dump.dex_index?.indexed_class_samples || 0,
         indexedMethods: dump.dex_index?.indexed_method_name_samples || 0,
@@ -787,8 +852,7 @@ const forensicSurfaces = computed(() => {
     { key: 'fd', icon: 'folder_open', label: 'FD / 取证文件', path: 'runtime/fd/ · forensics/', count: sum('fd_images'), detail: '打开文件与 spooled 会话哈希产物；文件存在不自动升级为运行时因果。' },
   ]
 })
-const evidenceFiles = computed(() => {
-  const matchesCategory = (path: string) => {
+const matchesEvidenceCategory = (path: string) => {
     const category = selectedEvidenceCategory.value
     if (!category) return true
     const roots: Record<string, string[]> = {
@@ -801,9 +865,10 @@ const evidenceFiles = computed(() => {
       fd: ['runtime/fd/', 'forensics/'],
     }
     return (roots[category] || []).some(prefix => path.startsWith(prefix))
-  }
+}
+const allEvidenceFiles = computed(() => {
   if (selectedLocalBundle.value) {
-    return selectedLocalBundle.value.files.filter(file => matchesCategory(file.relativePath)).map(file => ({
+    return selectedLocalBundle.value.files.map(file => ({
       package: selectedLocalBundle.value!.package,
       relative_path: file.relativePath,
       content_class: file.category,
@@ -844,8 +909,13 @@ const evidenceFiles = computed(() => {
       confirmed: false,
     })
   }
-  return [...files.values()].map(file => ({...file, codeEvidence:(dump.apk_member_evidence?.observations || []).filter(note => note.relative_path === file.relative_path)})).filter(file => matchesCategory(file.relative_path)).sort((left, right) => left.relative_path.localeCompare(right.relative_path))
+  return [...files.values()].map(file => ({...file, codeEvidence:(dump.apk_member_evidence?.observations || []).filter(note => note.relative_path === file.relative_path)})).sort((left, right) => left.relative_path.localeCompare(right.relative_path))
 })
+const evidenceFiles = computed(() => allEvidenceFiles.value.filter(file => matchesEvidenceCategory(file.relative_path)))
+const dexClassQuery = ref('')
+function dexClassMatches(object:any):{total:number;classes:string[]} {
+  return runtimeDexClassMatches(selectedPackageDump.value?.local_storage_accounting,object,dexClassQuery.value)
+}
 const analyzableArtifacts = computed<any[]>(() => {
   const dump = selectedPackageDump.value
   if (!dump) return []
@@ -1038,7 +1108,7 @@ const captureValid = computed(() => {
 const capturePolicyHint = computed(() => {
   if (!captureValid.value) return 'Inspect / Sched / Dump / 自动采集必须填写包名；时长 1–300 秒。'
   if (captureForm.plan === 'dump') return 'L2 dump --launch：force-stop 后由 dump 自己拉起 App，SIGSTOP 拷堆 DEX/SO/CE·DE。不是 eBPF 会话，不要同时挂 Inspect。'
-  if (captureForm.plan === 'auto' && captureForm.autoSessionMode === 'startup_replay') return '启动重采保留各能力自己的启动窗口：L0 → 重启 L1 → 该实例快照 → 重启 Linker。三个 session 不能冒充同一进程生命周期。失败停止并保留已有证据。'
+  if (captureForm.plan === 'auto' && captureForm.autoSessionMode === 'startup_replay') return '启动重采保留各能力自己的启动窗口：L0 → 重启 L1 → 该实例快照 → 重启 Linker。三个 session 不能冒充同一进程生命周期。已确认退出、清理和预算结算的额度 partial 可继续独立冷启动，父流程仍保留 partial；取消、清理未知或其它失败停止并保留已有证据。'
   if (captureForm.plan === 'auto') return `统一 session：首次冷启动 → L0 ${captureForm.autoL0Seconds}s → L0+L1 ${captureForm.autoL1Seconds}s → Linker ${captureForm.autoLinkerSeconds}s → 最终驻留快照。后续阶段不重启 App，主进程退出或代际变化则停止。界面显示计划等待，实际起止和失败由 agent 阶段记录核对。按业务顺序逐步操作；阶段成功不代表所有动态代码已覆盖。Memory all 仍是高流量选项。`
   if (captureForm.hideDebug) return 'Hide debug 会暂时断开 ADB；设备端 watchdog 在会话结束后恢复调试，MobileE 会等待重连。'
   if (captureForm.inspectMode === 'tls') return 'TLS Inspect 保留 bounded 明文 preview 与 SHA-256；AArch32 uprobe 在当前 GKI 可能返回 ENOTSUP。'
@@ -1173,10 +1243,12 @@ async function loadKernSight() {
   loadingKernSight.value = true
   probeError.value = ''
   try {
-    const [overview, dumps] = await Promise.all([
+    const [overview, dumps, groups] = await Promise.all([
       monitoringBackend.kernSightOverview(props.device.serial),
       monitoringBackend.kernSightPackageDumps(props.device.serial),
+      monitoringBackend.listKernSightGroups(props.device.serial),
     ])
+    captureGroups.value=groups
     kernSight.value = overview
     devicePackageDumps.value = dumps.map(dump => markRaw(dump))
     devicePackageNames.value = new Set(dumps.map(dump => dump.package))
@@ -1232,7 +1304,7 @@ async function importEvidenceArchive() {
   }
 }
 
-async function pullSelectedPackageEvidence() {
+async function pullSelectedPackageEvidence(parentId?:string) {
   if (!props.device || !selectedPackage.value || pullingPackage.value) return
   const destination = await save({
     defaultPath: `${selectedPackage.value}.mee`,
@@ -1243,10 +1315,10 @@ async function pullSelectedPackageEvidence() {
   pullingPackage.value = true
   probeError.value = ''
   evidenceError.value = ''
-  const expectedBytes = Number(selectedPackageDump.value?.physical_bytes ?? selectedPackageDump.value?.total_bytes ?? 0)
-  evidenceMessage.value = `正在拉取并封装 ${selectedPackage.value}${expectedBytes ? `（约 ${formatBytes(expectedBytes)}）` : ''}。目标旁会先出现 .part 文件，完成后原子替换为：${archivePath}`
+  const expectedBytes = Number(selectedPackageDump.value?.total_bytes ?? 0)
+  evidenceMessage.value = `正在拉取并封装 ME v2 内容引用归档 ${selectedPackage.value}${expectedBytes ? `（约 ${formatBytes(expectedBytes)}）` : ''}。目标旁会先出现 .part 文件，完成后原子替换为：${archivePath}`
   try {
-    const bundle = await monitoringBackend.pullKernSightPackageArchive(props.device.serial, selectedPackage.value, archivePath)
+    const bundle = await monitoringBackend.pullKernSightPackageArchive(props.device.serial, selectedPackage.value, archivePath, typeof parentId==='string'?parentId:undefined)
     upsertBundle(bundle)
     const dumps = new Map(packageDumps.value.map(dump => [dump.package, dump]))
     dumps.set(bundle.package, bundle.dumpReport)
@@ -1274,7 +1346,7 @@ async function exportSelectedEvidenceArchive() {
   pullingPackage.value = true
   probeError.value = ''
   evidenceError.value = ''
-  evidenceMessage.value = `正在导出 ${selectedLocalBundle.value.package} 的完整运行时证据：${archivePath}`
+  evidenceMessage.value = `正在导出 ${selectedLocalBundle.value.package} 的已留存运行时证据（覆盖仍按 partial/未知核对）：${archivePath}`
   try {
     const savedPath = await monitoringBackend.exportKernSightEvidenceArchive(selectedLocalBundle.value.root, archivePath)
     evidenceMessage.value = `MobileE 证据包已导出：${savedPath}`
@@ -1488,6 +1560,12 @@ function buildDumpBackbone(dump: KernSightPackageDumpReport, facts: {
 
 function buildCaptureRequest(inspectMode: typeof captureForm.inspectMode, durationSeconds: number, launchAfterAttach: boolean): KernSightCaptureRequest {
   return {
+    runtimePaths:captureForm.plan==='auto' && captureForm.isolatedRoot.trim()?{root:captureForm.isolatedRoot.trim(),agentPath:captureForm.isolatedAgent.trim()||`${captureForm.isolatedRoot.trim()}/ksightd`,expectedSha256:captureForm.isolatedSha256.trim()}:null,
+    sessionBudget:captureForm.plan==='auto'?{totalBytes:Number(captureForm.totalBudgetMiB)*1048576,maxSeconds:Number(captureForm.maxSessionSeconds)}:null,
+    codeOnly:captureCodeOnlyChoice(captureForm.codeOnly),
+    collectKeys:captureForm.plan==='auto'&&captureForm.collectKeys,
+    collectPrivate:captureForm.plan==='auto'&&captureForm.collectPrivate,
+    collectMemoryWindows:captureForm.plan==='auto'&&captureForm.collectMemoryWindows,
     serial: props.device!.serial,
     package: captureForm.package || null,
     durationSeconds,
@@ -1552,28 +1630,10 @@ async function startCapture() {
       capturePhase.value = 'L2 dump'
       captureResult.value = await monitoringBackend.dumpKernSightPackage(props.device.serial, captureForm.package, captureForm.hideDebug, false)
     } else if (captureForm.plan === 'auto') {
-      const durations = {
-        l0: Number(captureForm.autoL0Seconds),
-        l1: Number(captureForm.autoL1Seconds),
-        linker: Number(captureForm.autoLinkerSeconds),
-      }
-      // Validate the entire plan before the first backend/device operation.
-      buildAutoCaptureStages(durations.l0, durations.l1, durations.linker)
-      const runner = captureForm.autoSessionMode === 'unified' ? runUnifiedCapturePlan : runAutoCapturePlan
-      await runner(
-        buildCaptureRequest('none', durations.l0, false), durations, monitoringBackend,
-        stage => { capturePhase.value = stage.label; unifiedSessionAwaiting.value = stage.key === 'session' },
-        receipt => {
-          autoStageReceipts.value.push(receipt)
-          const logs = autoStageReceipts.value.map(item => item.result)
-          captureResult.value = {
-            ...mergeCaptureLogs(logs),
-            sessionId: autoStageReceipts.value.find(item => item.stage.key === 'l1' && item.succeeded)?.result.sessionId
-              || autoStageReceipts.value.find(item => item.succeeded && item.result.sessionId)?.result.sessionId,
-          }
-        },
-        captureForm.autoSessionMode === 'startup_replay',
-      )
+      const durations=[Number(captureForm.autoL0Seconds),Number(captureForm.autoL1Seconds),Number(captureForm.autoLinkerSeconds)]
+      buildAutoCaptureStages(durations[0]!,durations[1]!,durations[2]!,true)
+      const group=await monitoringBackend.beginKernSightGroup(buildCaptureRequest('none',durations[0]!,false),durations,captureForm.autoSessionMode==='startup_replay')
+      await executeCaptureGroup(group)
     } else {
       captureResult.value = await monitoringBackend.startKernSightCapture(buildCaptureRequest(captureForm.inspectMode, Number(captureForm.durationSeconds), false))
     }
@@ -1595,6 +1655,61 @@ async function startCapture() {
     captureTimer = undefined
   }
 }
+
+function groupLedger(bundle:KernSightLocalEvidenceBundle):Record<string,any>|undefined {return bundle.dumpReport.local_storage_accounting as Record<string,any>|undefined}
+function replaceCaptureGroup(group:KernSightCaptureGroup) {
+  captureGroups.value=[group,...captureGroups.value.filter(g=>g.id!==group.id)]
+  selectedCaptureGroup.value=group.id
+}
+async function executeCaptureGroup(group:KernSightCaptureGroup) {
+  runningCaptureGroup.value=group.id;replaceCaptureGroup(group)
+  try {
+    if(group.unified && group.stages.slice(0,3).some(s=>s.attempts[s.attempts.length-1]?.state!=='succeeded')) {
+      capturePhase.value=`统一阶段 · 主会话 ${shortSession(group.id)}`
+      const reply=await monitoringBackend.runKernSightUnifiedGroup(group.id)
+      group=reply.group;replaceCaptureGroup(group)
+      if(reply.result)captureResult.value=reply.result
+      if(reply.error)throw new Error(reply.error)
+      if(group.cancelRequested)return
+    }
+    for(const stage of group.stages) {
+      if(stage.attempts[stage.attempts.length-1]?.state==='succeeded')continue
+      capturePhase.value=`${stage.key} · 主会话 ${shortSession(group.id)}`
+      const reply=await monitoringBackend.runKernSightGroupStage(group.id,stage.key)
+      group=reply.group;replaceCaptureGroup(group)
+      if(reply.result) {
+        const receipt:AutoStageReceipt={stage:{key:stage.key as 'l0'|'l1'|'linker'|'dump',label:stage.key,launchAfterAttach:stage.launchAfterAttach,durationSeconds:stage.durationSeconds},result:reply.result,succeeded:!reply.error}
+        autoStageReceipts.value.push(receipt);captureResult.value={...mergeCaptureLogs(autoStageReceipts.value.map(r=>r.result)),sessionId:reply.result.sessionId}
+      }
+      if(reply.error && !reply.continueAfterPartial)throw new Error(reply.error)
+      if(group.cancelRequested)break
+    }
+  } finally {runningCaptureGroup.value=''}
+}
+async function resumeCaptureGroup(group:KernSightCaptureGroup) {
+  if(captureRunning.value)return
+  captureRunning.value=true;probeError.value=''
+  try {await executeCaptureGroup(group);await loadKernSight()}catch(error){probeError.value=readableError(error)}finally{captureRunning.value=false;capturePhase.value=''}
+}
+async function cancelCaptureGroup(group:KernSightCaptureGroup) {
+  try {replaceCaptureGroup(await monitoringBackend.cancelKernSightGroup(group.id))}catch(error){probeError.value=readableError(error)}
+}
+async function openGroupedSession(group:KernSightCaptureGroup,sessionId:string) {
+  selectedCaptureGroup.value=group.id
+  const local=importedCaptureGroups.value.find(item=>item.group.id===group.id)
+  if(local) {
+    selectedReport.value=await monitoringBackend.localKernSightChildReport(local.bundle.root,group.id,sessionId)
+    selectedSession.value=sessionId
+  } else {
+    selectedReport.value=await monitoringBackend.kernSightGroupSessionReport(group.id,group.serial,group.package,sessionId)
+    selectedSession.value=sessionId
+    if(selectedReport.value) {
+      selectedReport.value.report.mobilee_capture_group=group
+      selectedReport.value.report.mobilee_capture_edges=captureGroupEdges(group)
+    }
+  }
+}
+async function pullCaptureGroup(group:KernSightCaptureGroup) {selectPackage(group.package);await pullSelectedPackageEvidence(group.id)}
 
 async function copyAiContext() {
   try {
@@ -2039,6 +2154,14 @@ onBeforeUnmount(() => {
 .ks-session-detail-tabs button{padding:7px 10px;color:#718199;font-size:7px;border:1px solid var(--line);border-radius:7px;background:transparent}.ks-session-detail-tabs button.active{color:#a9c8ff;border-color:rgba(57,125,246,.4);background:rgba(57,125,246,.1)}
 .ks-session-list { display: grid; gap: 6px; margin-top: 12px; }
 .ks-session-row{display:grid;grid-template-columns:minmax(0,1fr) auto;align-items:stretch;overflow:hidden;border:1px solid var(--line);border-radius:10px;background:var(--surface-soft)}
+/* Parent details must keep native summary flow; the legacy row grid hides its toggle. */
+details.ks-session-row { display: block; }
+details.ks-session-row > summary { display: list-item; list-style-position: inside; padding: 10px 12px; cursor: pointer; font-size: 12px; }
+details.ks-session-row > summary strong { display: inline; font-size: 12px; }
+details.ks-session-row > article { padding: 12px; border-top: 1px solid var(--line); overflow-wrap: anywhere; }
+details.ks-session-row > article > strong { font-size: 12px; }
+details.ks-session-row > p, details.ks-session-row > small, details.ks-session-row > details { margin: 10px 12px; overflow-wrap: anywhere; }
+details.ks-session-row pre { max-height: 360px; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; font-size: 11px; }
 .ks-session-row:hover,.ks-session-row.active{border-color:rgba(57,125,246,.35);background:rgba(57,125,246,.07)}
 .ks-session-open{display:grid;grid-template-columns:minmax(150px,.8fr) minmax(180px,1fr) auto;align-items:center;gap:12px;width:100%;padding:10px 12px;border:0;color:inherit;text-align:left;background:transparent}
 .ks-session-delete-slot{display:flex;min-width:88px;align-items:stretch}.ks-session-delete,.ks-session-delete-cancel{min-width:72px;padding:8px 10px;border:0;border-left:1px solid var(--line);font-size:8px}.ks-session-delete{color:#e8b4b4;background:rgba(214,74,74,.06)}.ks-session-delete:hover{background:rgba(214,74,74,.14)}.ks-session-delete.confirm{color:#fff;background:#8f2f38;font-weight:600}.ks-session-delete.confirm:hover{background:#a33b45}.ks-session-delete-cancel{color:#9aa8bb;background:rgba(255,255,255,.03)}.ks-session-delete-cancel:hover{background:rgba(255,255,255,.08)}.ks-session-row.pending-delete{border-color:rgba(216,109,120,.45)}
