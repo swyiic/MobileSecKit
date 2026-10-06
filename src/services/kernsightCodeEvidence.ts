@@ -25,6 +25,55 @@ export function allocatedEvidenceLabel(value: unknown): string {
   return typeof value === 'number' && Number.isFinite(value) && value >= 0 ? `${value.toLocaleString()} B` : '未知'
 }
 
+function presentByte(value: unknown): number | null {
+  return typeof value === 'number' && Number.isFinite(value) && value >= 0 ? value : null
+}
+
+function formatScanBytes(value: unknown): string {
+  const amount = presentByte(value)
+  if (amount == null) return '未知'
+  if (amount === 0) return '0 B'
+  const units = ['B', 'KiB', 'MiB', 'GiB', 'TiB']
+  let size = amount
+  let unit = 0
+  while (size >= 1024 && unit < units.length - 1) { size /= 1024; unit += 1 }
+  return `${size >= 10 || unit === 0 ? size.toFixed(0) : size.toFixed(1)} ${units[unit]}`
+}
+
+type ScanInspection = {
+  file_bytes?: unknown
+  scanned_bytes?: unknown
+  scanned_through_offset?: unknown
+  unscanned_tail_bytes?: unknown
+  candidate_stop_reason?: unknown
+  status?: unknown
+  [key: string]: unknown
+}
+
+/** Scan range, stop reason, and unread tail. A missing field stays 未知. */
+export function dexScanSummary(inspection?: ScanInspection | null): string {
+  if (!inspection) return '未知（旧数据未检查）'
+  const file = formatScanBytes(inspection.file_bytes)
+  const scanned = formatScanBytes(inspection.scanned_through_offset ?? inspection.scanned_bytes)
+  const tail = formatScanBytes(inspection.unscanned_tail_bytes)
+  const stop = typeof inspection.candidate_stop_reason === 'string' && inspection.candidate_stop_reason.trim()
+    ? inspection.candidate_stop_reason
+    : '未知'
+  const status = typeof inspection.status === 'string' && inspection.status.trim() ? inspection.status : '未知'
+  return `${status} · 文件 ${file} · DEX 扫描到 ${scanned} · 停止 ${stop} · 未扫描尾部 ${tail}`
+}
+
+export function dexScanSummaryForObject(observations: unknown, sha: unknown): string {
+  if (typeof sha !== 'string' || !sha || !Array.isArray(observations)) return dexScanSummary(null)
+  for (const range of observations) {
+    if (!range || typeof range !== 'object') continue
+    const inspection = (range as { object_inspection?: { derived_objects?: Array<{ sha256?: string }> } }).object_inspection
+    const derived = inspection?.derived_objects
+    if (Array.isArray(derived) && derived.some(object => object?.sha256 === sha)) return dexScanSummary(inspection)
+  }
+  return '未知（没有对应的扫描记录）'
+}
+
 export function ownershipEvidenceEntries(schema: unknown, entries: Array<Record<string, any>>): any[] {
   return schema === 'mobilee.kernsight-dex-ownership/v4' ? entries : entries.map(entry => ({...entry, category:'unknown',confidence:0,reasons:['旧归属 schema 缺少本轮可重建依据；原记录保留，不能当作已验证归属']}))
 }
