@@ -164,7 +164,17 @@ pub(super) fn objects(
                     .as_array()
                     .map(|items| items.len())
                     .unwrap_or(0);
-                object["ownership"] = json!(if indexed > 0 && packer == indexed {
+                let partial = index["status"] == "partial_class_def_index"
+                    || index["omitted_classes"].as_u64().unwrap_or(0) > 0;
+                let shell_mixed = packer > 0 && packer < indexed;
+                if partial || shell_mixed {
+                    object["classification_basis"] = json!(
+                        "candidate only; a shell mixed with other classes, or a partial index, is not a pure ownership judgment"
+                    );
+                }
+                object["ownership"] = json!(if partial || shell_mixed {
+                    "mixed_or_unknown"
+                } else if indexed > 0 && packer == indexed {
                     "packer_shell"
                 } else if own + manifest > 0 && sdk + unknown > 0 {
                     "mixed_or_unknown"
@@ -307,6 +317,48 @@ mod tests {
         assert_eq!(unpacked_row["ownership"], "mixed_or_unknown");
         let shell_row = objects.iter().find(|row| row["sha256"] == shell).unwrap();
         assert_eq!(shell_row["ownership"], "packer_shell");
+    }
+    #[test]
+    fn shell_mixed_with_business_and_a_partial_index_stay_candidates() {
+        let mixed = "d".repeat(64);
+        let partial = "e".repeat(64);
+        let sets = json!([
+            {
+                "sha256": mixed,
+                "bytes": 100,
+                "canonical_relative_path": "runtime/mixed.dex",
+                "semantic": {
+                    "class_defs": 2,
+                    "class_descriptors_truncated": false,
+                    "class_descriptors": ["Lcom/pkg/Main;", "Lcom/secneo/apkwrapper/H;"]
+                }
+            },
+            {
+                "sha256": partial,
+                "bytes": 100,
+                "canonical_relative_path": "runtime/partial.dex",
+                "semantic": {
+                    "class_defs": 6,
+                    "class_descriptors_truncated": true,
+                    "class_descriptors": ["Lcom/pkg/OnlySeen;"]
+                }
+            }
+        ]);
+        let result = objects(&[], &sets, "com.pkg", &json!([]), &json!(null));
+        let objects = result["objects"].as_array().unwrap();
+        let mixed_row = objects.iter().find(|row| row["sha256"] == mixed).unwrap();
+        assert_eq!(mixed_row["ownership"], "mixed_or_unknown");
+        assert!(mixed_row["classification_basis"]
+            .as_str()
+            .unwrap()
+            .contains("candidate"));
+        let partial_row = objects.iter().find(|row| row["sha256"] == partial).unwrap();
+        assert_eq!(partial_row["class_index_status"], "partial_class_def_index");
+        assert_eq!(partial_row["ownership"], "mixed_or_unknown");
+        assert!(partial_row["classification_basis"]
+            .as_str()
+            .unwrap()
+            .contains("candidate"));
     }
     #[test]
     fn complete_runtime_index_is_not_replaced_by_a_truncated_producer_list() {

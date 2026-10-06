@@ -399,17 +399,36 @@ fn dex_layout_diagnostics(bytes: &[u8]) -> Value {
     let bounds = data_end <= declared && link_end <= declared && declared == bytes.len() as u64;
     json!({"status":if !bounds {"declared_spans_out_of_bounds"} else if end<declared {"declared_spans_leave_unaccounted_tail"}else{"declared_spans_cover_file"},"actual_bytes":bytes.len(),"declared_file_bytes":declared,"declared_data_start":data_off,"declared_data_bytes":data_size,"declared_data_end":data_end,"declared_link_start":link_off,"declared_link_bytes":link_size,"trailing_unaccounted_bytes":declared.saturating_sub(end),"full_dex_verifier":false,"scope":"header-declared data/link spans only; map entries and instruction code items not fully validated; trailing bytes remain uninterpreted"})
 }
-fn fitting_dex_images(bytes: &[u8]) -> (Vec<(usize, usize)>, Vec<Value>) {
+struct DexCandidateScan {
+    images: Vec<(usize, usize)>,
+    rejected: Vec<Value>,
+    stop_reason: Option<&'static str>,
+    scanned_through: usize,
+}
+
+fn fitting_dex_images(bytes: &[u8]) -> DexCandidateScan {
     let mut images = Vec::new();
     let mut rejected = Vec::new();
     let mut search = 0_usize;
+    let mut stop_reason = None;
+    let mut scanned_through = 0_usize;
     // Step through every `dex\n`, including ones inside a shell whose declared
     // length covers a later image. Do not jump to `at + declared`.
-    while search.saturating_add(4) <= bytes.len() && images.len() < 64 {
+    // Stop at 64 candidates and say so; do not treat the unread tail as scanned.
+    while search.saturating_add(4) <= bytes.len() {
+        if images.len() >= 64 {
+            stop_reason = Some("accepted_image_limit");
+            break;
+        }
+        if rejected.len() >= 64 {
+            stop_reason = Some("rejected_candidate_limit");
+            break;
+        }
         let Some(rel) = bytes[search..]
             .windows(4)
             .position(|window| window == b"dex\n")
         else {
+            scanned_through = bytes.len();
             break;
         };
         let at = search.saturating_add(rel);
@@ -457,13 +476,24 @@ fn fitting_dex_images(bytes: &[u8]) -> (Vec<(usize, usize)>, Vec<Value>) {
             }));
         }
         search = at.saturating_add(4);
+        scanned_through = search;
     }
-    (images, rejected)
+    DexCandidateScan {
+        images,
+        rejected,
+        stop_reason,
+        scanned_through,
+    }
 }
 
 fn inspect_runtime_bytes_with_class_budget(bytes: &[u8], _class_budget: &mut usize) -> Value {
     let elf_magic = bytes.windows(4).filter(|b| *b == b"\x7fELF").count();
-    let (images, mut rejected) = fitting_dex_images(bytes);
+    let DexCandidateScan {
+        images,
+        mut rejected,
+        stop_reason,
+        scanned_through,
+    } = fitting_dex_images(bytes);
     let mut objects = Vec::new();
     for (offset, len) in images {
         let slice = &bytes[offset..offset.saturating_add(len)];
@@ -474,7 +504,7 @@ fn inspect_runtime_bytes_with_class_budget(bytes: &[u8], _class_budget: &mut usi
             None => rejected.push(json!({"source_offset":offset,"reason":"semantic_tables_invalid_or_unsupported","declared_length":len,"complete_dex_validated":false})),
         }
     }
-    json!({"status":if objects.is_empty() && rejected.is_empty() && elf_magic==0 {"no_dex_or_elf_header_in_retained_range"} else {"bounded_candidate_inspection"},"scanned_bytes":bytes.len(),"dex_magic_count":objects.len()+rejected.len(),"elf_magic_count":elf_magic,"elf_header":super::elf_runtime::header(bytes),"derived_objects":objects,"rejected_candidates":rejected,"elf_status":if elf_magic==0 {"no_elf_header"} else {"unknown_no_linked_elf_reconstruction_parser"},"boundary":"this retained range only; headerless JIT, unselected pages and unread bytes remain unknown"})
+    json!({"status":if objects.is_empty() && rejected.is_empty() && elf_magic==0 {"no_dex_or_elf_header_in_retained_range"} else {"bounded_candidate_inspection"},"scanned_bytes":bytes.len(),"scanned_through_offset":scanned_through,"candidate_stop_reason":stop_reason,"omitted_after_stop":stop_reason.is_some() && scanned_through < bytes.len(),"dex_magic_count":objects.len()+rejected.len(),"elf_magic_count":elf_magic,"elf_header":super::elf_runtime::header(bytes),"derived_objects":objects,"rejected_candidates":rejected,"elf_status":if elf_magic==0 {"no_elf_header"} else {"unknown_no_linked_elf_reconstruction_parser"},"boundary":"this retained range only; headerless JIT, unselected pages and unread bytes remain unknown"})
 }
 
 fn dex_adler32(bytes: &[u8]) -> u32 {
@@ -594,6 +624,29 @@ mod tests {
         assert_eq!(objects[0]["source_offset"], 0x70);
         assert_eq!(objects[0]["length"], 0x70);
         assert_eq!(objects[0]["length_matches_declared"], true);
+    }
+    #[test]
+    fn sixty_four_bad_candidates_stop_before_a_later_real_dex() {
+        let mut bytes = Vec::new();
+        for _ in 0..64 {
+            bytes.extend_from_slice(b"dex\nXXXX");
+        }
+        let real_at = bytes.len();
+        bytes.extend_from_slice(b"dex\n035\0");
+        bytes.resize(real_at + 112, 0);
+        bytes[real_at + 32..real_at + 36].copy_from_slice(&112_u32.to_le_bytes());
+        bytes[real_at + 36..real_at + 40].copy_from_slice(&112_u32.to_le_bytes());
+        bytes[real_at + 40..real_at + 44].copy_from_slice(&0x1234_5678_u32.to_le_bytes());
+        let view = inspect_runtime_bytes(&bytes);
+        assert!(view["derived_objects"].as_array().unwrap().is_empty());
+        assert_eq!(view["rejected_candidates"].as_array().unwrap().len(), 64);
+        assert_eq!(view["candidate_stop_reason"], "rejected_candidate_limit");
+        assert!(view["scanned_through_offset"].as_u64().unwrap() <= real_at as u64);
+        assert_eq!(view["omitted_after_stop"], true);
+        assert!(
+            view["scanned_through_offset"].as_u64().unwrap()
+                < view["scanned_bytes"].as_u64().unwrap()
+        );
     }
     #[test]
     fn tree_budget_keeps_a_later_range_after_the_old_128mib_pool_would_be_spent() {
