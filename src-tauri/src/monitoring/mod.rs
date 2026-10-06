@@ -2866,7 +2866,7 @@ pub async fn import_kernsight_evidence_directory(
             }
         }
     }
-    dump_report["content_dex_class_index"] = dex_class_index::objects(
+    let mut content_dex_class_index = dex_class_index::objects(
         dump_report["local_storage_accounting"]["runtime_observations"]
             .as_array()
             .map(Vec::as_slice)
@@ -2879,6 +2879,33 @@ pub async fn import_kernsight_evidence_directory(
             .map(|r| r["mobilee_capture_group"]["id"].clone())
             .unwrap_or(Value::Null),
     );
+    if let Some(notes) = dump_report
+        .get("warnings")
+        .and_then(|value| value.as_array())
+    {
+        let payload: Vec<Value> = notes
+            .iter()
+            .filter(|note| note.as_str().is_some_and(|text| text.contains("dexdata0")))
+            .cloned()
+            .collect();
+        if !payload.is_empty() {
+            content_dex_class_index["dexdata0_notes"] = serde_json::json!(payload);
+        }
+    }
+    if let Some(packed) = dump_report.get("packed_plaintext_names") {
+        if !packed.as_array().is_some_and(Vec::is_empty) {
+            content_dex_class_index["packed_plaintext_names"] = packed.clone();
+            content_dex_class_index["packed_plaintext_status"] = serde_json::json!(
+                "names are plaintext type descriptors inside dexdata0; they are not class_defs and the bytecode is not decrypted"
+            );
+        }
+    }
+    if let Some(symbols) = dump_report.get("dynamic_symbols") {
+        if !symbols.as_array().is_some_and(Vec::is_empty) {
+            dump_report["content_elf_symbols"] = symbols.clone();
+        }
+    }
+    dump_report["content_dex_class_index"] = content_dex_class_index;
     if let Some(report) = session_report
         .as_mut()
         .filter(|r| r.get("mobilee_capture_group").is_some())
@@ -3059,7 +3086,21 @@ fn enrich_local_dex_ownership(dump_report: &mut Value, package: &str) {
         let classified = business + internal + sdk;
         let has_first_party = business + internal > 0;
         let has_non_first_party = sdk + unknown > 0;
-        let category = if total == 0 {
+        let secneo_classes = descriptors
+            .iter()
+            .filter(|descriptor| {
+                descriptor
+                    .trim_start_matches('[')
+                    .trim_start_matches('L')
+                    .trim_end_matches(';')
+                    .to_ascii_lowercase()
+                    .starts_with("com/secneo/apkwrapper/")
+            })
+            .count();
+        let packer_shell = total > 0 && total <= 512 && business == 0 && secneo_classes > 0;
+        let category = if packer_shell {
+            "dynamic_payload"
+        } else if total == 0 {
             "unknown"
         } else if has_first_party && has_non_first_party {
             "mixed"
@@ -3099,7 +3140,7 @@ fn enrich_local_dex_ownership(dump_report: &mut Value, package: &str) {
             "third_party_classes": sdk,
             "unknown_classes": unknown,
             "dominant_namespaces": namespace_rows.into_iter().take(6).map(|(name, count)| format!("{name} ({count})")).collect::<Vec<_>>(),
-            "reasons": [format!("类样本 {total}：业务 {business}、内部组件 {internal}、第三方 SDK {sdk}、未知 {unknown}"), if runtime_only { String::from("仅在内存/堆载荷中观察到") } else { String::from("包含安装态或可读 DEX 来源") }],
+            "reasons": [format!("类样本 {total}：业务 {business}、内部组件 {internal}、第三方 SDK {sdk}、未知 {unknown}"), if packer_shell { String::from("SecNeo apkwrapper 壳；业务类不在这张 DEX 里") } else if runtime_only { String::from("仅在内存/堆载荷中观察到") } else { String::from("包含安装态或可读 DEX 来源") }],
         }));
     }
     if let Some(object) = dump_report.as_object_mut() {
@@ -3139,7 +3180,10 @@ fn is_mobilee_sdk_namespace(path: &str) -> bool {
         "androidx/",
         "com/airbnb/",
         "com/alibaba/fastjson/",
+        "com/alipay/",
         "com/bumptech/glide/",
+        "com/fasterxml/",
+        "com/meizu/",
         "com/facebook/",
         "com/google/",
         "com/huawei/hms/",

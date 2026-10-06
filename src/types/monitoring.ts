@@ -382,6 +382,9 @@ export interface KernSightPackageDumpReport {
   http_calls?: Array<Record<string, unknown>>
   http_code_refs?: Array<Record<string, unknown>>
   jni_exports?: Array<{ relative_path?: string; names?: string[] }>
+  recovered_sm4_key?: string | null
+  packed_plaintext_names?: Array<{ sha256?: string; sidecar?: string; count?: number; truncated?: boolean; splash_names?: string[]; note?: string }>
+  dynamic_symbols?: Array<{ relative_path?: string; defined_function_count?: number; names?: string[]; status?: string }>
   key_slots?: number
   secneo_decrypted?: number
   artifacts?: unknown[]
@@ -402,7 +405,7 @@ export interface KernSightPackageDumpReport {
   mobilee_archive_coverage?: { status: 'partial' | 'unknown'; scope?: string; complete_collection?: false }
   mobilee_transport_status?: { complete: false; status: 'partial'; notes: Array<Record<string, unknown>>; scope: string }
   local_storage_accounting?: { logical_file_bytes: number; allocated_bytes: number | null; verified_code_duplicate_bytes: number; runtime_observations?: Array<Record<string, any>>; elf_module_observations?: Array<Record<string, any>>; runtime_source_diagnostics?: Array<Record<string, unknown>>; [key: string]: unknown }
-  content_dex_class_index?: { schema: string; scope: string; objects: Array<{sha256: string; bytes: number; sources: Array<Record<string, any>>; ownership: string; declared_classes: number | null; indexed_classes: number | null; class_index_status: string; layout_diagnostics?: Record<string, any>; validation_status?: string; sha1_signature_verified?: boolean | null; adler32_checksum_verified?: boolean | null; class_hints?: Record<string, number>}> }
+  content_dex_class_index?: { schema: string; scope: string; objects: Array<{sha256: string; bytes: number; sources: Array<Record<string, any>>; ownership: string; declared_classes: number | null; indexed_classes: number | null; omitted_classes?: number | null; classes?: string[]; declared_file_bytes?: number | null; length_matches_declared?: boolean | null; class_index_status: string; layout_diagnostics?: Record<string, any>; validation_status?: string; sha1_signature_verified?: boolean | null; adler32_checksum_verified?: boolean | null; class_hints?: Record<string, number>}> }
   apk_member_evidence?: { observations?: Array<Record<string, any>>; omitted_observations?: number; status?: string }
   storage_accounting?: string | null
   unique_inode_bytes?: number | null

@@ -185,7 +185,7 @@
           <p>预算累计写入准入及终态预留；读取不计入此计量。唯一内容、传输量和磁盘峰值另核算。有效 partial 归档仅保存已收到路径，不补齐缺页或失败字节。</p>
           <p>阶段独立进程与启动；未拉取时唯一内容/物理占用未知，执行成功不等于数据覆盖完整。</p>
           <p v-for="item in importedCaptureGroups.filter(i=>i.group.id===group.id)" :key="item.bundle.root">本次导入树：逻辑 {{ formatBytes(Number(groupLedger(item.bundle)?.logical_file_bytes||0)) }} · 唯一 inode {{ groupLedger(item.bundle)?.unique_inode_bytes==null?'未知':formatBytes(Number(groupLedger(item.bundle)?.unique_inode_bytes)) }} · 实际分配 {{ allocatedEvidenceLabel(groupLedger(item.bundle)?.allocated_bytes) }} · 已核验代码唯一 {{ formatBytes(Number(groupLedger(item.bundle)?.verified_code_unique_bytes||0)) }}（其余内容未核验）；归档范围 {{ archiveCoverageLabel(item.bundle.dumpReport.mobilee_archive_coverage) }}；{{ item.bundle.sessionReport?.mobilee_capture_source_status }} · 传输 {{ item.bundle.dumpReport.mobilee_transport_status ? 'partial（收到的目录不完整，归档可能未生成）' : '无 partial 终态记录；完整性另按预算与源清单核对' }}</p>
-          <details v-for="item in importedCaptureGroups.filter(i=>i.group.id===group.id)" :key="`classes-${item.bundle.root}`"><summary>DEX 完整类索引与独立来源</summary><p v-if="!item.bundle.dumpReport.content_dex_class_index">旧数据：完整类索引未知。</p><section v-for="bucket in dexObjectGroups(item.bundle.dumpReport.content_dex_class_index?.objects)" :key="bucket.kind" :data-dex-group="bucket.kind"><h4>{{ bucket.label }}</h4><article v-for="object in bucket.objects" :key="`${object.sha256}:${object.bytes}`"><p>{{ object.sha256 }} · {{ object.sources.length }} 来源 · {{ object.indexed_classes ?? '未知' }} / {{ object.declared_classes ?? '未知' }} 类 · {{ object.class_index_status }} · {{ object.validation_status || '校验未知（旧字段）' }} · {{ object.ownership }}</p><pre>{{ object.class_hints }}</pre><details><summary>来源与实例</summary><pre>{{ object.sources }}</pre></details><input v-model="dexClassQuery" placeholder="类名片段（最多显示100项）" /><pre>{{ runtimeDexClassMatches(item.bundle.dumpReport.local_storage_accounting,object,dexClassQuery).classes.join('\n') }}</pre></article></section></details>
+          <details v-for="item in importedCaptureGroups.filter(i=>i.group.id===group.id)" :key="`classes-${item.bundle.root}`"><summary>DEX 完整类索引与独立来源</summary><p v-if="!item.bundle.dumpReport.content_dex_class_index">旧数据：完整类索引未知。</p><section v-for="bucket in dexObjectGroups(item.bundle.dumpReport.content_dex_class_index?.objects)" :key="bucket.kind" :data-dex-group="bucket.kind"><h4>{{ bucket.label }}</h4><article v-for="object in bucket.objects" :key="`${object.sha256}:${object.bytes}`"><p>{{ object.sha256 }} · {{ object.sources.length }} 来源 · {{ object.indexed_classes ?? '未知' }} / {{ object.declared_classes ?? '未知' }} 类 · {{ object.class_index_status }} · {{ object.validation_status || '校验未知（旧字段）' }} · {{ object.ownership }}</p><pre>{{ object.class_hints }}</pre><details><summary>来源与实例</summary><pre>{{ object.sources }}</pre></details><input v-model="dexClassQuery" placeholder="类名片段，检索全部已索引类" /><p>匹配 {{ runtimeDexClassMatches(item.bundle.dumpReport.local_storage_accounting,object,dexClassQuery).total }} · 本页 {{ runtimeDexClassMatches(item.bundle.dumpReport.local_storage_accounting,object,dexClassQuery).classes.length }} · 未展开 {{ runtimeDexClassMatches(item.bundle.dumpReport.local_storage_accounting,object,dexClassQuery).omitted }}。未展开的类名仍在索引里，换一个片段可以查到。</p><pre>{{ runtimeDexClassMatches(item.bundle.dumpReport.local_storage_accounting,object,dexClassQuery).classes.join('\n') }}</pre></article></section></details>
           <details v-for="item in importedCaptureGroups.filter(i=>i.group.id===group.id)" :key="`elf-${item.bundle.root}`"><summary>ELF 加载段覆盖（不是完整 SO 文件）</summary><p v-if="!groupLedger(item.bundle)?.elf_module_observations?.length">旧数据或未验证加载段：解析与覆盖未知。</p><article v-for="module in groupLedger(item.bundle)?.elf_module_observations || []" :key="`${module.source_report}:${module.path}`"><p>{{ module.path }} · PID {{ module.source?.pid ?? '未知' }} / birth {{ module.source?.birth_ns ?? '未知' }} · {{ module.source_report }}</p><p>PT_LOAD 文件部分：{{ elfLoadCoverageLabel(module.all_load_file_bytes_covered) }} · 内存部分（含 BSS）：{{ elfLoadCoverageLabel(module.all_load_memory_bytes_covered) }} · 完整 SO 未重建 · live/torn · 业务/SDK 归属未知</p><p>文件偏移关联由保留的 ELF 头推导，原 maps 未记录文件偏移；未补缺失节表、重定位或未读字节。</p><table v-if="module.segments?.length"><thead><tr><th>文件偏移</th><th>虚拟地址</th><th>文件字节</th><th>内存字节</th><th>文件缺口</th><th>内存缺口</th></tr></thead><tbody><tr v-for="(segment,index) in module.segments" :key="index"><td>{{ segment.file_offset }}</td><td>{{ segment.virtual_start }}</td><td>{{ segment.file_bytes }}</td><td>{{ segment.memory_bytes }}</td><td>{{ segment.file_backed_gaps?.length ? segment.file_backed_gaps : '无（列示范围）' }}</td><td>{{ segment.memory_gaps?.length ? segment.memory_gaps : '无（列示范围）' }}</td></tr></tbody></table><details><summary>原始范围、hash 与派生偏移链</summary><pre>{{ module }}</pre></details></article></details>
           <details v-for="item in importedCaptureGroups.filter(i=>i.group.id===group.id)" :key="`source-diagnostics-${item.bundle.root}`"><summary>运行时来源记录诊断</summary><p v-if="!groupLedger(item.bundle)?.runtime_source_diagnostics">旧数据：逐来源诊断未知。</p><p>来源上限 {{ groupLedger(item.bundle)?.runtime_source_limit ?? '未知' }} · 未处理来源 {{ groupLedger(item.bundle)?.runtime_sources_omitted ?? '未知' }}</p><pre>{{ groupLedger(item.bundle)?.runtime_source_diagnostics }}</pre></details>
           <details v-for="item in importedCaptureGroups.filter(i=>i.group.id===group.id)" :key="`runtime-${item.bundle.root}`"><summary>运行时代码范围（不代表完整 DEX/SO 或总覆盖率）</summary><p v-if="!groupLedger(item.bundle)?.runtime_observations?.length">旧数据或无范围记录：已提取、解析与来源状态未知。</p><article v-for="(range,index) in groupLedger(item.bundle)?.runtime_observations || []" :key="index"><p>{{ range.mapping?.path || '映射来源未知' }} · PID {{ range.source?.pid ?? '未知' }} / birth {{ range.source?.birth_ns ?? '未知' }} / exec {{ range.source?.exec_id ?? '未知' }} · {{ range.source_identity_status }}</p><p>请求 {{ range.read?.requested_length ?? '未知' }} B · 实际读 {{ range.read?.actual_length ?? '未知' }} B · 留存 {{ range.retained_file_bytes ?? '未知' }} B · {{ range.local_content_status }} · 映射完整 {{ range.mapping_complete == null ? '未知' : range.mapping_complete ? '是' : '否' }} · torn {{ range.read?.torn == null ? '未知' : range.read.torn ? '是' : '否' }}</p><p>映射 {{ range.requested_mapping_bytes ?? '未知' }} B · 选区 {{ range.selection_limit_bytes ?? '未知' }} B · 选区原因 {{ range.selection_limit_reason || '未知（旧数据缺字段）' }}；预算截断选区不等于读取失败。</p><p>读取 {{ range.read?.read_status || '未知' }} · 落盘 {{ range.read?.write_status || '未知' }} · 解析 {{ range.parse_status }} · 分类 {{ range.ownership }} · {{ range.relative_path }} · {{ range.source_report }}</p><p>派生关联：{{ range.derived == null ? '未知（缺字段）' : range.derived.length ? '原生产者记录，未在此范围核验语义' : '未记录提取 DEX/SO 的关联' }}</p><pre v-if="range.derived?.length">{{ range.derived }}</pre><p>本地对象检查：{{ range.object_inspection?.status || '未知（旧数据未检查）' }} · 已检查 {{ range.object_inspection?.scanned_bytes ?? '未知' }} B · DEX 候选 {{ range.object_inspection?.dex_magic_count ?? '未知' }} · ELF 标记（未验证为完整对象）{{ range.object_inspection?.elf_magic_count ?? '未知' }}；只检查留存范围，不代表 headerless JIT 或未读页没有代码。</p><pre v-if="range.object_inspection?.derived_objects?.length || range.object_inspection?.rejected_candidates?.length">{{ range.object_inspection }}</pre></article></details>
@@ -381,17 +381,28 @@
     </section>
 
     <section v-if="workspaceMode === 'evidence' && selectedPackageDump" class="panel ks-package-evidence-panel">
-      <div class="section-title compact"><div><div class="eyebrow">FORENSIC EVIDENCE</div><h2>{{ selectedPackage }} · 产物与私有文件</h2><p>MobileE 会在载入后自动整理文件、内存、会话与映射关系；文件存在本身不代表本次运行已经执行或外发。</p></div><span class="device-chip">{{ evidenceFiles.length.toLocaleString() }} FILES · {{ allocatedEvidenceLabel(selectedPackageDump.local_storage_accounting?.allocated_bytes ?? selectedPackageDump.physical_bytes) }}</span></div>
+      <div class="section-title compact"><div><div class="eyebrow">FORENSIC EVIDENCE</div><h2>{{ selectedPackage }} · 产物与私有文件</h2><p>MobileE 会在载入后自动整理文件、内存、会话与映射关系；文件存在本身不代表本次运行已经执行或外发。</p></div><span class="device-chip">{{ evidenceFiles.length.toLocaleString() }} FILES · {{ formatMaybeBytes(selectedPackageDump.local_storage_accounting?.allocated_bytes ?? selectedPackageDump.physical_bytes) }}</span></div>
       <template v-if="selectedPackageDump">
       <div class="ks-selected-package-bar"><button v-if="device && selectedEvidenceSource === 'device'" class="primary-button" :disabled="pullingPackage" @click="pullSelectedPackageEvidence()">{{ pullingPackage ? '正在拉取并解析…' : '拉取全部信息' }}</button><button v-else-if="selectedLocalBundle" class="ghost-button" :disabled="pullingPackage" @click="exportSelectedEvidenceArchive">{{ pullingPackage ? '正在封装…' : '导出 .mee' }}</button><b :class="`source-${selectedEvidenceSource}`">{{ selectedEvidenceSource === 'local' ? 'MAC 本地证据' : '手机端证据' }}</b><span>Dump {{ selectedPackageDump.dump_id || 'legacy' }}</span><span v-if="selectedPackageDump.local_storage_accounting">本地逻辑 {{ formatBytes(Number(selectedPackageDump.local_storage_accounting.logical_file_bytes)) }} · 分配 {{ allocatedEvidenceLabel(selectedPackageDump.local_storage_accounting.allocated_bytes) }} · 已验证代码重复 {{ formatBytes(Number(selectedPackageDump.local_storage_accounting.verified_code_duplicate_bytes)) }}（账面，非物理节省）</span><span>{{ selectedPackageDump.launched ? '已执行 launch harvest' : '未执行 launch harvest' }}</span><span>物理 {{ allocatedEvidenceLabel(selectedPackageDump.local_storage_accounting?.allocated_bytes ?? selectedPackageDump.physical_bytes) }}</span><span v-if="selectedPackageDump.storage_accounting === 'kernsight.inode-accounting/v1'">硬链接共享逻辑字节 {{ formatBytes(Number(selectedPackageDump.deduplicated_bytes ?? 0)) }}</span></div>
       <details v-if="selectedEvidenceSource === 'local'"><summary>本地运行时来源诊断与逐库加载段</summary><p v-if="!selectedPackageDump.local_storage_accounting?.runtime_source_diagnostics">旧数据：来源诊断未知。</p><pre>{{ selectedPackageDump.local_storage_accounting?.runtime_source_diagnostics }}</pre><article v-for="module in selectedPackageDump.local_storage_accounting?.elf_module_observations || []" :key="`${module.source_report}:${module.path}`"><p>{{ module.path }} · 已观察/已读范围 {{ module.verified_range_count ?? '未知' }} · 留存 {{ module.verified_range_bytes ?? '未知' }} B · PT_LOAD 可分析 {{ elfLoadCoverageLabel(module.all_load_file_bytes_covered) }} · 完整文件缺失（未重建）</p><details><summary>来源与缺口</summary><pre>{{ module }}</pre></details></article></details>
       <section v-if="evidenceError" class="notice error-notice ks-pull-notice" role="alert"><span class="material-symbols-outlined">error</span><span>{{ evidenceError }}</span><button @click="evidenceError = ''">关闭</button></section>
-      <section v-if="evidenceMessage" class="notice ks-pull-notice" role="status"><span class="material-symbols-outlined">task_alt</span><span>{{ evidenceMessage }}</span><button @click="evidenceMessage = ''">关闭</button></section>
-      <section v-if="selectedPackageDump.content_dex_class_index" class="ks-dex-ownership"><header><strong>DEX结构对象与类索引（校验通过与诊断分列）</strong><small>按完整 hash + 长度计对象，保留所有来源；包名与现有 SDK 命名空间只作候选线索。manifest 组件缺失不能当作已确认业务归属。</small></header><section v-for="bucket in dexObjectGroups(selectedPackageDump.content_dex_class_index.objects)" :key="bucket.kind" :data-dex-group="bucket.kind"><h4>{{ bucket.label }}</h4><article v-for="object in bucket.objects" :key="`${object.sha256}:${object.bytes}`"><p>{{ object.sha256 }} · {{ object.bytes }} B · {{ object.sources.length }} 来源 · {{ object.ownership }}</p><p>声明 {{ object.declared_classes ?? '未知' }} 类 · 已索引 {{ object.indexed_classes ?? '未知' }} · {{ object.class_index_status }} · {{ object.validation_status || '校验未知（旧字段）' }} · {{ object.class_hints }}</p><details><summary>独立来源、父会话与实例</summary><pre>{{ object.sources }}</pre></details><details><summary>类名索引（有界检索）</summary><input v-model="dexClassQuery" placeholder="输入类名片段" /><p>{{ dexClassMatches(object).total }} 个匹配，最多显示 100 项；空查询只显示前 100 项。</p><pre>{{ dexClassMatches(object).classes.join('\n') }}</pre></details></article></section></section>
-      <section class="ks-dex-ownership"><header><strong>代码证据去噪视图</strong><small>仅按已验证完整保留内容合并展示，所有路径、来源与状态仍保留；不删除文件、不改变采集范围。旧字段或partial不合并。系统/SDK分层需内容签名依据，命名空间线索仍归混合/未知。此视图不受文件浏览器筛选影响；本地核验预算或目录计数上限之外的内容仍未验证，不会宣称全部去重。</small></header>
-        <details v-for="layer in evidenceNoiseLayers" :key="layer.key" :open="layer.key === 'attention' || layer.key === 'business'" :class="`noise-${layer.key}`" @toggle="keepAttentionOpen($event, layer.key)">
+      <section v-if="evidenceMessage" class="notice status-notice ks-pull-notice" role="status"><span class="material-symbols-outlined">task_alt</span><span>{{ evidenceMessage }}</span><button @click="evidenceMessage = ''">关闭</button></section>
+      <section v-if="landedKeyFiles.length" class="ks-dex-ownership">
+        <header><div><strong>已落地的 key 文件</strong><small>正常读取过程中写出的文件。文件在目录里，不表示这个值已经验证可用于解密。</small></div></header>
+        <div class="ks-dex-ownership-list">
+          <article v-for="file in landedKeyFiles" :key="file.path">
+            <div><strong>{{ file.kind }}</strong><code>{{ file.path }}</code></div>
+            <span>{{ formatBytes(Number(file.bytes || 0)) }}</span>
+            <small>{{ file.sha256 || '没有哈希' }}</small>
+          </article>
+        </div>
+      </section>
+      <section class="ks-dex-ownership"><header><div><strong>代码证据去噪视图</strong><small>按已验证内容合并。路径和状态都还在，不删除文件，也不把未验证的范围说成已去重。</small></div></header>
+        <details v-for="layer in evidenceNoiseLayers" :key="layer.key" :class="`noise-${layer.key}`">
           <summary>{{ layer.label }} · {{ layer.groups.length }} 内容组 / {{ layer.groups.reduce((n,g) => n + g.rows.length,0) }} 来源</summary>
-          <article v-for="group in layer.groups" :key="group.key"><code>{{ group.sha256 || '未验证完整内容' }}</code><div v-for="row in group.rows" :key="row.path"><b>{{ row.path }}</b><small>{{ codeEvidenceLabel(row.notes) || '读取/完整性依据缺失，原件保留' }}</small></div></article>
+          <div class="ks-noise-body">
+            <article v-for="group in layer.groups" :key="group.key"><code>{{ group.sha256 || '未验证完整内容' }}</code><div v-for="row in group.rows" :key="row.path"><b>{{ row.path }}</b><small :title="codeEvidenceLabel(row.notes) || '读取/完整性依据缺失，原件保留'">{{ codeEvidenceLabel(row.notes) || '读取/完整性依据缺失，原件保留' }}</small></div></article>
+          </div>
         </details>
       </section>
       <section class="ks-dex-ownership">
@@ -406,7 +417,8 @@
             <div><strong>{{ dexOwnershipLabel(entry.category) }} · 线索评分 {{ entry.confidence }}/100</strong><code>{{ entry.canonical_relative_path }}</code></div>
             <span>{{ entry.sampled_classes }} 类 · 业务 {{ entry.business_classes }} · 内部 {{ entry.internal_classes }} · SDK {{ entry.third_party_classes }} · 未知 {{ entry.unknown_classes }}</span>
             <small>{{ entry.dominant_namespaces.join(' · ') || '没有可发布命名空间' }}</small>
-            <p>{{ entry.reasons.join('；') }}</p>
+            <p>{{ dexOwnershipMeasure(entry) }}{{ entry.reasons.join('；') }}</p>
+            <details v-if="dexIndexObject(entry.sha256)" class="dex-class-search"><summary>类名索引（有界检索）</summary><input v-model="dexClassQuery" placeholder="输入类名片段" /><p>匹配 {{ dexClassMatches(dexIndexObject(entry.sha256)).total }} · 这里显示 {{ dexClassMatches(dexIndexObject(entry.sha256)).classes.length }} · 未展开 {{ dexClassMatches(dexIndexObject(entry.sha256)).omitted }}</p><pre>{{ dexClassMatches(dexIndexObject(entry.sha256)).classes.join('\n') }}</pre></details>
           </article>
           <button v-if="filteredDexOwnershipEntries.length > dexOwnershipVisibleCount" type="button" class="ghost-button ks-load-more" @click="dexOwnershipVisibleCount += 30">继续显示 {{ Math.min(30, filteredDexOwnershipEntries.length - dexOwnershipVisibleCount) }} 个 DEX</button>
         </div>
@@ -438,7 +450,8 @@ import { mergeCaptureGroups,groupSessionIds,captureGroupEdges } from '../service
 import { memoryCounterLabel, memoryEvidenceLabel } from '../services/kernsightMemoryEvidence'
 import { dexObjectGroups, verifiedDexObjectCount, indexedElfModuleCount, indexedDexCount, runtimeDexClassMatches, elfLoadCoverageLabel, codeEvidenceLabel, allocatedEvidenceLabel, ownershipEvidenceEntries, codeNoiseLayers, archiveCoverageLabel } from '../services/kernsightCodeEvidence'
 import { buildAutoCaptureStages, captureCodeOnlyChoice, startupEvidenceLabel, qualifiedSourceLabel, buildUnifiedStageSpec, type AutoStageReceipt } from '@/services/kernsightCapturePlan'
-import { computed, markRaw, nextTick, onErrorCaptured, onBeforeUnmount, reactive, ref, shallowRef, watch } from 'vue'
+import { computed, markRaw, nextTick, onErrorCaptured, onBeforeUnmount, onMounted, reactive, ref, shallowRef, watch } from 'vue'
+import { listen } from '@tauri-apps/api/event'
 import { save } from '@tauri-apps/plugin-dialog'
 import { monitoringBackend, readableError } from '@/services/backend'
 import { useKernSightEvidence } from '@/composables/useKernSightEvidence'
@@ -461,7 +474,7 @@ import type {
 } from '@/types'
 
 const props = defineProps<{ device?: DeviceSummary; details: DeviceDetails | null }>()
-const emit = defineEmits<{ 'open-devices': []; 'open-ai': [] }>()
+const emit = defineEmits<{ 'open-devices': []; 'open-ai': []; 'show-evidence': [] }>()
 
 const captureGroups=ref<KernSightCaptureGroup[]>([])
 const selectedCaptureGroup=ref('')
@@ -614,7 +627,6 @@ const selectedLocalBundle = computed(() => selectedEvidenceSource.value === 'loc
 const selectedPackageDump = computed(() => selectedEvidenceSource.value === 'device'
   ? devicePackageDumps.value.find(dump => dump.package === selectedPackage.value) || null
   : selectedLocalBundle.value?.dumpReport || packageDumps.value.find(dump => dump.package === selectedPackage.value) || null)
-function keepAttentionOpen(event: Event, key: string) { const element = event.target as HTMLDetailsElement; if (key === 'attention' && !element.open) element.open = true }
 const evidenceNoiseLayers = computed(() => codeNoiseLayers(allEvidenceFiles.value as any[]))
 const dexOwnershipEntries = computed<KernSightDexOwnershipEntry[]>(() => ownershipEvidenceEntries(selectedPackageDump.value?.dex_ownership?.schema_version, selectedPackageDump.value?.dex_ownership?.entries || []))
 const dexOwnershipAvailable = computed(() => Boolean(selectedPackageDump.value?.dex_ownership))
@@ -643,6 +655,30 @@ const filteredDexOwnershipEntries = computed(() => dexOwnershipEntries.value
     || left.canonical_relative_path.localeCompare(right.canonical_relative_path)))
 const visibleDexOwnershipEntries = computed(() => filteredDexOwnershipEntries.value.slice(0, dexOwnershipVisibleCount.value))
 
+function dexIndexObject(sha: string) {
+  return selectedPackageDump.value?.content_dex_class_index?.objects?.find(object => object.sha256 === sha) || null
+}
+function dexOwnershipMeasure(entry: { sha256: string }) {
+  const object = dexIndexObject(entry.sha256)
+  if (!object) return ''
+  return `${formatBytes(Number(object.bytes || 0))} · ${dexLengthLabel(object.length_matches_declared)} · ${dexObjectIndexLabel(object.class_index_status)} · ${dexObjectCheckLabel(object.validation_status)}。`
+}
+function dexLengthLabel(match: boolean | null | undefined) {
+  if (match === true) return '长度一致'
+  if (match === false) return '声明长度与切片不一致'
+  return '声明长度未单独标出'
+}
+function dexObjectIndexLabel(status: string) {
+  if (status === 'complete_class_def_index') return '类索引完整'
+  if (status === 'partial_class_def_index') return '类索引被截断'
+  return '类索引未知'
+}
+function dexObjectCheckLabel(status?: string) {
+  if (status?.startsWith('checksum_and_bounded')) return '校验通过'
+  if (status?.startsWith('checksum_failed')) return '校验失败'
+  if (status?.startsWith('layout_unverified')) return '布局未核验'
+  return '校验未知'
+}
 function dexOwnershipLabel(category: KernSightDexOwnershipCategory) {
   return ({
     business: '业务线索',
@@ -913,7 +949,7 @@ const allEvidenceFiles = computed(() => {
 })
 const evidenceFiles = computed(() => allEvidenceFiles.value.filter(file => matchesEvidenceCategory(file.relative_path)))
 const dexClassQuery = ref('')
-function dexClassMatches(object:any):{total:number;classes:string[]} {
+function dexClassMatches(object:any):{total:number;classes:string[];omitted:number} {
   return runtimeDexClassMatches(selectedPackageDump.value?.local_storage_accounting,object,dexClassQuery.value)
 }
 const analyzableArtifacts = computed<any[]>(() => {
@@ -933,7 +969,7 @@ const analyzableArtifacts = computed<any[]>(() => {
       source: observation?.source || dex.sources?.join(', ') || 'dex-set',
       ready: Boolean(semantic),
       detail: semantic
-        ? `DEX ${semantic.version} · ${semantic.class_defs.toLocaleString()} classes · ${semantic.method_ids.toLocaleString()} methods · ${dex.observations.length} observations`
+        ? `DEX ${semantic.version} · 切片 ${Number(dex.bytes).toLocaleString()} B · 声明 ${semantic.declared_file_size?.toLocaleString?.() ?? semantic.declared_file_size ?? '未知'} · ${Number(semantic.declared_file_size) === Number(dex.bytes) ? '长度一致' : '声明长度与切片不一致'} · ${semantic.class_defs.toLocaleString()} classes · 已索引 ${semantic.class_descriptors?.length?.toLocaleString?.() ?? '未知'} · ${semantic.class_descriptors_truncated ? '类索引被截断' : '类索引未截断'} · ${semantic.method_ids.toLocaleString()} methods · ${dex.observations.length} observations`
         : `${dex.observations?.length || 0} observations · semantic parse 未完成`,
       pid: observation?.pid,
       vmaStart: observation?.vma_start,
@@ -1267,10 +1303,15 @@ async function loadKernSight() {
 }
 
 async function importLocalEvidence() {
+  await importEvidenceDirectory()
+}
+
+async function importEvidenceDirectory(path?: string) {
   importingLocal.value = true
   probeError.value = ''
+  emit('show-evidence')
   try {
-    const bundle = await importDirectory()
+    const bundle = await importDirectory(path)
     if (!bundle) return
     const dumps = new Map(packageDumps.value.map(dump => [dump.package, dump]))
     dumps.set(bundle.package, bundle.dumpReport)
@@ -1284,6 +1325,15 @@ async function importLocalEvidence() {
     importingLocal.value = false
   }
 }
+
+onMounted(() => {
+  let started = false
+  void listen<string>('me-import-directory', (event) => {
+    if (started || !event.payload) return
+    started = true
+    void importEvidenceDirectory(event.payload)
+  })
+})
 
 async function importEvidenceArchive() {
   importingLocal.value = true
@@ -1966,6 +2016,9 @@ function binderInterfaceNames(value: unknown): string[] {
   return []
 }
 
+function formatMaybeBytes(value: unknown) {
+  return typeof value === 'number' && Number.isFinite(value) && value >= 0 ? formatBytes(value) : '未知'
+}
 function formatBytes(value: number) {
   if (!Number.isFinite(value) || value <= 0) return '0 B'
   const units = ['B', 'KiB', 'MiB', 'GiB', 'TiB']
@@ -2013,6 +2066,28 @@ function sensitiveCount(dump: KernSightPackageDumpReport, contentClass: string, 
   if (!dump.sensitive_files) return legacy || 0
   return dump.sensitive_files.filter(file => file.content_class === contentClass).length
 }
+
+const landedKeyFiles = computed(() => {
+  const dump = selectedPackageDump.value
+  if (!dump) return []
+  const files = (dump.sensitive_files || [])
+    .filter(file => file.content_class === 'key_candidate')
+    .map(file => ({
+      path: file.relative_path,
+      bytes: file.bytes,
+      sha256: file.sha256,
+      kind: file.content_class,
+    }))
+  if (dump.recovered_sm4_key) {
+    files.unshift({
+      path: 'recovered_sm4_key',
+      bytes: 16,
+      sha256: dump.recovered_sm4_key,
+      kind: 'report field',
+    })
+  }
+  return files
+})
 
 function capabilityIcon(status: string) {
   if (status === 'available') return 'check_circle'
@@ -2225,8 +2300,20 @@ details.ks-session-row pre { max-height: 360px; overflow: auto; white-space: pre
 .ks-package-list article>div strong,.ks-package-list article>div small,.ks-package-list span b,.ks-package-list span small { display:block; }.ks-package-list article>div strong{font-size:8px}.ks-package-list article>div small{margin-top:3px;color:#657388;font-size:7px}.ks-package-list span{text-align:center}.ks-package-list span b{font-size:9px}.ks-package-list span small{margin-top:3px;color:#657388;font-size:6px}.ks-package-list button{white-space:nowrap;font-size:7px}
 .ks-source-badges{display:flex!important;flex-wrap:wrap;gap:4px;margin-top:5px!important}.ks-source-badges b{display:inline-block;padding:3px 5px;border-radius:5px;font-size:6px}.ks-source-badges .source-local{color:#62d3a7;background:rgba(52,211,153,.09)}.ks-source-badges .source-device{color:#79a7ea;background:rgba(57,125,246,.1)}.ks-source-badges .source-unknown{color:#d1a35b;background:rgba(245,158,11,.08)}
 .ks-package-source-actions{display:flex;gap:4px}.ks-package-source-actions button.active{color:#b9d2fb;border-color:rgba(57,125,246,.4);background:rgba(57,125,246,.1)}.ks-selected-package-bar>b{padding:4px 6px;border-radius:5px;font-size:6px}.ks-selected-package-bar>.source-local{color:#62d3a7;background:rgba(52,211,153,.09)}.ks-selected-package-bar>.source-device{color:#79a7ea;background:rgba(57,125,246,.1)}
-.ks-dex-ownership{margin-top:12px;padding:14px;border:1px solid var(--line);border-radius:12px;background:var(--surface-soft)}
-.ks-dex-ownership>header{display:flex;align-items:flex-start;justify-content:space-between;gap:12px}.ks-dex-ownership>header strong,.ks-dex-ownership>header small{display:block}.ks-dex-ownership>header strong{font-size:13px}.ks-dex-ownership>header small{margin-top:5px;color:var(--muted);font-size:11px;line-height:1.45}.ks-dex-ownership>header>b{color:var(--primary);font-size:11px;white-space:nowrap}
+.ks-dex-ownership{min-width:0;max-width:100%;margin-top:12px;padding:14px;overflow:hidden;border:1px solid var(--line);border-radius:12px;background:var(--surface-soft)}
+.ks-dex-ownership p,.ks-dex-ownership h4,.ks-dex-ownership code,.ks-dex-ownership b,.ks-dex-ownership small{min-width:0;max-width:100%;overflow-wrap:anywhere}
+.ks-dex-ownership>article{display:grid;grid-template-columns:minmax(0,1.1fr) minmax(0,.9fr);gap:4px 12px;align-items:center;margin-top:8px}
+.ks-dex-ownership>article code,.ks-dex-ownership>article span{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.ks-dex-ownership details pre{max-height:220px;overflow:auto;white-space:pre-wrap;overflow-wrap:anywhere}
+.ks-noise-body{max-height:240px;margin-top:8px;overflow:auto}
+.ks-noise-body article{min-width:0;padding:8px 0;border-top:1px solid var(--line)}
+.ks-noise-body b,.ks-noise-body small,.ks-noise-body code{display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.ks-dex-ownership h4{margin:14px 0 0;color:var(--text);font-size:12px;font-weight:650}
+.ks-dex-ownership-list article>span,.ks-dex-ownership-list article>p,.ks-dex-ownership-list article>small,.ks-dex-ownership-list article>details{min-width:0;overflow-wrap:anywhere}
+.ks-dex-ownership-list article>details{grid-column:1 / -1}
+.ks-dex-ownership [data-dex-group]{min-width:0}
+.ks-dex-ownership [data-dex-group]>article{min-width:0;margin-top:8px;padding-top:8px;border-top:1px solid var(--line)}
+.ks-dex-ownership>header{display:flex;align-items:flex-start;justify-content:space-between;gap:12px}.ks-dex-ownership>header>div{min-width:0;flex:1}.ks-dex-ownership>header strong,.ks-dex-ownership>header small{display:block}.ks-dex-ownership>header strong{font-size:13px}.ks-dex-ownership>header small{margin-top:5px;color:var(--muted);font-size:11px;line-height:1.45}.ks-dex-ownership>header>b{flex:0 0 auto;color:var(--primary);font-size:11px;white-space:nowrap}
 .ks-dex-ownership-summary{display:grid;grid-template-columns:repeat(6,minmax(0,1fr));gap:7px;margin-top:12px}.ks-dex-ownership-summary button{display:flex;align-items:center;justify-content:space-between;gap:8px;min-width:0;padding:10px;border:1px solid var(--line);border-radius:9px;color:var(--text);background:var(--surface);text-align:left}.ks-dex-ownership-summary button:hover,.ks-dex-ownership-summary button.active{border-color:currentColor;background:var(--primary-soft)}.ks-dex-ownership-summary b{font-size:17px}.ks-dex-ownership-summary span{font-size:10px;line-height:1.25}
 .ks-dex-ownership-seeds{display:flex;flex-wrap:wrap;align-items:center;gap:6px;margin:9px 0 0;color:var(--muted);font-size:10px}.ks-dex-ownership-seeds>b{padding:5px 7px;border:1px solid color-mix(in srgb,var(--primary) 28%,var(--line));border-radius:7px;color:var(--primary);background:var(--primary-soft);font-weight:600}
 .ks-dex-ownership-package{display:flex;align-items:center;gap:9px;margin:9px 0 0;padding:8px 10px;border:1px solid color-mix(in srgb,#39b980 30%,var(--line));border-radius:8px;color:var(--muted);background:color-mix(in srgb,#39b980 7%,var(--surface));font-size:10px;line-height:1.45}.ks-dex-ownership-package>b{color:#39b980;font:600 10px ui-monospace,SFMono-Regular,Menlo,monospace}.ks-dex-ownership-package>span{min-width:0}

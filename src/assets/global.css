@@ -121,6 +121,7 @@ button:disabled { cursor: not-allowed; opacity: 0.48; }
 .page-stack, .toolbox-layout, .analyzer-layout { display: grid; gap: 16px; }
 .panel { border: 1px solid var(--line); border-radius: 22px; background: linear-gradient(145deg, rgba(24,29,39,.94), rgba(15,18,25,.96)); box-shadow: 0 18px 50px rgba(0,0,0,.18); }
 .notice { display: flex; align-items: center; gap: 10px; width: min(1052px, calc(100% - 36px)); margin: 10px auto 0; padding: 11px 14px; border: 1px solid rgba(251,113,133,.25); border-radius: 12px; color: #fecdd3; background: rgba(127,29,29,.26); font-size: 12px; }
+.notice.status-notice { color: #bbf7d0; border-color: rgba(52,211,153,.4); background: rgba(6,78,59,.28); }
 .notice button { margin-left: auto; border: 0; color: inherit; background: transparent; cursor: pointer; }
 
 .device-card { padding: clamp(18px, 3vw, 26px); }

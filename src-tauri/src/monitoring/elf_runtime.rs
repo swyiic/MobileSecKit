@@ -212,7 +212,35 @@ pub(super) fn module_views(rows: &[Value]) -> Value {
         let shoff = h["section_table_offset"].as_u64().unwrap_or(0);
         let shbytes = h["section_table_bytes"].as_u64().unwrap_or(0);
         let shgaps = gaps(shoff, shoff.saturating_add(shbytes), file_ranges);
-        modules.push(json!({"schema":"mobilee.verified-elf-load-view/v1","path":first["mapping"]["path"],"source":first["source"],"source_report":first["source_report"],"load_bias":bias,"verified_range_count":rows.len(),"verified_range_bytes":rows.iter().filter_map(|r|r["read"]["actual_length"].as_u64()).sum::<u64>(),"association":"inferred_from_unique_offset_zero_PT_LOAD_and_retained_header; kernel_file_offsets_not_recorded","torn":true,"all_load_file_bytes_covered":file_complete,"all_load_memory_bytes_covered":mem_complete,"section_table_gaps":shgaps,"segments":segments,"complete_file_reconstructed":false,"symbol_analysis":"not_performed_on_incomplete_memory_file","ownership":"unknown","scope":"this producer window and listed verified ranges only"}));
+        let torn = rows.iter().any(|row| row["read"]["torn"] == true);
+        let limits: Vec<&str> = rows
+            .iter()
+            .filter_map(|row| row["selection_limit_reason"].as_str())
+            .collect();
+        let mapping_copy = if limits.is_empty() {
+            "unknown"
+        } else if limits
+            .iter()
+            .all(|reason| *reason == "full_mapping_selected")
+        {
+            "full_mapping_selected"
+        } else if limits.iter().any(|reason| {
+            *reason == "per_range_cap" || *reason == "runtime_payload_budget_metadata_reserve"
+        }) {
+            "truncated_by_cap_or_budget"
+        } else {
+            "mixed_or_other"
+        };
+        let symbol_analysis = if mapping_copy == "truncated_by_cap_or_budget" {
+            "not_performed_on_budget_or_per_range_truncated_copy"
+        } else if file_complete && shgaps.is_empty() {
+            "file_backed_load_and_section_bytes_covered; process was not paused; symbols not parsed in this import"
+        } else if file_complete {
+            "file_backed_load_bytes_covered; section table still has gaps; dynsym is catalogued separately when those bytes sit in the retained mapping"
+        } else {
+            "not_performed_on_incomplete_memory_file"
+        };
+        modules.push(json!({"schema":"mobilee.verified-elf-load-view/v1","path":first["mapping"]["path"],"source":first["source"],"source_report":first["source_report"],"load_bias":bias,"verified_range_count":rows.len(),"verified_range_bytes":rows.iter().filter_map(|r|r["read"]["actual_length"].as_u64()).sum::<u64>(),"association":"inferred_from_unique_offset_zero_PT_LOAD_and_retained_header; kernel_file_offsets_not_recorded","torn":torn,"all_load_file_bytes_covered":file_complete,"all_load_memory_bytes_covered":mem_complete,"section_table_gaps":shgaps,"segments":segments,"complete_file_reconstructed":file_complete && shgaps.is_empty() && !torn,"mapping_copy":mapping_copy,"symbol_analysis":symbol_analysis,"ownership":"unknown","scope":"this producer window and listed verified ranges only"}));
     }
     json!(modules)
 }
@@ -246,6 +274,36 @@ mod tests {
         assert_eq!(v[0]["all_load_memory_bytes_covered"], false);
         assert_eq!(v[0]["complete_file_reconstructed"], false);
         assert_eq!(v[0]["section_table_gaps"], json!([[192, 256]]));
+        assert_eq!(
+            v[0]["symbol_analysis"],
+            "file_backed_load_bytes_covered; section table still has gaps; dynsym is catalogued separately when those bytes sit in the retained mapping"
+        );
+        assert_eq!(v[0]["mapping_copy"], "unknown");
+    }
+    #[test]
+    fn budget_truncated_elf_is_not_described_as_a_covered_load() {
+        let h = header(&fixture()).unwrap();
+        let r = json!({"mapping":{"path":"/data/app/id/lib.so","inode":1},"source":{"pid":1},"source_report":"one-window","selection_limit_reason":"per_range_cap","read":{"actual_start":4096,"actual_length":64,"sha256":"verified-source","torn":true},"relative_path":"runtime/bound.code","local_content_status":"complete_range_hash_verified","object_inspection":{"elf_header":h}});
+        let v = module_views(&[r]);
+        assert_eq!(v[0]["mapping_copy"], "truncated_by_cap_or_budget");
+        assert_eq!(
+            v[0]["symbol_analysis"],
+            "not_performed_on_budget_or_per_range_truncated_copy"
+        );
+        assert_eq!(v[0]["complete_file_reconstructed"], false);
+    }
+    #[test]
+    fn full_mapping_torn_read_keeps_load_coverage_separate_from_reconstruction() {
+        let h = header(&fixture()).unwrap();
+        let r = json!({"mapping":{"path":"/data/app/id/lib.so","inode":1},"source":{"pid":1},"source_report":"one-window","selection_limit_reason":"full_mapping_selected","read":{"actual_start":4096,"actual_length":192,"sha256":"verified-source","torn":true},"relative_path":"runtime/bound.code","local_content_status":"complete_range_hash_verified","object_inspection":{"elf_header":h}});
+        let v = module_views(&[r]);
+        assert_eq!(v[0]["mapping_copy"], "full_mapping_selected");
+        assert_eq!(v[0]["all_load_file_bytes_covered"], true);
+        assert_eq!(v[0]["complete_file_reconstructed"], false);
+        assert_eq!(
+            v[0]["symbol_analysis"],
+            "file_backed_load_bytes_covered; section table still has gaps; dynsym is catalogued separately when those bytes sit in the retained mapping"
+        );
     }
     #[test]
     fn fake_truncated_and_overflow_program_tables_stay_unknown() {

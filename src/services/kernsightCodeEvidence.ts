@@ -71,14 +71,22 @@ export function elfLoadCoverageLabel(value: unknown): string {
 }
 
 /** Resolve a full class index through the exact displayed runtime source, never a stale row pointer. */
-export function runtimeDexClassMatches(ledger: any, object: any, query: string): {total:number;classes:string[]} {
-  const source=object?.sources?.find((s:any)=>s.kind==='runtime')
-  const row=source ? ledger?.runtime_observations?.[source.row_index] : undefined
-  if (!row || row.source_report!==source.source_report || row.read?.sha256!==source.range_sha256 || ['package','pid','uid','birth_ns','exec_id','boot_id'].some(k=>row.source?.[k]!==source.source?.[k])) return {total:0,classes:[]}
-  const dex=row.object_inspection?.derived_objects?.find((d:any)=>d.sha256===object.sha256 && d.length===object.bytes)
-  const classes:string[]=dex?.class_index?.classes || []
-  const matches=classes.filter(c=>c.toLowerCase().includes(query.toLowerCase()))
-  return {total:matches.length,classes:matches.slice(0,100)}
+export function runtimeDexClassMatches(ledger: any, object: any, query: string): {total:number;classes:string[];omitted:number} {
+  const direct:string[] = Array.isArray(object?.classes) ? object.classes : []
+  let classes = direct
+  if (!classes.length) {
+    const source=object?.sources?.find((s:any)=>s.kind==='runtime')
+    const row=source ? ledger?.runtime_observations?.[source.row_index] : undefined
+    const identityOk = row && row.source_report===source.source_report && row.read?.sha256===source.range_sha256 && !['package','pid','uid','birth_ns','exec_id','boot_id'].some(k=>row.source?.[k]!==source.source?.[k])
+    const dex=identityOk ? row.object_inspection?.derived_objects?.find((d:any)=>d.sha256===object.sha256 && d.length===object.bytes) : undefined
+    classes = dex?.class_index?.classes || []
+  }
+  const needle = query.toLowerCase()
+  const matches=classes.filter(c=>c.toLowerCase().includes(needle))
+  // The stored index is complete up to the producer cap. This window is only
+  // the on-screen list; `total` and `omitted` stay visible beside it.
+  const shown = matches.slice(0, 500)
+  return {total:matches.length,classes:shown,omitted:Math.max(0, matches.length-shown.length)}
 }
 
 export function indexedDexCount(dump:any):number|null {

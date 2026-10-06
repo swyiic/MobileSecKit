@@ -57,8 +57,11 @@ test('class index search retains all classes and rejects stale instance pointers
  const object={sha256:'object',bytes:10,sources:[source]}
  const row={source_report:'window',read:{sha256:'range'},source:identity,object_inspection:{derived_objects:[{sha256:'object',length:10,class_index:{classes:Array.from({length:8201},(_,i)=>`Lpkg/Class${i};`)}}]}}
  assert.equal(runtimeDexClassMatches({runtime_observations:[row]},object,'').total,8201)
- assert.equal(runtimeDexClassMatches({runtime_observations:[row]},object,'').classes.length,100)
+ assert.equal(runtimeDexClassMatches({runtime_observations:[row]},object,'').classes.length,500)
+ assert.equal(runtimeDexClassMatches({runtime_observations:[row]},object,'').omitted,7701)
  assert.equal(runtimeDexClassMatches({runtime_observations:[row]},object,'Class8200;').total,1)
+ assert.equal(runtimeDexClassMatches({runtime_observations:[row]},object,'Class8200;').classes.length,1)
+ assert.equal(runtimeDexClassMatches({runtime_observations:[row]},object,'Class8200;').omitted,0)
  assert.equal(runtimeDexClassMatches({runtime_observations:[{...row,source:{...identity,pid:99}}]},object,'').total,0)
 })
 

@@ -688,6 +688,11 @@
   border-color: #e7aaa5;
   background: #fcebea;
 }
+:root[data-theme='light'] .notice.status-notice {
+  color: #0b6b45;
+  border-color: #9ed9bf;
+  background: #e8f7ef;
+}
 
 :root[data-theme='light'] .environment-startup-notice,
 :root[data-theme='light'] .runtime-guidance {

@@ -8,6 +8,20 @@ use std::{
     path::Path,
 };
 
+/// One retained mapping. 128 MiB holds the 92,319,172-byte image in `base.vdex`
+/// and the 128 MiB anonymous container copied on device.
+const RUNTIME_RANGE_FILE_CAP: u64 = 128 * 1024 * 1024;
+/// One imported tree. A code-only dump on device is about 201MB. Spending the
+/// first 128MB must not drop the later container that holds the plaintext DEX.
+const RUNTIME_RANGE_TREE_CAP: u64 = 512 * 1024 * 1024;
+/// `bound-source-*.json` on device is larger than 64KB (SGCC 174,685 bytes,
+/// momo 120,166, tax 103,712). A lower cap rejects the whole record list.
+const BOUND_SOURCE_BYTE_LIMIT: u64 = 1024 * 1024;
+
+fn range_budget_admits(len: u64, remaining: u64) -> bool {
+    len > 0 && len <= RUNTIME_RANGE_FILE_CAP && len <= remaining
+}
+
 pub(super) fn account(root: &Path, files: &[(String, u64)]) -> Value {
     let mut logical = 0_u64;
     let mut inode_bytes = 0_u64;
@@ -46,7 +60,7 @@ pub(super) fn account(root: &Path, files: &[(String, u64)]) -> Value {
         .collect::<BTreeMap<_, _>>();
     let mut observations = Vec::new();
     let mut omitted = 0;
-    let mut hash_budget = 64 * 1024 * 1024_u64;
+    let mut hash_budget = RUNTIME_RANGE_TREE_CAP;
     let mut verified_paths = BTreeMap::<String, (String, u64)>::new();
     let mut failures = 0;
     for (path, len) in files
@@ -89,7 +103,7 @@ pub(super) fn account(root: &Path, files: &[(String, u64)]) -> Value {
         let verified = if valid && verified_paths.get(&relative) == Some(&(expected.clone(), bytes))
         {
             true
-        } else if valid && bytes <= hash_budget {
+        } else if valid && range_budget_admits(bytes, hash_budget) {
             hash_budget -= bytes;
             hash_file(&root.join(&relative), bytes).is_some_and(|s| s == expected)
         } else {
@@ -114,8 +128,8 @@ pub(super) fn account(root: &Path, files: &[(String, u64)]) -> Value {
     let mut source_count = 0_usize;
     let mut source_omitted = 0_usize;
     let mut inspections = BTreeMap::<String, Value>::new();
-    let mut inspection_budget = 64 * 1024 * 1024_u64;
-    let mut class_index_budget = 1024 * 1024_usize;
+    let mut inspection_budget = RUNTIME_RANGE_TREE_CAP;
+    let mut class_index_budget = 4 * 1024 * 1024_usize;
     for (path, len) in files.iter().filter(|(p, _)| {
         Path::new(p)
             .file_name()
@@ -128,9 +142,9 @@ pub(super) fn account(root: &Path, files: &[(String, u64)]) -> Value {
             continue;
         }
         source_count += 1;
-        let mut diagnostic = json!({"source_report":path,"status":"accepted","records_seen":0,"invalid_records":0,"omitted_records":0,"byte_limit":65536});
+        let mut diagnostic = json!({"source_report":path,"status":"accepted","records_seen":0,"invalid_records":0,"omitted_records":0,"byte_limit":BOUND_SOURCE_BYTE_LIMIT});
         let result = (|| -> Result<Value, &'static str> {
-            if *len > 65536 {
+            if *len > BOUND_SOURCE_BYTE_LIMIT {
                 return Err("source_byte_limit");
             }
             if !safe_local_file(root, path) {
@@ -138,10 +152,10 @@ pub(super) fn account(root: &Path, files: &[(String, u64)]) -> Value {
             }
             let file = fs::File::open(root.join(path)).map_err(|_| "source_read_failed")?;
             let mut bytes = Vec::new();
-            file.take(65537)
+            file.take(BOUND_SOURCE_BYTE_LIMIT.saturating_add(1))
                 .read_to_end(&mut bytes)
                 .map_err(|_| "source_read_failed")?;
-            if bytes.len() > 65536 {
+            if bytes.len() as u64 > BOUND_SOURCE_BYTE_LIMIT {
                 return Err("source_byte_limit");
             }
             let note: Value =
@@ -241,7 +255,7 @@ pub(super) fn account(root: &Path, files: &[(String, u64)]) -> Value {
                     verified_paths.get(&relative) == Some(&(expected.to_owned(), n))
                 }) {
                 true
-            } else if valid && bytes.is_some_and(|n| n <= hash_budget) {
+            } else if valid && bytes.is_some_and(|n| range_budget_admits(n, hash_budget)) {
                 let n = bytes.unwrap();
                 hash_budget -= n;
                 hash_file(&root.join(&relative), n).is_some_and(|h| h == expected)
@@ -280,11 +294,11 @@ pub(super) fn account(root: &Path, files: &[(String, u64)]) -> Value {
             } else {
                 None
             });
-            // Hashing a live range cannot attest atomic memory, a reconstructed DEX/SO,
-            // semantic parsing or ownership. Preserve producer derivations without inventing links.
+            // A range hash does not make the container a reconstructed DEX or SO.
+            // Derived slices found inside it are recorded separately below.
             observation["parse_status"] = json!("unknown_not_attested_by_range_copy");
             observation["ownership"] = json!("unknown");
-            if verified && bytes.unwrap() <= 16 * 1024 * 1024 {
+            if verified && bytes.is_some_and(|n| n <= RUNTIME_RANGE_FILE_CAP) {
                 let key = format!("{expected}:{}", bytes.unwrap());
                 if !inspections.contains_key(&key) && bytes.unwrap() <= inspection_budget {
                     inspection_budget -= bytes.unwrap();
@@ -314,7 +328,7 @@ pub(super) fn account(root: &Path, files: &[(String, u64)]) -> Value {
             if let Some(objects) =
                 observation["object_inspection"]["derived_objects"].as_array_mut()
             {
-                for object in objects {
+                for object in &mut *objects {
                     object["source_artifact"] = json!(relative);
                     object["source_artifact_sha256"] = json!(expected);
                     object["source_instance"] = source.clone();
@@ -323,6 +337,11 @@ pub(super) fn account(root: &Path, files: &[(String, u64)]) -> Value {
                         .zip(object["source_offset"].as_u64())
                         .and_then(|(a, b)| a.checked_add(b)));
                     object["source_torn"] = read["torn"].clone();
+                }
+                if !objects.is_empty() {
+                    observation["parse_status"] = json!(
+                        "derived_slice_inside_retained_range; container_file_not_a_reconstructed_dex_or_so"
+                    );
                 }
             }
             if !verified {
@@ -349,7 +368,7 @@ pub(super) fn account(root: &Path, files: &[(String, u64)]) -> Value {
     json!({"schema":"mobilee.local-storage-evidence/v1","logical_file_bytes":logical,"unique_inode_bytes":if cfg!(unix){Some(inode_bytes)}else{None},"allocated_bytes":if cfg!(unix){Some(allocated)}else{None},
         "shared_inode_logical_bytes":if cfg!(unix){Some(logical.saturating_sub(inode_bytes))}else{None},"allocation_basis":if cfg!(unix){"unique_inode_st_blocks_512"}else{"unavailable"},"unknown_metadata_files":unknown_metadata,"category_logical_bytes":categories,
         "verified_code_logical_bytes":code_logical,"verified_code_unique_bytes":unique,"verified_code_duplicate_bytes":code_logical.saturating_sub(unique),
-        "unverified_observations":failures,"omitted_observations":omitted,"hash_budget_bytes":64*1024*1024,"hash_budget_remaining":hash_budget,"observations":observations,"runtime_observations":runtime,"elf_module_observations":elf_modules,"runtime_source_diagnostics":source_diagnostics,"runtime_source_limit":256,"runtime_sources_omitted":source_omitted,"class_index_descriptor_budget_bytes":1048576,"class_index_descriptor_budget_remaining":class_index_budget,
+        "unverified_observations":failures,"omitted_observations":omitted,"hash_budget_bytes":RUNTIME_RANGE_TREE_CAP,"hash_budget_file_cap_bytes":RUNTIME_RANGE_FILE_CAP,"hash_budget_remaining":hash_budget,"observations":observations,"runtime_observations":runtime,"elf_module_observations":elf_modules,"runtime_source_diagnostics":source_diagnostics,"runtime_source_limit":256,"runtime_sources_omitted":source_omitted,"bound_source_byte_limit":BOUND_SOURCE_BYTE_LIMIT,"class_index_descriptor_budget_bytes":4194304,"class_index_descriptor_budget_scope":"per dex image; not a shared pool across images","class_index_descriptor_budget_remaining":class_index_budget,
         "warnings":["Content redundancy is an accounting opportunity, not physical disk savings","APK members and producer transformations are provenance assertions; local verification hashes retained files only","This bounded code ledger does not hash private data or old memory windows"]})
 }
 /// Reuse the existing bounded DEX splitter/semantic parser. Slice references
@@ -380,36 +399,79 @@ fn dex_layout_diagnostics(bytes: &[u8]) -> Value {
     let bounds = data_end <= declared && link_end <= declared && declared == bytes.len() as u64;
     json!({"status":if !bounds {"declared_spans_out_of_bounds"} else if end<declared {"declared_spans_leave_unaccounted_tail"}else{"declared_spans_cover_file"},"actual_bytes":bytes.len(),"declared_file_bytes":declared,"declared_data_start":data_off,"declared_data_bytes":data_size,"declared_data_end":data_end,"declared_link_start":link_off,"declared_link_bytes":link_size,"trailing_unaccounted_bytes":declared.saturating_sub(end),"full_dex_verifier":false,"scope":"header-declared data/link spans only; map entries and instruction code items not fully validated; trailing bytes remain uninterpreted"})
 }
-fn inspect_runtime_bytes_with_class_budget(bytes: &[u8], class_budget: &mut usize) -> Value {
-    let dex_offsets = bytes
-        .windows(4)
-        .enumerate()
-        .filter_map(|(i, b)| (b == b"dex\n").then_some(i))
-        .take(257)
-        .collect::<Vec<_>>();
-    let elf_magic = bytes.windows(4).filter(|b| *b == b"\x7fELF").count();
-    if dex_offsets.len() > 256 {
-        return json!({"status":"unknown_candidate_limit","candidate_limit":256,"elf_magic_count":elf_magic});
-    }
-    let slices = ksight_core::split_concatenated_dex(bytes);
-    let mut objects = Vec::new();
+fn fitting_dex_images(bytes: &[u8]) -> (Vec<(usize, usize)>, Vec<Value>) {
+    let mut images = Vec::new();
     let mut rejected = Vec::new();
-    for offset in dex_offsets {
-        match slices.iter().find(|s| s.offset==offset as u64) {
-            Some(slice) => match ksight_core::parse_dex_semantics(&slice.bytes) {
-                Some(semantic)=>objects.push(json!({"kind":"dex","source_offset":offset,"length":slice.bytes.len(),"sha256":format!("{:x}",Sha256::digest(&slice.bytes)),"semantic":semantic,"layout_diagnostics":dex_layout_diagnostics(&slice.bytes),"class_index":super::dex_class_index::classes(&slice.bytes, class_budget),"sha1_signature_verified":sha1::Sha1::digest(&slice.bytes[32..]).as_slice()==&slice.bytes[12..32],"adler32_checksum_verified":dex_adler32(&slice.bytes[12..])==u32::from_le_bytes(slice.bytes[8..12].try_into().unwrap()),"validation_level":"bounded_semantic_tables_and_checksum_results; instruction_code_items_not_fully_validated","retained_as_separate_file":false,"ownership":"unknown","relationship":"exact_slice_of_original_runtime_range"})),
-                None=>rejected.push(json!({"source_offset":offset,"reason":"semantic_tables_invalid_or_unsupported"})),
-            },
-            None=>{
-                let candidate = &bytes[offset..];
-                let read_u32 = |at: usize| candidate.get(at..at+4).and_then(|b| b.try_into().ok()).map(u32::from_le_bytes);
-                let declared = read_u32(32);
-                // These are header assertions, not full DEX validation or authority to read more memory.
-                let plausible = candidate.get(..8).is_some_and(|b| b.starts_with(b"dex\n") && b[4..7].iter().all(u8::is_ascii_digit) && b[7]==0)
-                    && read_u32(36)==Some(112) && read_u32(40)==Some(0x12345678)
-                    && declared.is_some_and(|n|n>=112);
-                rejected.push(json!({"source_offset":offset,"reason":if plausible && declared.is_some_and(|n|n as usize>candidate.len()) {"declared_dex_extends_beyond_retained_range"} else {"truncated_or_invalid_dex_header_and_declared_bounds"},"header_claim_only":true,"declared_length":if plausible {declared}else{None},"available_range_bytes":candidate.len(),"missing_declared_bytes":if plausible {declared.map(|n|(n as u64).saturating_sub(candidate.len() as u64))}else{None},"complete_dex_validated":false}));
-            },
+    let mut search = 0_usize;
+    // Step through every `dex\n`, including ones inside a shell whose declared
+    // length covers a later image. Do not jump to `at + declared`.
+    while search.saturating_add(4) <= bytes.len() && images.len() < 64 {
+        let Some(rel) = bytes[search..]
+            .windows(4)
+            .position(|window| window == b"dex\n")
+        else {
+            break;
+        };
+        let at = search.saturating_add(rel);
+        let inside_accepted = images
+            .iter()
+            .any(|(off, len)| at > *off && at < off.saturating_add(*len));
+        let word = |offset: usize| {
+            bytes
+                .get(at.saturating_add(offset)..at.saturating_add(offset).saturating_add(4))
+                .and_then(|raw| raw.try_into().ok())
+                .map(u32::from_le_bytes)
+        };
+        let declared = word(32);
+        let endian = word(40);
+        let header_ok = bytes.get(at..at.saturating_add(8)).is_some_and(|header| {
+            header.starts_with(b"dex\n")
+                && header[4..7].iter().all(u8::is_ascii_digit)
+                && header[7] == 0
+        }) && word(36) == Some(112)
+            && endian == Some(0x1234_5678)
+            && declared.is_some_and(|n| n >= 112);
+        if header_ok {
+            let declared = declared.unwrap_or(0) as usize;
+            if at.saturating_add(declared) <= bytes.len() {
+                images.push((at, declared));
+            } else if rejected.len() < 64 {
+                rejected.push(json!({
+                    "source_offset": at,
+                    "reason": "declared_dex_extends_beyond_retained_range",
+                    "header_claim_only": true,
+                    "declared_length": declared,
+                    "available_range_bytes": bytes.len().saturating_sub(at),
+                    "missing_declared_bytes": (declared as u64).saturating_sub(bytes.len().saturating_sub(at) as u64),
+                    "complete_dex_validated": false
+                }));
+            }
+        } else if !inside_accepted && rejected.len() < 64 {
+            rejected.push(json!({
+                "source_offset": at,
+                "reason": "truncated_or_invalid_dex_header_and_declared_bounds",
+                "header_claim_only": true,
+                "declared_length": null,
+                "available_range_bytes": bytes.len().saturating_sub(at),
+                "complete_dex_validated": false
+            }));
+        }
+        search = at.saturating_add(4);
+    }
+    (images, rejected)
+}
+
+fn inspect_runtime_bytes_with_class_budget(bytes: &[u8], _class_budget: &mut usize) -> Value {
+    let elf_magic = bytes.windows(4).filter(|b| *b == b"\x7fELF").count();
+    let (images, mut rejected) = fitting_dex_images(bytes);
+    let mut objects = Vec::new();
+    for (offset, len) in images {
+        let slice = &bytes[offset..offset.saturating_add(len)];
+        // Each image gets its own descriptor budget. A shared 1MiB pool was cutting later DEX.
+        let mut dex_budget = 4 * 1024 * 1024_usize;
+        match ksight_core::parse_dex_semantics(slice) {
+            Some(semantic) => objects.push(json!({"kind":"dex","source_offset":offset,"length":slice.len(),"declared_file_bytes":semantic.declared_file_size,"length_matches_declared":semantic.declared_file_size==slice.len() as u64,"sha256":format!("{:x}",Sha256::digest(slice)),"semantic":semantic,"layout_diagnostics":dex_layout_diagnostics(slice),"class_index":super::dex_class_index::classes(slice, &mut dex_budget),"sha1_signature_verified":sha1::Sha1::digest(&slice[32..]).as_slice()==&slice[12..32],"adler32_checksum_verified":dex_adler32(&slice[12..])==u32::from_le_bytes(slice[8..12].try_into().unwrap()),"validation_level":"bounded_semantic_tables_and_checksum_results; instruction_code_items_not_fully_validated","retained_as_separate_file":false,"ownership":"unknown","relationship":"exact_declared_length_slice_of_original_runtime_range"})),
+            None => rejected.push(json!({"source_offset":offset,"reason":"semantic_tables_invalid_or_unsupported","declared_length":len,"complete_dex_validated":false})),
         }
     }
     json!({"status":if objects.is_empty() && rejected.is_empty() && elf_magic==0 {"no_dex_or_elf_header_in_retained_range"} else {"bounded_candidate_inspection"},"scanned_bytes":bytes.len(),"dex_magic_count":objects.len()+rejected.len(),"elf_magic_count":elf_magic,"elf_header":super::elf_runtime::header(bytes),"derived_objects":objects,"rejected_candidates":rejected,"elf_status":if elf_magic==0 {"no_elf_header"} else {"unknown_no_linked_elf_reconstruction_parser"},"boundary":"this retained range only; headerless JIT, unselected pages and unread bytes remain unknown"})
@@ -491,6 +553,63 @@ mod tests {
             "unknown_no_linked_elf_reconstruction_parser"
         );
     }
+    #[test]
+    fn shell_declared_length_keeps_the_inner_dex_at_its_own_length() {
+        let mut image = vec![0_u8; 0xE0];
+        image[..8].copy_from_slice(b"dex\n035\0");
+        image[32..36].copy_from_slice(&0xE0_u32.to_le_bytes());
+        image[36..40].copy_from_slice(&112_u32.to_le_bytes());
+        image[40..44].copy_from_slice(&0x1234_5678_u32.to_le_bytes());
+        image[0x70..0x78].copy_from_slice(b"dex\n035\0");
+        image[0x70 + 32..0x70 + 36].copy_from_slice(&0x70_u32.to_le_bytes());
+        image[0x70 + 36..0x70 + 40].copy_from_slice(&112_u32.to_le_bytes());
+        image[0x70 + 40..0x70 + 44].copy_from_slice(&0x1234_5678_u32.to_le_bytes());
+        let view = inspect_runtime_bytes(&image);
+        let objects = view["derived_objects"].as_array().unwrap();
+        assert_eq!(objects.len(), 2);
+        assert_eq!(objects[0]["length"], 0xE0);
+        assert_eq!(objects[0]["length_matches_declared"], true);
+        assert_eq!(objects[1]["source_offset"], 0x70);
+        assert_eq!(objects[1]["length"], 0x70);
+        assert_eq!(objects[1]["length_matches_declared"], true);
+    }
+    #[test]
+    fn declared_oversize_shell_does_not_hide_a_fitting_inner_dex() {
+        let mut image = vec![0_u8; 0x70 + 0x70];
+        image[..8].copy_from_slice(b"dex\n035\0");
+        image[32..36].copy_from_slice(&50_000_u32.to_le_bytes());
+        image[36..40].copy_from_slice(&112_u32.to_le_bytes());
+        image[40..44].copy_from_slice(&0x1234_5678_u32.to_le_bytes());
+        image[0x70..0x78].copy_from_slice(b"dex\n035\0");
+        image[0x70 + 32..0x70 + 36].copy_from_slice(&0x70_u32.to_le_bytes());
+        image[0x70 + 36..0x70 + 40].copy_from_slice(&112_u32.to_le_bytes());
+        image[0x70 + 40..0x70 + 44].copy_from_slice(&0x1234_5678_u32.to_le_bytes());
+        let view = inspect_runtime_bytes(&image);
+        assert_eq!(
+            view["rejected_candidates"][0]["reason"],
+            "declared_dex_extends_beyond_retained_range"
+        );
+        let objects = view["derived_objects"].as_array().unwrap();
+        assert_eq!(objects.len(), 1);
+        assert_eq!(objects[0]["source_offset"], 0x70);
+        assert_eq!(objects[0]["length"], 0x70);
+        assert_eq!(objects[0]["length_matches_declared"], true);
+    }
+    #[test]
+    fn tree_budget_keeps_a_later_range_after_the_old_128mib_pool_would_be_spent() {
+        let mut remaining = RUNTIME_RANGE_TREE_CAP;
+        let first = 90 * 1024 * 1024;
+        assert!(range_budget_admits(first, remaining));
+        remaining -= first;
+        let second = 76 * 1024 * 1024;
+        assert!(first + second > RUNTIME_RANGE_FILE_CAP);
+        assert!(range_budget_admits(second, remaining));
+        assert!(!range_budget_admits(RUNTIME_RANGE_FILE_CAP + 1, remaining));
+        assert!(range_budget_admits(
+            RUNTIME_RANGE_FILE_CAP,
+            RUNTIME_RANGE_TREE_CAP
+        ));
+    }
     fn runtime_fixture() -> (std::path::PathBuf, Vec<(String, u64)>, Value) {
         let root = std::env::temp_dir().join(format!("me-runtime-{}", uuid::Uuid::new_v4()));
         fs::create_dir_all(root.join("runtime")).unwrap();
@@ -571,7 +690,7 @@ mod tests {
             assert_eq!(result["verified_code_unique_bytes"], 0, "{field}");
             assert_eq!(
                 result["hash_budget_remaining"],
-                64 * 1024 * 1024_u64,
+                result["hash_budget_bytes"].as_u64().unwrap(),
                 "{field}"
             );
             fs::remove_dir_all(root).unwrap();
@@ -705,7 +824,7 @@ mod tests {
         fs::remove_dir_all(root).unwrap();
     }
     #[test]
-    fn legitimate_bound_source_over_32k_is_analyzed_but_64k_limit_still_applies() {
+    fn bound_source_between_64kib_and_1mib_is_analyzed() {
         let (root, mut files, mut note) = runtime_fixture();
         note["bounded_extra_metadata"] = json!("x".repeat(33000));
         let bytes = serde_json::to_vec(&note).unwrap();
@@ -719,7 +838,17 @@ mod tests {
         let result = account(&root, &files);
         assert_eq!(result["verified_code_unique_bytes"], 256);
         assert_eq!(result["runtime_observations"].as_array().unwrap().len(), 1);
-        note["bounded_extra_metadata"] = json!("x".repeat(66000));
+        note["bounded_extra_metadata"] = json!("x".repeat(200_000));
+        let bytes = serde_json::to_vec(&note).unwrap();
+        assert!(bytes.len() > 174_685 && (bytes.len() as u64) < BOUND_SOURCE_BYTE_LIMIT);
+        fs::write(root.join("runtime/bound-source-fixture.json"), &bytes).unwrap();
+        files
+            .iter_mut()
+            .find(|(p, _)| p == "runtime/bound-source-fixture.json")
+            .unwrap()
+            .1 = bytes.len() as u64;
+        assert_eq!(account(&root, &files)["verified_code_unique_bytes"], 256);
+        note["bounded_extra_metadata"] = json!("x".repeat(BOUND_SOURCE_BYTE_LIMIT as usize + 64));
         let bytes = serde_json::to_vec(&note).unwrap();
         fs::write(root.join("runtime/bound-source-fixture.json"), &bytes).unwrap();
         files
@@ -728,6 +857,7 @@ mod tests {
             .unwrap()
             .1 = bytes.len() as u64;
         assert_eq!(account(&root, &files)["verified_code_unique_bytes"], 0);
+        fs::remove_dir_all(root).unwrap();
     }
     #[test]
     fn runtime_duplicate_sources_preserve_rows_without_double_counting_and_symlinks_fail() {
@@ -742,7 +872,10 @@ mod tests {
         let result = account(&root, &files);
         assert_eq!(result["runtime_observations"].as_array().unwrap().len(), 2);
         assert_eq!(result["verified_code_logical_bytes"], 256);
-        assert_eq!(result["hash_budget_remaining"], 64 * 1024 * 1024_u64 - 256);
+        assert_eq!(
+            result["hash_budget_remaining"],
+            result["hash_budget_bytes"].as_u64().unwrap() - 256
+        );
         #[cfg(unix)]
         {
             fs::rename(
@@ -901,7 +1034,10 @@ mod tests {
         );
         assert_eq!(result["verified_code_logical_bytes"], 0);
         assert_eq!(result["unverified_observations"], 1);
-        assert_eq!(result["hash_budget_remaining"], 64 * 1024 * 1024_u64);
+        assert_eq!(
+            result["hash_budget_remaining"],
+            result["hash_budget_bytes"].as_u64().unwrap()
+        );
         fs::remove_dir_all(root).unwrap();
     }
 }

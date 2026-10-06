@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use tauri::Emitter;
 use std::collections::HashMap;
 use std::sync::OnceLock;
 use tokio::{
@@ -1123,6 +1124,21 @@ pub fn run() {
             monitoring::read_local_kernsight_evidence_file,
             monitoring::cleanup_kernsight_package_dump,
         ])
+        .setup(|app| {
+            // Operator path used to open one local evidence directory in this window.
+            if let Ok(path) = std::env::var("ME_IMPORT_DIR") {
+                let app = app.handle().clone();
+                tauri::async_runtime::spawn(async move {
+                    for _ in 0..20 {
+                        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                        if app.emit("me-import-directory", path.clone()).is_err() {
+                            break;
+                        }
+                    }
+                });
+            }
+            Ok(())
+        })
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }

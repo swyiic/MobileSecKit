@@ -68,6 +68,7 @@
         :installed-apps="fridaProcesses"
         @open-devices="activeTab = 'devices'"
         @open-ai="activeTab = 'ai-workbench'"
+        @show-evidence="activeTab = 'android-runtime'"
       />
       <AdbToolboxView
         v-show="activeTab === 'adb'"
