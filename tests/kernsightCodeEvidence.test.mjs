@@ -4,7 +4,7 @@ import { readFileSync } from 'node:fs'
 import ts from 'typescript'
 const source=readFileSync(new URL('../src/services/kernsightCodeEvidence.ts',import.meta.url),'utf8')
 const js=ts.transpileModule(source,{compilerOptions:{module:ts.ModuleKind.ESNext}}).outputText
-const {dexObjectGroups,verifiedDexObjectCount,indexedElfModuleCount,indexedDexCount,runtimeDexClassMatches,codeEvidenceLabel,allocatedEvidenceLabel,ownershipEvidenceEntries,codeNoiseLayers,archiveCoverageLabel,elfLoadCoverageLabel,dexScanSummary,dexScanSummaryForObject}=await import(`data:text/javascript;base64,${Buffer.from(js).toString('base64')}`)
+const {dexObjectGroups,verifiedDexObjectCount,indexedElfModuleCount,indexedDexCount,runtimeDexClassMatches,codeEvidenceLabel,allocatedEvidenceLabel,ownershipEvidenceEntries,codeNoiseLayers,archiveCoverageLabel,elfLoadCoverageLabel,dexScanSummary,dexScanSummaryForObject,fileScanLabel}=await import(`data:text/javascript;base64,${Buffer.from(js).toString('base64')}`)
 test('legacy code has no invented source or success',()=>{assert.equal(codeEvidenceLabel(), '');assert.equal(codeEvidenceLabel([{}]),'代码来源未知')})
 test('member provenance is distinct from verified retained bytes and business ownership',()=>{const label=codeEvidenceLabel([{schema:'kernsight.apk-member-evidence/v1',source:{zip_member:'classes.dex',apk_sha256:'a'.repeat(64)},transformation:'repair_dex/v1',local_content_status:'complete_file_hash_verified',ownership:{category:'mixed',reasons:['1 SDK + 99 app']}}]);assert.match(label,/classes.dex.*repair_dex.*保留文件完整 hash 已核对.*混合/);assert.match(label,/APK 原成员未在本地重解包核对/)})
 
@@ -27,6 +27,30 @@ test('dex scan summary does not invent zero bytes or a clean stop',()=>{
   const joined=dexScanSummaryForObject([{object_inspection:{file_bytes:0,scanned_bytes:0,unscanned_tail_bytes:0,candidate_stop_reason:'rejected_candidate_limit',derived_objects:[{sha256:'abc'}]}}],'abc')
   assert.match(joined,/文件 0 B · DEX 扫描到 0 B · 停止 rejected_candidate_limit · 未扫描尾部 0 B/)
   assert.match(dexScanSummaryForObject([],'abc'),/未知/)
+  const sha='abc'
+  const observations=[
+    {mapping:{path:'/mem/a'},source:{pid:1,exec_id:2},raw_evidence:'a.code',object_inspection:{file_bytes:100,scanned_through_offset:40,unscanned_tail_bytes:60,candidate_stop_reason:'rejected_candidate_limit',derived_objects:[{sha256:sha}]}},
+    {mapping:{path:'/mem/b'},source:{pid:1,exec_id:3},raw_evidence:'b.code',object_inspection:{file_bytes:100,scanned_through_offset:100,unscanned_tail_bytes:0,candidate_stop_reason:'complete',derived_objects:[{sha256:sha}]}},
+  ]
+  const both=dexScanSummaryForObject(observations,sha)
+  assert.match(both,/\/mem\/a/)
+  assert.match(both,/\/mem\/b/)
+  assert.match(both,/停止 rejected_candidate_limit/)
+  assert.match(both,/未扫描尾部 60 B/)
+  assert.match(both,/未扫描尾部 0 B/)
+  const fileA=fileScanLabel(observations,{relativePath:'runtime/a.code',sha256:sha})
+  assert.match(fileA,/\/mem\/a/)
+  assert.match(fileA,/停止 rejected_candidate_limit/)
+  assert.doesNotMatch(fileA,/\/mem\/b/)
+  const fileB=fileScanLabel(observations,{relativePath:'runtime/b.code',sha256:sha})
+  assert.match(fileB,/停止 complete/)
+  assert.doesNotMatch(fileB,/rejected_candidate_limit/)
+  const unbound=fileScanLabel(observations,{relativePath:'apk-dex/classes.dex',sha256:sha})
+  assert.match(unbound,/\/mem\/a/)
+  assert.match(unbound,/\/mem\/b/)
+  const absent=fileScanLabel(undefined,{relativePath:'notes.txt'})
+  assert.match(absent,/停止 未知/)
+  assert.match(absent,/未扫描尾部 未知/)
 })
 
 test('old ownership is unknown without overwriting its original data',()=>{const old=[{category:'business',confidence:100}];const result=ownershipEvidenceEntries('mobilee.kernsight-dex-ownership/v3',old);assert.equal(result[0].category,'unknown');assert.equal(result[0].confidence,0);assert.equal(old[0].category,'business')})

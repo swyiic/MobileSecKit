@@ -63,15 +63,79 @@ export function dexScanSummary(inspection?: ScanInspection | null): string {
   return `${status} · 文件 ${file} · DEX 扫描到 ${scanned} · 停止 ${stop} · 未扫描尾部 ${tail}`
 }
 
-export function dexScanSummaryForObject(observations: unknown, sha: unknown): string {
-  if (typeof sha !== 'string' || !sha || !Array.isArray(observations)) return dexScanSummary(null)
+function scanSourceLabel(range: Record<string, any>): string {
+  const mapping = range.mapping && typeof range.mapping === 'object' ? range.mapping.path : undefined
+  const path = typeof mapping === 'string' && mapping
+    ? mapping
+    : typeof range.raw_evidence === 'string' && range.raw_evidence
+      ? range.raw_evidence
+      : typeof range.relative_path === 'string' && range.relative_path
+        ? range.relative_path
+        : '来源未知'
+  const source = range.source && typeof range.source === 'object' ? range.source : {}
+  const pid = source.pid ?? '未知'
+  const exec = source.exec_id ?? '未知'
+  return `${path} · pid ${pid} · exec ${exec}`
+}
+
+function sourceBasename(value: string): string {
+  const cut = Math.max(value.lastIndexOf('/'), value.lastIndexOf('\\'))
+  return cut >= 0 ? value.slice(cut + 1) : value
+}
+
+function sameSourcePath(filePath: string, candidate: string): boolean {
+  if (!filePath || !candidate) return false
+  if (filePath === candidate) return true
+  const left = sourceBasename(filePath)
+  const right = sourceBasename(candidate)
+  return left.length > 0 && left === right
+}
+
+function observationPaths(range: Record<string, any>): string[] {
+  const mapping = range.mapping && typeof range.mapping === 'object' ? range.mapping.path : undefined
+  return [mapping, range.raw_evidence, range.relative_path].filter((value): value is string => typeof value === 'string' && value.length > 0)
+}
+
+/** Every matching source, not the first SHA hit. A path match hides other SHA hits. */
+function scanLines(observations: unknown, shas: string[], filePath: string, preferPath: boolean): string[] {
+  if (!Array.isArray(observations)) return []
+  const byPath: string[] = []
+  const bySha: string[] = []
   for (const range of observations) {
     if (!range || typeof range !== 'object') continue
-    const inspection = (range as { object_inspection?: { derived_objects?: Array<{ sha256?: string }> } }).object_inspection
-    const derived = inspection?.derived_objects
-    if (Array.isArray(derived) && derived.some(object => object?.sha256 === sha)) return dexScanSummary(inspection)
+    const row = range as Record<string, any>
+    const inspection = row.object_inspection as ScanInspection | undefined
+    const derived = Array.isArray(inspection?.derived_objects) ? inspection.derived_objects as Array<{ sha256?: string }> : []
+    const shaHit = derived.some(object => typeof object?.sha256 === 'string' && shas.includes(object.sha256))
+    const pathHit = filePath.length > 0 && observationPaths(row).some(candidate => sameSourcePath(filePath, candidate))
+    const line = `${scanSourceLabel(row)} · ${dexScanSummary(inspection)}`
+    if (pathHit) byPath.push(line)
+    else if (shaHit) bySha.push(line)
   }
-  return '未知（没有对应的扫描记录）'
+  if (preferPath && byPath.length) return byPath
+  return byPath.concat(bySha)
+}
+
+export function dexScanSummaryForObject(observations: unknown, sha: unknown): string {
+  if (typeof sha !== 'string' || !sha || !Array.isArray(observations)) return dexScanSummary(null)
+  const lines = scanLines(observations, [sha], '', false)
+  return lines.length ? lines.join('；') : '未知（没有对应的扫描记录）'
+}
+
+/** Scan position, stop reason, and unread tail for this file. Missing fields stay 未知. */
+export function fileScanLabel(observations: unknown, file: { relativePath?: string; relative_path?: string; codeEvidence?: Array<Record<string, any>>; code_evidence?: Array<Record<string, any>>; sha256?: string }): string {
+  const filePath = file.relativePath || file.relative_path || ''
+  const notes = file.codeEvidence || file.code_evidence || []
+  const shas: string[] = []
+  if (typeof file.sha256 === 'string' && file.sha256) shas.push(file.sha256)
+  for (const note of notes) {
+    for (const key of ['sha256', 'raw_member_sha256'] as const) {
+      const value = note?.[key]
+      if (typeof value === 'string' && value && !shas.includes(value)) shas.push(value)
+    }
+  }
+  const lines = scanLines(observations, shas, filePath, true)
+  return lines.length ? lines.join('；') : `来源未知 · ${dexScanSummary({})}`
 }
 
 export function ownershipEvidenceEntries(schema: unknown, entries: Array<Record<string, any>>): any[] {

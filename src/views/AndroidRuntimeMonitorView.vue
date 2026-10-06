@@ -401,7 +401,7 @@
         <details v-for="layer in evidenceNoiseLayers" :key="layer.key" :class="`noise-${layer.key}`">
           <summary>{{ layer.label }} · {{ layer.groups.length }} 内容组 / {{ layer.groups.reduce((n,g) => n + g.rows.length,0) }} 来源</summary>
           <div class="ks-noise-body">
-            <article v-for="group in layer.groups" :key="group.key"><code>{{ group.sha256 || '未验证完整内容' }}</code><div v-for="row in group.rows" :key="row.path"><b>{{ row.path }}</b><small :title="codeEvidenceLabel(row.notes) || '读取/完整性依据缺失，原件保留'">{{ codeEvidenceLabel(row.notes) || '读取/完整性依据缺失，原件保留' }}</small></div></article>
+            <article v-for="group in layer.groups" :key="group.key"><code>{{ group.sha256 || '未验证完整内容' }}</code><div v-for="row in group.rows" :key="row.path"><b>{{ row.path }}</b><small :title="codeEvidenceLabel(row.notes) || '读取/完整性依据缺失，原件保留'">{{ codeEvidenceLabel(row.notes) || '读取/完整性依据缺失，原件保留' }}</small><small class="ks-scan-status">{{ fileScanText({ relativePath: row.path, codeEvidence: row.notes }) }}</small></div></article>
           </div>
         </details>
       </section>
@@ -428,7 +428,7 @@
       </div>
       <section ref="evidenceBrowserRef" class="ks-evidence-browser">
         <header><div><strong>文件证据浏览器{{ selectedEvidenceCategoryLabel ? ` · ${selectedEvidenceCategoryLabel}` : '' }}</strong><small>内存窗口失败：读 {{ memoryCounterLabel(selectedPackageDump.memory_window_read_failures, selectedLocalBundle?.files) }} / 短读 {{ memoryCounterLabel(selectedPackageDump.memory_window_short_reads, selectedLocalBundle?.files) }} / 写 {{ memoryCounterLabel(selectedPackageDump.memory_window_write_failures, selectedLocalBundle?.files) }}。上方分类只筛选此浏览器。DEX/SO 的语义、映射链也在选中文件后展示；证据文件不能在这里单独删除。</small></div><div><b>{{ evidenceFiles.length }} catalogued</b><button v-if="selectedEvidenceCategory" class="ghost-button" @click="openEvidenceCategory('')">显示全部</button></div></header>
-        <div class="ks-evidence-file-list"><button v-for="file in visibleEvidenceFiles" :key="`${file.package}:${file.relative_path}`" :class="{ active: selectedEvidenceKey === `${file.package}:${file.relative_path}`, 'prio-focus': evidencePriority(file) === 'focus' }" :disabled="loadingEvidence" @click="openEvidenceEntry(file)"><span><strong>{{ file.relative_path }}</strong><small>{{ file.package }} · {{ file.content_class }}</small><small v-if="memoryEvidenceLabel(file.relative_path, file.memoryEvidence)">{{ memoryEvidenceLabel(file.relative_path, file.memoryEvidence) }}</small><small v-if="codeEvidenceLabel(file.codeEvidence)">{{ codeEvidenceLabel(file.codeEvidence) }}</small></span><b>{{ formatBytes(file.bytes) }}</b><em>{{ evidenceBadge(file) }}</em></button></div>
+        <div class="ks-evidence-file-list"><button v-for="file in visibleEvidenceFiles" :key="`${file.package}:${file.relative_path}`" :class="{ active: selectedEvidenceKey === `${file.package}:${file.relative_path}`, 'prio-focus': evidencePriority(file) === 'focus' }" :disabled="loadingEvidence" @click="openEvidenceEntry(file)"><span><strong>{{ file.relative_path }}</strong><small>{{ file.package }} · {{ file.content_class }}</small><small v-if="memoryEvidenceLabel(file.relative_path, file.memoryEvidence)">{{ memoryEvidenceLabel(file.relative_path, file.memoryEvidence) }}</small><small v-if="codeEvidenceLabel(file.codeEvidence)">{{ codeEvidenceLabel(file.codeEvidence) }}</small><small class="ks-scan-status">{{ fileScanText(file) }}</small></span><b>{{ formatBytes(file.bytes) }}</b><em>{{ evidenceBadge(file) }}</em></button></div>
         <button v-if="visibleEvidenceFiles.length < evidenceFiles.length" class="ghost-button ks-load-more" @click="evidenceVisibleCount += 100">继续显示 {{ Math.min(100, evidenceFiles.length - visibleEvidenceFiles.length) }} 个文件</button>
         <div v-if="loadingEvidence" class="ks-loading"><span class="material-symbols-outlined spinning">sync</span>正在读取证据文件…</div>
         <article v-else-if="selectedEvidence" class="ks-evidence-preview"><header><div><strong>{{ selectedEvidence.relativePath }}</strong><small>{{ selectedEvidence.package }} · {{ formatBytes(selectedEvidence.bytes) }}{{ selectedEvidence.truncated ? ' · 预览已截断' : '' }} · {{ evidenceOriginLabel(selectedEvidence.relativePath) }}</small></div><div><b>{{ evidencePreviewKind }}</b><button class="icon-button" @click="closeEvidencePreview">×</button></div></header><div v-if="evidenceDecodedPreview" class="ks-binary-preview-grid"><section><h4>HEX</h4><pre>{{ evidencePreview }}</pre></section><section><h4>转码 / 可打印字符串</h4><pre>{{ evidenceDecodedPreview }}</pre></section></div><pre v-else>{{ evidencePreview }}</pre></article>
@@ -448,7 +448,7 @@
 <script setup lang="ts">
 import { mergeCaptureGroups,groupSessionIds,captureGroupEdges } from '../services/kernsightCaptureGroups'
 import { memoryCounterLabel, memoryEvidenceLabel } from '../services/kernsightMemoryEvidence'
-import { dexObjectGroups, verifiedDexObjectCount, indexedElfModuleCount, indexedDexCount, runtimeDexClassMatches, elfLoadCoverageLabel, codeEvidenceLabel, allocatedEvidenceLabel, ownershipEvidenceEntries, codeNoiseLayers, archiveCoverageLabel, dexScanSummary, dexScanSummaryForObject } from '../services/kernsightCodeEvidence'
+import { dexObjectGroups, verifiedDexObjectCount, indexedElfModuleCount, indexedDexCount, runtimeDexClassMatches, elfLoadCoverageLabel, codeEvidenceLabel, allocatedEvidenceLabel, ownershipEvidenceEntries, codeNoiseLayers, archiveCoverageLabel, dexScanSummary, dexScanSummaryForObject, fileScanLabel } from '../services/kernsightCodeEvidence'
 import { buildAutoCaptureStages, captureCodeOnlyChoice, startupEvidenceLabel, qualifiedSourceLabel, buildUnifiedStageSpec, type AutoStageReceipt } from '@/services/kernsightCapturePlan'
 import { computed, markRaw, nextTick, onErrorCaptured, onBeforeUnmount, onMounted, reactive, ref, shallowRef, watch } from 'vue'
 import { listen } from '@tauri-apps/api/event'
@@ -655,6 +655,9 @@ const filteredDexOwnershipEntries = computed(() => dexOwnershipEntries.value
     || left.canonical_relative_path.localeCompare(right.canonical_relative_path)))
 const visibleDexOwnershipEntries = computed(() => filteredDexOwnershipEntries.value.slice(0, dexOwnershipVisibleCount.value))
 
+function fileScanText(file: { relativePath?: string; relative_path?: string; codeEvidence?: Array<Record<string, any>>; sha256?: string }) {
+  return fileScanLabel(selectedPackageDump.value?.local_storage_accounting?.runtime_observations, file)
+}
 function dexIndexObject(sha: string) {
   return selectedPackageDump.value?.content_dex_class_index?.objects?.find(object => object.sha256 === sha) || null
 }
@@ -2310,6 +2313,7 @@ details.ks-session-row pre { max-height: 360px; overflow: auto; white-space: pre
 .ks-noise-body{max-height:240px;margin-top:8px;overflow:auto}
 .ks-noise-body article{min-width:0;padding:8px 0;border-top:1px solid var(--line)}
 .ks-noise-body b,.ks-noise-body small,.ks-noise-body code{display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.ks-noise-body small.ks-scan-status,.ks-evidence-file-list small.ks-scan-status{white-space:normal;overflow:visible;text-overflow:clip}
 .ks-dex-ownership h4{margin:14px 0 0;color:var(--text);font-size:12px;font-weight:650}
 .ks-dex-ownership-list article>span,.ks-dex-ownership-list article>p,.ks-dex-ownership-list article>small,.ks-dex-ownership-list article>details{min-width:0;overflow-wrap:anywhere}
 .ks-dex-ownership-list article>details{grid-column:1 / -1}
