@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
-use tauri::Emitter;
 use std::collections::HashMap;
 use std::sync::OnceLock;
+use tauri::Emitter;
 use tokio::{
     process::Command,
     sync::Mutex,
