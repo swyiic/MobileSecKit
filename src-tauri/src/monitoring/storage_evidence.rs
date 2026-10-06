@@ -487,13 +487,20 @@ fn fitting_dex_images(bytes: &[u8]) -> DexCandidateScan {
 }
 
 fn inspect_runtime_bytes_with_class_budget(bytes: &[u8], _class_budget: &mut usize) -> Value {
-    let elf_magic = bytes.windows(4).filter(|b| *b == b"\x7fELF").count();
     let DexCandidateScan {
         images,
         mut rejected,
         stop_reason,
         scanned_through,
     } = fitting_dex_images(bytes);
+    let file_bytes = bytes.len();
+    let unscanned_tail = file_bytes.saturating_sub(scanned_through);
+    let elf_magic = bytes
+        .get(..scanned_through)
+        .unwrap_or(&[])
+        .windows(4)
+        .filter(|b| *b == b"\x7fELF")
+        .count();
     let mut objects = Vec::new();
     for (offset, len) in images {
         let slice = &bytes[offset..offset.saturating_add(len)];
@@ -504,7 +511,7 @@ fn inspect_runtime_bytes_with_class_budget(bytes: &[u8], _class_budget: &mut usi
             None => rejected.push(json!({"source_offset":offset,"reason":"semantic_tables_invalid_or_unsupported","declared_length":len,"complete_dex_validated":false})),
         }
     }
-    json!({"status":if objects.is_empty() && rejected.is_empty() && elf_magic==0 {"no_dex_or_elf_header_in_retained_range"} else {"bounded_candidate_inspection"},"scanned_bytes":bytes.len(),"scanned_through_offset":scanned_through,"candidate_stop_reason":stop_reason,"omitted_after_stop":stop_reason.is_some() && scanned_through < bytes.len(),"dex_magic_count":objects.len()+rejected.len(),"elf_magic_count":elf_magic,"elf_header":super::elf_runtime::header(bytes),"derived_objects":objects,"rejected_candidates":rejected,"elf_status":if elf_magic==0 {"no_elf_header"} else {"unknown_no_linked_elf_reconstruction_parser"},"boundary":"this retained range only; headerless JIT, unselected pages and unread bytes remain unknown"})
+    json!({"status":if objects.is_empty() && rejected.is_empty() && elf_magic==0 {"no_dex_or_elf_header_in_retained_range"} else {"bounded_candidate_inspection"},"file_bytes":file_bytes,"scanned_bytes":scanned_through,"scanned_through_offset":scanned_through,"unscanned_tail_bytes":unscanned_tail,"candidate_stop_reason":stop_reason,"omitted_after_stop":stop_reason.is_some() && unscanned_tail > 0,"dex_magic_count":objects.len()+rejected.len(),"elf_magic_count":elf_magic,"elf_header":super::elf_runtime::header(bytes.get(..scanned_through).unwrap_or(&[])),"derived_objects":objects,"rejected_candidates":rejected,"elf_status":if elf_magic==0 {"no_elf_header"} else {"unknown_no_linked_elf_reconstruction_parser"},"boundary":"file_bytes is the retained file; scanned_bytes is only the DEX candidate walk. A stop leaves unscanned_tail_bytes unread"})
 }
 
 fn dex_adler32(bytes: &[u8]) -> u32 {
@@ -643,10 +650,10 @@ mod tests {
         assert_eq!(view["candidate_stop_reason"], "rejected_candidate_limit");
         assert!(view["scanned_through_offset"].as_u64().unwrap() <= real_at as u64);
         assert_eq!(view["omitted_after_stop"], true);
-        assert!(
-            view["scanned_through_offset"].as_u64().unwrap()
-                < view["scanned_bytes"].as_u64().unwrap()
-        );
+        assert_eq!(view["file_bytes"], bytes.len() as u64);
+        assert_eq!(view["scanned_bytes"], view["scanned_through_offset"]);
+        assert!(view["unscanned_tail_bytes"].as_u64().unwrap() > 0);
+        assert!(view["scanned_bytes"].as_u64().unwrap() < view["file_bytes"].as_u64().unwrap());
     }
     #[test]
     fn tree_budget_keeps_a_later_range_after_the_old_128mib_pool_would_be_spent() {
