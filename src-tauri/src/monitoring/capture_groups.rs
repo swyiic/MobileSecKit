@@ -26,6 +26,9 @@ pub struct Attempt {
     pub finished_unix_ms: Option<u64>,
     pub session_id: Option<Uuid>,
     pub error: Option<String>,
+    /// Bounded display-only output, kept separate from policy-classified errors.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub diagnostic_tail: Option<String>,
     pub remote_artifact_root: Option<String>,
     #[serde(default)]
     pub process_instances: Vec<Value>,
@@ -345,6 +348,7 @@ impl Group {
             finished_unix_ms: None,
             session_id: None,
             error: None,
+            diagnostic_tail: None,
             remote_artifact_root: None,
             process_instances: vec![],
             observation_error: None,
@@ -628,6 +632,39 @@ pub struct StageResult {
     pub error: Option<String>,
     pub continue_after_partial: bool,
 }
+
+const MAX_CAPTURE_DIAGNOSTIC_BYTES: usize = 3072;
+
+fn capture_diagnostic_tail(result: &KernSightCaptureResult) -> Option<String> {
+    let (source, text) = if !result.stderr.trim().is_empty() {
+        ("stderr", result.stderr.trim())
+    } else {
+        ("stdout", result.stdout.trim())
+    };
+    if text.is_empty() {
+        return None;
+    }
+    let mut prefix = format!("[{source}]\n");
+    if prefix.len() + text.len() > MAX_CAPTURE_DIAGNOSTIC_BYTES {
+        prefix = format!("[{source} tail; earlier output omitted]\n");
+    }
+    let mut start = text
+        .len()
+        .saturating_sub(MAX_CAPTURE_DIAGNOSTIC_BYTES - prefix.len());
+    while !text.is_char_boundary(start) {
+        start += 1;
+    }
+    Some(format!("{prefix}{}", &text[start..]))
+}
+
+/// Run after terminal and budget classification. Output is diagnostic evidence,
+/// never a stop reason, cleanup receipt, or permission to advance another stage.
+fn retain_capture_diagnostic(attempt: &mut Attempt, result: Option<&KernSightCaptureResult>) {
+    if !matches!(attempt.state.as_str(), "running" | "succeeded") {
+        attempt.diagnostic_tail = result.and_then(capture_diagnostic_tail);
+    }
+}
+
 #[tauri::command]
 pub async fn run_kernsight_group_stage(
     app: tauri::AppHandle,
@@ -866,6 +903,7 @@ async fn run_group_stage_at(
         attempt.process_instances = instances.into_iter().take(16).collect();
         attempt.observation_error = observation_error;
         attempt.remote_lifecycle = remote_lifecycle;
+        retain_capture_diagnostic(attempt, result.as_ref());
         save(&root, &g)?;
     }
     let continue_after_partial = g.continue_after_partial(&stage_key);
@@ -904,6 +942,92 @@ mod tests {
                 .to_vec(),
         }
     }
+    fn diagnostic_result(stdout: &str, stderr: &str) -> KernSightCaptureResult {
+        KernSightCaptureResult {
+            session_id: Some(Uuid::new_v4()),
+            started_unix_ms: 1,
+            finished_unix_ms: 2,
+            command_preview: "synthetic diagnostic fixture".into(),
+            stdout: stdout.into(),
+            stderr: stderr.into(),
+            exit_code: Some(1),
+            hide_debug: false,
+        }
+    }
+
+    #[test]
+    fn diagnostic_tail_prefers_stderr_falls_back_to_stdout_and_omits_empty_output() {
+        assert_eq!(
+            capture_diagnostic_tail(&diagnostic_result("stdout detail", " stderr detail \n")),
+            Some("[stderr]\nstderr detail".into())
+        );
+        assert_eq!(
+            capture_diagnostic_tail(&diagnostic_result(" stdout detail \n", " \n")),
+            Some("[stdout]\nstdout detail".into())
+        );
+        assert!(capture_diagnostic_tail(&diagnostic_result(" \n", "\t")).is_none());
+    }
+
+    #[test]
+    fn diagnostic_tail_bounds_bytes_without_splitting_utf8_and_keeps_the_end() {
+        for text in ["x".repeat(20_000), "诊断🙂".repeat(5_000)] {
+            let output = format!("{text}\nfinal failure detail");
+            let tail = capture_diagnostic_tail(&diagnostic_result("", &output)).unwrap();
+            assert!(tail.len() <= MAX_CAPTURE_DIAGNOSTIC_BYTES);
+            assert!(tail.starts_with("[stderr tail; earlier output omitted]\n"));
+            assert!(tail.ends_with("\nfinal failure detail"));
+        }
+    }
+
+    #[test]
+    fn diagnostic_tail_persists_without_changing_failure_policy_or_retry_history() {
+        let mut g = group();
+        let relation = g.start("l0", epoch()).unwrap();
+        let output = diagnostic_result("", "parent_cancelled remote_collection_partial");
+        let error = Some("阶段退出状态未确认成功: Some(1)".to_owned());
+        g.finish(&relation, output.session_id, None, error.clone())
+            .unwrap();
+        retain_capture_diagnostic(&mut g.stages[0].attempts[0], Some(&output));
+        // The display-only log must neither classify a stop nor change idempotency.
+        g.finish(&relation, output.session_id, None, error.clone())
+            .unwrap();
+        assert_eq!(g.state, "failed");
+        assert_eq!(g.stages[0].attempts[0].error, error);
+        assert!(!g.continue_after_partial("l0"));
+        assert!(g.start("l1", epoch()).is_err());
+
+        let root = std::env::temp_dir().join(format!("me-diagnostic-test-{}", Uuid::new_v4()));
+        save(&root, &g).unwrap();
+        let mut restored = load(&root, g.id).unwrap();
+        assert_eq!(
+            restored.stages[0].attempts[0].diagnostic_tail,
+            Some("[stderr]\nparent_cancelled remote_collection_partial".into())
+        );
+        let retry = restored.start("l0", epoch()).unwrap();
+        assert_eq!(retry.attempt, 2);
+        assert_eq!(restored.stages[0].attempts[0].state, "failed");
+        assert!(restored.stages[0].attempts[0].diagnostic_tail.is_some());
+        assert!(restored.stages[0].attempts[1].diagnostic_tail.is_none());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn diagnostic_tail_does_not_store_success_logs_and_accepts_legacy_manifests() {
+        let mut g = group();
+        let relation = g.start("l0", epoch()).unwrap();
+        let output = diagnostic_result("ordinary success output", "warning");
+        g.finish(&relation, output.session_id, None, None).unwrap();
+        retain_capture_diagnostic(&mut g.stages[0].attempts[0], Some(&output));
+        assert!(g.stages[0].attempts[0].diagnostic_tail.is_none());
+        let encoded = serde_json::to_value(&g).unwrap();
+        assert!(encoded["stages"][0]["attempts"][0]
+            .get("diagnosticTail")
+            .is_none());
+        let restored: Group = serde_json::from_value(encoded).unwrap();
+        restored.validate().unwrap();
+        assert!(restored.stages[0].attempts[0].diagnostic_tail.is_none());
+    }
+
     fn quota_partial_group() -> Group {
         let mut g = group();
         g.stages[2].launch_after_attach = false;
@@ -1601,6 +1725,7 @@ impl Group {
                 finished_unix_ms: None,
                 session_id: None,
                 error: None,
+                diagnostic_tail: None,
                 remote_artifact_root: None,
                 process_instances: vec![],
                 observation_error: None,
@@ -1835,6 +1960,13 @@ pub async fn run_kernsight_unified_group(
                     g.refresh();
                 }
             }
+        }
+        for attempt in g.stages[..3]
+            .iter_mut()
+            .flat_map(|s| s.attempts.iter_mut())
+            .filter(|a| relations.contains(&a.relation))
+        {
+            retain_capture_diagnostic(attempt, result.as_ref());
         }
         save(&root, &g)?;
     }
@@ -2102,6 +2234,7 @@ mod source_relation_tests {
                     finished_unix_ms: Some(2),
                     session_id: Some(id),
                     error: None,
+                    diagnostic_tail: None,
                     remote_artifact_root: None,
                     process_instances: vec![],
                     observation_error: None,

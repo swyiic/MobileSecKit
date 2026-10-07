@@ -1,4 +1,5 @@
 import { sameImportedCapture } from '../services/kernsightCaptureGroups'
+import { selectedImportedBundle } from '../services/kernsightWorkspaceState'
 import { computed, markRaw, ref, shallowRef, type MaybeRef, unref } from 'vue'
 import { open } from '@tauri-apps/plugin-dialog'
 import { monitoringBackend } from '@/services/backend'
@@ -6,6 +7,7 @@ import { buildKernSightAnalyzerJoin } from '@/services/kernsightJoin'
 import type { KernSightAnalyzerJoin, KernSightLocalEvidenceBundle } from '@/types/monitoring'
 
 const bundles = shallowRef<KernSightLocalEvidenceBundle[]>([])
+const selectedRoots = ref<Record<string, string>>({})
 const requestedPackage = ref('')
 const PARENT_KEY = 'mobilee.kernsightReportsParent'
 
@@ -24,11 +26,16 @@ export function upsertKernSightBundle(bundle: KernSightLocalEvidenceBundle) {
     ...bundles.value.filter(item => !sameImportedCapture(item,bundle)),
     markRaw(bundle),
   ]
+  selectKernSightBundle(bundle)
   rememberParent(bundle.root)
 }
 
+export function selectKernSightBundle(bundle: KernSightLocalEvidenceBundle) {
+  selectedRoots.value = { ...selectedRoots.value, [bundle.package]: bundle.root }
+}
+
 export function bundleForPackage(packageName: string) {
-  return bundles.value.find(bundle => bundle.package === packageName) || null
+  return selectedImportedBundle(bundles.value, packageName, selectedRoots.value[packageName])
 }
 
 export async function importKernSightDirectory(path?: string) {
@@ -76,6 +83,9 @@ export function useKernSightEvidence(packageName?: MaybeRef<string>) {
   const join = computed<KernSightAnalyzerJoin | null>(() => bundle.value ? buildKernSightAnalyzerJoin(bundle.value) : null)
   return {
     bundles,
+    selectedRoots,
+    bundleForPackage,
+    selectBundle: selectKernSightBundle,
     requestedPackage,
     bundle,
     join,

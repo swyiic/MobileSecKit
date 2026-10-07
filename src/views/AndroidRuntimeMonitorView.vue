@@ -79,44 +79,46 @@
 
     <section v-if="kernSight && workspaceMode === 'capture'" class="panel ks-capture-panel">
       <div class="section-title compact">
-        <div><div class="eyebrow">CAPTURE CONTROL</div><h2>按层采集</h2><p>L0 默认采集进程、文件、mmap、socket、DNS、Handshake（ClientHello SNI/ALPN、HTTP/1 Host、QUIC 首段）和 Binder parcel prefix。L1 TLS、JNI 明文与 Binder userspace 可同会话；单窗口 Linker 仍独占；统一阶段可顺序切换。要拿到 SNI，必须在 connect 首写之前开始；包 PID 出现前不要开 Sched。</p></div>
+        <div><div class="eyebrow">CAPTURE CONTROL</div><h2>自动采集</h2><p>选择目标包，一次点击自动完成 L0 → L1 → 快照 → Linker，并保存在一个主会话中。运行中可切回证据链；失败会保留已经采到的数据和重试入口。</p></div>
         <span class="device-chip" :class="{ active: captureRunning }">{{ captureRunning ? `RUNNING ${captureElapsed}s` : 'READY' }}</span>
       </div>
       <div class="ks-presets">
+        <button :class="{ active: captureForm.plan === 'auto' }" :aria-pressed="captureForm.plan === 'auto'" :disabled="captureRunning" @click="applyCapturePreset('auto')"><span class="material-symbols-outlined">playlist_play</span><strong>全自动采集</strong><small>L0 {{ captureForm.autoL0Seconds }}s → L0+L1 {{ captureForm.autoL1Seconds }}s → {{ captureForm.autoSessionMode === 'startup_replay' ? '该实例 Dump → ' : '' }}Linker {{ captureForm.autoLinkerSeconds }}s{{ captureForm.autoSessionMode === 'unified' ? ' → Dump' : '' }}</small></button>
         <button :disabled="captureRunning" @click="applyCapturePreset('observe-pkg')"><span class="material-symbols-outlined">hub</span><strong>单包 L0 主干</strong><small>DNS / SNI / Binder token，无 Inspect</small></button>
         <button :disabled="captureRunning" @click="applyCapturePreset('tls-binder')"><span class="material-symbols-outlined">key</span><strong>单包 L0+L1</strong><small>主干 + TLS + JNI 明文 + Parcel</small></button>
         <button :disabled="captureRunning" @click="applyCapturePreset('binder')"><span class="material-symbols-outlined">device_hub</span><strong>单包 Binder L1</strong><small>Parcel token / scalar · ELF64</small></button>
         <button :disabled="captureRunning" @click="applyCapturePreset('linker')"><span class="material-symbols-outlined">deployed_code</span><strong>单包 Linker</strong><small>独占 SO load；不与 TLS 同会话</small></button>
         <button :disabled="captureRunning" @click="applyCapturePreset('whole')"><span class="material-symbols-outlined">public</span><strong>全设备 L0</strong><small>无包过滤 · 不要开 Inspect/Sched</small></button>
         <button :disabled="captureRunning" @click="applyCapturePreset('dump')"><span class="material-symbols-outlined">folder_zip</span><strong>单包 L2 Dump</strong><small>--launch 拷 DEX/SO/CE·DE</small></button>
-        <button :disabled="captureRunning" @click="applyCapturePreset('auto')"><span class="material-symbols-outlined">playlist_play</span><strong>分阶段采集</strong><small>L0 {{ captureForm.autoL0Seconds }}s → L0+L1 {{ captureForm.autoL1Seconds }}s → {{ captureForm.autoSessionMode === 'startup_replay' ? '该实例 Dump → ' : '' }}Linker {{ captureForm.autoLinkerSeconds }}s{{ captureForm.autoSessionMode === 'unified' ? ' → Dump' : '' }}</small></button>
       </div>
-      <div class="ks-layer-contract"><article v-for="layer in layerContracts" :key="layer.key" :class="`layer-${layer.key}`"><header><b>{{ layer.label }}</b><small>{{ layer.stage }}</small></header><strong>{{ layer.title }}</strong><p>{{ layer.detail }}</p><ul><li v-for="item in layer.items" :key="item">{{ item }}</li></ul></article></div>
+      <details class="ks-capture-help"><summary>采集层级与覆盖边界</summary><div class="ks-layer-contract"><article v-for="layer in layerContracts" :key="layer.key" :class="`layer-${layer.key}`"><header><b>{{ layer.label }}</b><small>{{ layer.stage }}</small></header><strong>{{ layer.title }}</strong><p>{{ layer.detail }}</p><ul><li v-for="item in layer.items" :key="item">{{ item }}</li></ul></article></div></details>
       <div class="ks-capture-form">
-        <label v-if="captureForm.plan === 'auto'" class="wide"><span>阶段生命周期</span><select v-model="captureForm.autoSessionMode" :disabled="captureRunning"><option value="startup_replay">启动重采：三次冷启动，分别观察各能力启动窗口</option><option value="unified">统一 session：只首次冷启动，顺序启停 Inspect（需新版 agent）</option></select><small>{{ captureForm.autoSessionMode === 'unified' ? 'L0 全程保留；L1/Linker 各有时间窗，只在会话结束取驻留快照，不能补回其它阶段的启动调用或已卸载代码。' : 'L0/L1/Linker 各由本 attempt 强制停止并启动新实例；L1 后快照属于该实例。实际挂载前的事件可能缺失，失败/未知会停止后续阶段。' }}</small></label>
-        <label class="wide"><span>目标包（留空表示全设备 Observe）</span><input v-model.trim="captureForm.package" :disabled="captureRunning" placeholder="例如 us.hsbc.hsbcus" /></label>
+        <label class="wide"><span>{{ captureForm.plan === 'auto' ? '目标包（必填）' : '目标包（全设备 L0 可留空）' }}</span><input v-model.trim="captureForm.package" :disabled="captureRunning" placeholder="例如 us.hsbc.hsbcus" /></label>
         <label v-if="captureForm.plan !== 'auto'"><span>时长（秒）</span><input v-model.number="captureForm.durationSeconds" :disabled="captureRunning" type="number" min="1" max="300" /></label>
         <label><span>采样 1 / N</span><input v-model.number="captureForm.sampleOneIn" :disabled="captureRunning" type="number" min="1" max="10000" /></label>
         <label><span>L1 Inspect 组合{{ captureForm.plan === 'auto' ? '（L1 阶段固定组合）' : '' }}</span><select v-model="captureForm.inspectMode" :disabled="captureRunning || captureForm.plan === 'auto'"><option value="none">关闭（仅 L0）</option><option value="tls">TLS plaintext</option><option value="jni_plaintext">JNI plaintext</option><option value="binder_userspace">Binder userspace</option><option value="tls_jni">TLS + JNI</option><option value="binder_jni">Binder + JNI</option><option value="tls_binder">TLS + Binder</option><option value="tls_binder_jni">TLS + Binder + JNI</option><option value="linker_so_load">Linker SO load（独占）</option></select></label>
         <label><span>明文/命中上限</span><select v-model.number="captureForm.inspectMaxBytes" :disabled="captureRunning"><option :value="256">256 B</option><option :value="1024">1 KiB</option><option :value="4096">4 KiB</option><option :value="16384">16 KiB</option><option :value="65536">64 KiB</option></select></label>
-        <label v-if="captureForm.plan === 'auto'"><span>累计输出写入预算（MiB）</span><input v-model.number="captureForm.totalBudgetMiB" type="number" min="4" max="16384" :disabled="captureRunning" /></label>
-        <label v-if="captureForm.plan === 'auto'"><span>总期限（秒）</span><input v-model.number="captureForm.maxSessionSeconds" type="number" min="30" max="3600" :disabled="captureRunning" /></label>
-        <label v-if="captureForm.plan === 'auto'" class="wide"><span>隔离候选运行根（留空使用旧默认路径）</span><input v-model="captureForm.isolatedRoot" :disabled="captureRunning" placeholder="/data/local/tmp/ksight-candidate-本轮ID" /><small>目录、agent、BPF、资产与证据均需处于此根；不安装或替换默认工具。</small></label>
-        <label v-if="captureForm.plan === 'auto' && captureForm.isolatedRoot.trim()" class="wide"><span>隔离agent绝对路径（留空为运行根/ksightd）</span><input v-model="captureForm.isolatedAgent" :disabled="captureRunning" /><span>候选完整SHA256（必填）</span><input v-model="captureForm.isolatedSha256" :disabled="captureRunning" /></label>
-        <label v-if="captureForm.plan === 'auto'" class="wide"><span>独立采集范围</span><span><input v-model="captureForm.codeOnly" type="checkbox" :disabled="captureRunning" /> 仅代码证据（独立选择，默认关闭）</span><small>普通与仅代码范围均按计划执行强制停止和冷启动；不暂停进程。仅代码先核验真实 BTF/task-storage 后端，启动后再资格化具体实例。新父会话两种范围均限定独占 UID 主进程的已登记代码/执行映射，不等于旧全内存采集；共享 UID、容器和未登记匿名堆/FD 扫描不支持。L1仍按阶段开启TLS/JNI/Binder Inspect，“仅代码”不是禁止所有Inspect字节的承诺。事件从实际挂载时刻起可观察，最早事件可能缺失。</small></label>
-        <label v-if="captureForm.plan === 'auto'" class="wide"><span>独立额外能力（默认关闭）</span><span><input v-model="captureForm.collectKeys" type="checkbox" :disabled="captureRunning" /> 密钥轮询 <input v-model="captureForm.collectPrivate" type="checkbox" :disabled="captureRunning" /> CE/DE 私有存储 <input v-model="captureForm.collectMemoryWindows" type="checkbox" :disabled="captureRunning" /> 通用内存窗口</span><small>代码发现、APK/split 原件、阶段能力仍保留。额外能力需单独范围校验；身份或范围不能证明时拒绝。预算耗尽停止新输出，标为 partial，原件保留可导入；预算计入设备产物、传输缓存、归档及导入输出，元数据每操作预留64KiB，父清单原子保存计入2MiB管理额度。逻辑字节、唯一内容和物理占用分别显示，硬链接不丢原路径。</small></label>
         <label v-if="captureForm.plan === 'auto'"><span>L0 主干（秒）</span><input v-model.number="captureForm.autoL0Seconds" :disabled="captureRunning" type="number" min="1" max="300" /></label>
         <label v-if="captureForm.plan === 'auto'"><span>L0+L1 观察窗（秒）</span><input v-model.number="captureForm.autoL1Seconds" :disabled="captureRunning" type="number" min="1" max="300" /></label>
-        <p v-if="captureForm.plan === 'auto'" class="muted">90 秒默认值仅指 L1 观察窗；L0、L1、Linker 默认合计 120 秒。总期限另计冷启动、挂载、提取与本父会话内的输出操作；阶段结束不表示动态代码覆盖或解析完整。</p>
         <label v-if="captureForm.plan === 'auto'"><span>Linker（秒）</span><input v-model.number="captureForm.autoLinkerSeconds" :disabled="captureRunning" type="number" min="1" max="300" /></label>
+        <p v-if="captureForm.plan === 'auto'" class="ks-form-help wide">默认观察 120 秒，另计启动与快照耗时。L1 阶段请操作目标 App；阶段执行结束不代表动态代码覆盖完整。</p>
       </div>
       <div class="ks-sensor-switches">
         <label><input v-model="captureForm.files" :disabled="captureRunning" type="checkbox" />File open</label>
         <label><input v-model="captureForm.network" :disabled="captureRunning" type="checkbox" />Network lifecycle</label>
         <label><input v-model="captureForm.memory" :disabled="captureRunning" type="checkbox" />Memory executable</label>
         <label><input v-model="captureForm.binder" :disabled="captureRunning" type="checkbox" />Binder</label>
-        <label><input v-model="captureForm.hideDebug" :disabled="captureRunning" type="checkbox" />Hide debug lab</label>
+        <label><input v-model="captureForm.hideDebug" :disabled="captureRunning || captureForm.plan === 'auto'" type="checkbox" />Hide debug lab{{ captureForm.plan === 'auto' ? '（父会话不支持）' : '' }}</label>
       </div>
+      <details v-if="captureForm.plan === 'auto'" class="ks-advanced-capture ks-auto-settings"><summary>自动采集高级设置 · 生命周期、预算与范围</summary><div class="ks-capture-form">
+        <label v-if="captureForm.plan === 'auto'" class="wide"><span>阶段生命周期</span><select v-model="captureForm.autoSessionMode" :disabled="captureRunning"><option value="startup_replay">启动重采：三次冷启动，分别观察各能力启动窗口</option><option value="unified">统一 session：只首次冷启动，顺序启停 Inspect（需新版 agent）</option></select><small>{{ captureForm.autoSessionMode === 'unified' ? 'L0 全程保留；L1/Linker 各有时间窗，只在会话结束取驻留快照，不能补回其它阶段的启动调用或已卸载代码。' : 'L0/L1/Linker 各由本 attempt 强制停止并启动新实例；L1 后快照属于该实例。实际挂载前的事件可能缺失，失败/未知会停止后续阶段。' }}</small></label>
+        <label v-if="captureForm.plan === 'auto'"><span>累计输出写入预算（MiB）</span><input v-model.number="captureForm.totalBudgetMiB" type="number" min="4" max="16384" :disabled="captureRunning" /></label>
+        <label v-if="captureForm.plan === 'auto'"><span>总期限（秒）</span><input v-model.number="captureForm.maxSessionSeconds" type="number" min="30" max="3600" :disabled="captureRunning" /></label>
+        <label v-if="captureForm.plan === 'auto'" class="wide"><span>隔离候选运行根（留空使用旧默认路径）</span><input v-model="captureForm.isolatedRoot" :disabled="captureRunning" placeholder="/data/local/tmp/ksight-candidate-本轮ID" /><small>目录、agent、BPF、资产与证据均需处于此根；不安装或替换默认工具。</small></label>
+        <label v-if="captureForm.plan === 'auto' && captureForm.isolatedRoot.trim()" class="wide"><span>隔离agent绝对路径（留空为运行根/ksightd）</span><input v-model="captureForm.isolatedAgent" :disabled="captureRunning" /><span>候选完整SHA256（必填）</span><input v-model="captureForm.isolatedSha256" :disabled="captureRunning" /></label>
+        <label v-if="captureForm.plan === 'auto'" class="wide"><span>独立采集范围</span><span><input v-model="captureForm.codeOnly" type="checkbox" :disabled="captureRunning" /> 仅代码证据（独立选择，默认关闭）</span><small>普通与仅代码范围均按计划执行强制停止和冷启动；不暂停进程。仅代码先核验真实 BTF/task-storage 后端，启动后再资格化具体实例。新父会话两种范围均限定独占 UID 主进程的已登记代码/执行映射，不等于旧全内存采集；共享 UID、容器和未登记匿名堆/FD 扫描不支持。L1仍按阶段开启TLS/JNI/Binder Inspect，“仅代码”不是禁止所有Inspect字节的承诺。事件从实际挂载时刻起可观察，最早事件可能缺失。</small></label>
+        <label v-if="captureForm.plan === 'auto'" class="wide"><span>父会话暂不支持的额外能力</span><span class="ks-unavailable-options"><span><input type="checkbox" disabled />密钥轮询</span><span><input type="checkbox" disabled />CE/DE 私有存储</span><span><input type="checkbox" disabled />通用内存窗口</span></span><small>当前父会话接口拒绝这三项能力，不能在分阶段采集中启用。代码发现、APK/split 原件、阶段 Inspect 能力仍保留。预算耗尽停止新输出，标为 partial，原件保留可导入；预算计入设备产物、传输缓存、归档及导入输出，元数据每操作预留64KiB，父清单原子保存计入2MiB管理额度。逻辑字节、唯一内容和物理占用分别显示，硬链接不丢原路径。</small></label>
+      </div></details>
       <details class="ks-advanced-capture">
         <summary>高级采集参数</summary>
         <div class="ks-sensor-switches">
@@ -135,7 +137,7 @@
         <div><small>范围</small><strong>{{ captureScopeLabel }}</strong></div>
         <div><small>模式</small><strong :class="`risk-${captureRisk.tone}`">{{ captureRisk.label }}</strong></div>
         <div><small>传感器</small><strong>{{ enabledSensorLabels.join(' · ') || '未选择' }}</strong></div>
-        <details><summary>查看等效命令</summary><code>{{ captureCommandPreview }}</code></details>
+        <details><summary>{{ captureForm.plan === 'auto' ? '查看主会话执行计划' : '查看参考命令' }}</summary><code>{{ captureCommandPreview }}</code></details>
       </div>
       <p class="ks-control-boundary"><span class="material-symbols-outlined">info</span>当前按钮使用 MobileE 前台 ADB 执行路径；关闭 MobileE 会中断等待。常驻 daemon 的远程 StartSession / UpdatePolicy 尚未接通，界面不会伪装成后台独立控制。</p>
       <div v-if="autoStageReceipts.length" class="ks-capture-plan">
@@ -169,7 +171,7 @@
         <ul><li>{{ sensitiveFileCount }} 个敏感候选</li><li>{{ formatBytes(kernSight.privatePackageBytes) }} 受保护</li><li>{{ formatBytes(kernSight.publicPackageBytes) }} 发布目录</li></ul>
       </article>
       <article class="panel runtime-stage-card">
-        <header><span class="stage-index">GAP</span><div><strong>完整性</strong><small>丢失与环境</small></div><b>{{ latestExecutionComplete ? 'COMPLETE' : 'CHECK' }}</b></header>
+        <header><span class="stage-index">GAP</span><div><strong>完整性</strong><small>丢失与环境</small></div><b>{{ sessionReport?.execution_complete === true ? '执行结束' : sessionReport?.execution_complete === false ? '执行不完整' : '未知' }}</b></header>
         <p>握手成功不等于目标行为完整；丢失、采样、截断和环境变化必须留在链上。</p>
         <ul><li>{{ capabilityProbe?.verifiedBootState || 'boot unknown' }}</li><li>{{ capabilityProbe?.selinuxStatus || 'SELinux unknown' }}</li><li>{{ environmentTransitions }} 次环境变化</li></ul>
       </article>
@@ -177,36 +179,40 @@
 
     <section v-if="workspaceMode === 'evidence'" class="panel ks-session-panel">
       <div class="section-title compact"><div><div class="eyebrow">L0 / L1 SESSION</div><h2>{{ sessionMatchedPackage ? `${sessionMatchedPackage} · 会话链` : 'KernSight 会话' }}</h2><p>一次自动采集显示一个主会话，展开实际阶段与所有 attempts；无父 ID 的旧记录独立为 legacy，不按包名合并。</p></div><div class="ks-title-actions"><button v-if="selectedSession || selectedReport" class="ghost-button" title="只关闭当前详情，不删除任何数据" @click="clearCurrentSession">关闭详情</button><span class="device-chip">{{ visibleCaptureGroups.length + visibleLocalSessionBundles.length + legacyDeviceSessions.length }} SESSIONS</span></div></div>
+      <p v-if="captureRunning && lastCaptureGroupId" class="ks-capture-status" role="status">自动采集进行中 · {{ capturePhase || '正在准备' }} · {{ captureElapsed }}s。可以查看已有证据，采集不会因切换页面而中断。</p>
       <div class="ks-session-list">
-        <details v-for="group in visibleCaptureGroups" :key="group.id" class="ks-session-row" :open="selectedCaptureGroup===group.id">
-          <summary @click.prevent="selectedCaptureGroup=selectedCaptureGroup===group.id?'':group.id"><strong>{{ group.package }} · {{ shortSession(group.id) }}</strong> · {{ formatDate(group.createdUnixMs) }} · {{ group.state }} · {{ group.unified?'统一进程阶段':'启动重采' }} · 主会话</summary>
+        <details v-for="group in visibleCaptureGroups" :key="group.id" class="ks-session-row ks-capture-group" :open="selectedCaptureGroup===group.id">
+          <summary @click.prevent="toggleCaptureGroup(group.id)"><strong>{{ group.package }}</strong><span class="ks-group-meta">{{ shortSession(group.id) }} · {{ formatDate(group.createdUnixMs) }} · {{ group.unified ? '统一阶段' : '启动重采' }} · 主会话</span><b :class="`state-${group.state}`">{{ runningCaptureGroup === group.id ? '自动执行中' : captureStateLabel(group.state) }}</b></summary>
+          <details class="ks-group-budget"><summary>预算与采集边界</summary>
           <p class="muted">{{ group.budget ? `会话写入预算 ${formatBytes(group.budget.limits.totalBytes)} · 期限 ${group.budget.limits.maxSeconds}s · 预留 ${group.budget.reservations.length} 个输出操作；计量为写入准入 + 终态预留，物理占用见本地统计` : '旧会话预算 / 采集范围未知，不视为完整或受限成功' }}</p>
           <small v-for="operation in group.budget?.reservations || []" :key="operation.id">{{ operation.kind }} · {{ operation.status }} · 预留 {{ formatBytes(operation.reservedBytes) }} · 准入与终态预留 {{ operation.chargedBytes==null ? '未知' : formatBytes(operation.chargedBytes) }}</small>
           <p>预算累计写入准入及终态预留；读取不计入此计量。唯一内容、传输量和磁盘峰值另核算。有效 partial 归档仅保存已收到路径，不补齐缺页或失败字节。</p>
-          <p>阶段独立进程与启动；未拉取时唯一内容/物理占用未知，执行成功不等于数据覆盖完整。</p>
-          <p v-for="item in importedCaptureGroups.filter(i=>i.group.id===group.id)" :key="item.bundle.root">本次导入树：逻辑 {{ formatBytes(Number(groupLedger(item.bundle)?.logical_file_bytes||0)) }} · 唯一 inode {{ groupLedger(item.bundle)?.unique_inode_bytes==null?'未知':formatBytes(Number(groupLedger(item.bundle)?.unique_inode_bytes)) }} · 实际分配 {{ allocatedEvidenceLabel(groupLedger(item.bundle)?.allocated_bytes) }} · 已核验代码唯一 {{ formatBytes(Number(groupLedger(item.bundle)?.verified_code_unique_bytes||0)) }}（其余内容未核验）；归档范围 {{ archiveCoverageLabel(item.bundle.dumpReport.mobilee_archive_coverage) }}；{{ item.bundle.sessionReport?.mobilee_capture_source_status }} · 传输 {{ item.bundle.dumpReport.mobilee_transport_status ? 'partial（收到的目录不完整，归档可能未生成）' : '无 partial 终态记录；完整性另按预算与源清单核对' }}</p>
-          <details v-for="item in importedCaptureGroups.filter(i=>i.group.id===group.id)" :key="`classes-${item.bundle.root}`"><summary>DEX 完整类索引与独立来源</summary><p v-if="!item.bundle.dumpReport.content_dex_class_index">旧数据：完整类索引未知。</p><section v-for="bucket in dexObjectGroups(item.bundle.dumpReport.content_dex_class_index?.objects)" :key="bucket.kind" :data-dex-group="bucket.kind"><h4>{{ bucket.label }}</h4><article v-for="object in bucket.objects" :key="`${object.sha256}:${object.bytes}`"><p>{{ object.sha256 }} · {{ object.sources.length }} 来源 · {{ object.indexed_classes ?? '未知' }} / {{ object.declared_classes ?? '未知' }} 类 · {{ object.class_index_status }} · {{ object.validation_status || '校验未知（旧字段）' }} · {{ object.ownership }}</p><p>扫描范围：{{ dexScanSummaryForObject(groupLedger(item.bundle)?.runtime_observations, object.sha256) }}</p><pre>{{ object.class_hints }}</pre><details><summary>来源与实例</summary><pre>{{ object.sources }}</pre></details><input v-model="dexClassQuery" placeholder="类名片段，检索全部已索引类" /><p>匹配 {{ runtimeDexClassMatches(item.bundle.dumpReport.local_storage_accounting,object,dexClassQuery).total }} · 本页 {{ runtimeDexClassMatches(item.bundle.dumpReport.local_storage_accounting,object,dexClassQuery).classes.length }} · 未展开 {{ runtimeDexClassMatches(item.bundle.dumpReport.local_storage_accounting,object,dexClassQuery).omitted }}。未展开的类名仍在索引里，换一个片段可以查到。</p><pre>{{ runtimeDexClassMatches(item.bundle.dumpReport.local_storage_accounting,object,dexClassQuery).classes.join('\n') }}</pre></article></section></details>
-          <details v-for="item in importedCaptureGroups.filter(i=>i.group.id===group.id)" :key="`elf-${item.bundle.root}`"><summary>ELF 加载段覆盖（不是完整 SO 文件）</summary><p v-if="!groupLedger(item.bundle)?.elf_module_observations?.length">旧数据或未验证加载段：解析与覆盖未知。</p><article v-for="module in groupLedger(item.bundle)?.elf_module_observations || []" :key="`${module.source_report}:${module.path}`"><p>{{ module.path }} · PID {{ module.source?.pid ?? '未知' }} / birth {{ module.source?.birth_ns ?? '未知' }} · {{ module.source_report }}</p><p>PT_LOAD 文件部分：{{ elfLoadCoverageLabel(module.all_load_file_bytes_covered) }} · 内存部分（含 BSS）：{{ elfLoadCoverageLabel(module.all_load_memory_bytes_covered) }} · 完整 SO 未重建 · live/torn · 业务/SDK 归属未知</p><p>文件偏移关联由保留的 ELF 头推导，原 maps 未记录文件偏移；未补缺失节表、重定位或未读字节。</p><table v-if="module.segments?.length"><thead><tr><th>文件偏移</th><th>虚拟地址</th><th>文件字节</th><th>内存字节</th><th>文件缺口</th><th>内存缺口</th></tr></thead><tbody><tr v-for="(segment,index) in module.segments" :key="index"><td>{{ segment.file_offset }}</td><td>{{ segment.virtual_start }}</td><td>{{ segment.file_bytes }}</td><td>{{ segment.memory_bytes }}</td><td>{{ segment.file_backed_gaps?.length ? segment.file_backed_gaps : '无（列示范围）' }}</td><td>{{ segment.memory_gaps?.length ? segment.memory_gaps : '无（列示范围）' }}</td></tr></tbody></table><details><summary>原始范围、hash 与派生偏移链</summary><pre>{{ module }}</pre></details></article></details>
+          <p>{{ group.unified ? '统一阶段按生产者记录核对同一进程实例。' : '启动重采各阶段属于不同进程实例。' }}未拉取时唯一内容/物理占用未知，执行成功不等于数据覆盖完整。</p></details>
+          <p v-for="item in importedCaptureGroups.filter(i=>i.group.id===group.id)" :key="item.bundle.root">本次导入树：逻辑 {{ formatMaybeBytes(groupLedger(item.bundle)?.logical_file_bytes) }} · 唯一 inode {{ groupLedger(item.bundle)?.unique_inode_bytes==null?'未知':formatBytes(Number(groupLedger(item.bundle)?.unique_inode_bytes)) }} · 实际分配 {{ allocatedEvidenceLabel(groupLedger(item.bundle)?.allocated_bytes) }} · 已核验代码唯一 {{ formatMaybeBytes(groupLedger(item.bundle)?.verified_code_unique_bytes) }}（其余内容未核验）；归档范围 {{ archiveCoverageLabel(item.bundle.dumpReport.mobilee_archive_coverage) }}；{{ item.bundle.sessionReport?.mobilee_capture_source_status || '来源状态未知' }} · 传输 {{ item.bundle.dumpReport.mobilee_transport_status ? 'partial（收到的目录不完整，归档可能未生成）' : '无 partial 终态记录；完整性另按预算与源清单核对' }}</p>
+          <p v-for="item in importedCaptureGroups.filter(i=>i.group.id===group.id)" :key="`open-${item.bundle.root}`"><button class="ghost-button" @click="loadLocalBundleSession(item.bundle)">打开本次导入的主会话报告</button><small>{{ item.bundle.root }}</small></p>
+          <KernSightDexIndex v-for="item in importedCaptureGroups.filter(i=>i.group.id===group.id)" :key="`classes-${item.bundle.root}`" :dump="item.bundle.dumpReport" />
+          <details v-for="item in importedCaptureGroups.filter(i=>i.group.id===group.id)" :key="`elf-${item.bundle.root}`"><summary>ELF 加载段覆盖（不是完整 SO 文件）</summary><p v-if="!groupLedger(item.bundle)?.elf_module_observations?.length">旧数据或未验证加载段：解析与覆盖未知。</p><article v-for="module in groupLedger(item.bundle)?.elf_module_observations || []" :key="`${module.source_report}:${module.path}`"><p>{{ module.path }} · PID {{ module.source?.pid ?? '未知' }} / birth {{ module.source?.birth_ns ?? '未知' }} · {{ module.source_report }}</p><p>PT_LOAD 文件部分：{{ elfLoadCoverageLabel(module.all_load_file_bytes_covered) }} · 内存部分（含 BSS）：{{ elfLoadCoverageLabel(module.all_load_memory_bytes_covered) }} · 完整 SO 未重建 · live/torn · 业务/SDK 归属未知</p><p>文件偏移关联由保留的 ELF 头推导，原 maps 未记录文件偏移；未补缺失节表、重定位或未读字节。</p><div v-if="module.segments?.length" class="ks-range-table" role="region" aria-label="ELF 加载段范围，可横向滚动" tabindex="0"><table><thead><tr><th>文件偏移</th><th>虚拟地址</th><th>文件字节</th><th>内存字节</th><th>文件缺口</th><th>内存缺口</th></tr></thead><tbody><tr v-for="(segment,index) in module.segments" :key="index"><td>{{ segment.file_offset }}</td><td>{{ segment.virtual_start }}</td><td>{{ segment.file_bytes }}</td><td>{{ segment.memory_bytes }}</td><td>{{ Array.isArray(segment.file_backed_gaps) ? (segment.file_backed_gaps.length ? segment.file_backed_gaps : '无（列示范围）') : '未知（缺字段）' }}</td><td>{{ Array.isArray(segment.memory_gaps) ? (segment.memory_gaps.length ? segment.memory_gaps : '无（列示范围）') : '未知（缺字段）' }}</td></tr></tbody></table></div><details><summary>原始范围、hash 与派生偏移链</summary><pre>{{ module }}</pre></details></article></details>
           <details v-for="item in importedCaptureGroups.filter(i=>i.group.id===group.id)" :key="`source-diagnostics-${item.bundle.root}`"><summary>运行时来源记录诊断</summary><p v-if="!groupLedger(item.bundle)?.runtime_source_diagnostics">旧数据：逐来源诊断未知。</p><p>来源上限 {{ groupLedger(item.bundle)?.runtime_source_limit ?? '未知' }} · 未处理来源 {{ groupLedger(item.bundle)?.runtime_sources_omitted ?? '未知' }}</p><pre>{{ groupLedger(item.bundle)?.runtime_source_diagnostics }}</pre></details>
           <details v-for="item in importedCaptureGroups.filter(i=>i.group.id===group.id)" :key="`runtime-${item.bundle.root}`"><summary>运行时代码范围（不代表完整 DEX/SO 或总覆盖率）</summary><p v-if="!groupLedger(item.bundle)?.runtime_observations?.length">旧数据或无范围记录：已提取、解析与来源状态未知。</p><article v-for="(range,index) in groupLedger(item.bundle)?.runtime_observations || []" :key="index"><p>{{ range.mapping?.path || '映射来源未知' }} · PID {{ range.source?.pid ?? '未知' }} / birth {{ range.source?.birth_ns ?? '未知' }} / exec {{ range.source?.exec_id ?? '未知' }} · {{ range.source_identity_status }}</p><p>请求 {{ range.read?.requested_length ?? '未知' }} B · 实际读 {{ range.read?.actual_length ?? '未知' }} B · 留存 {{ range.retained_file_bytes ?? '未知' }} B · {{ range.local_content_status }} · 映射完整 {{ range.mapping_complete == null ? '未知' : range.mapping_complete ? '是' : '否' }} · torn {{ range.read?.torn == null ? '未知' : range.read.torn ? '是' : '否' }}</p><p>映射 {{ range.requested_mapping_bytes ?? '未知' }} B · 选区 {{ range.selection_limit_bytes ?? '未知' }} B · 选区原因 {{ range.selection_limit_reason || '未知（旧数据缺字段）' }}；预算截断选区不等于读取失败。</p><p>读取 {{ range.read?.read_status || '未知' }} · 落盘 {{ range.read?.write_status || '未知' }} · 解析 {{ range.parse_status }} · 分类 {{ range.ownership }} · {{ range.relative_path }} · {{ range.source_report }}</p><p>派生关联：{{ range.derived == null ? '未知（缺字段）' : range.derived.length ? '原生产者记录，未在此范围核验语义' : '未记录提取 DEX/SO 的关联' }}</p><pre v-if="range.derived?.length">{{ range.derived }}</pre><p>本地对象检查：{{ dexScanSummary(range.object_inspection) }} · DEX 候选 {{ range.object_inspection?.dex_magic_count ?? '未知' }} · ELF 标记（未验证为完整对象）{{ range.object_inspection?.elf_magic_count ?? '未知' }}；文件总字节和 DEX 扫描范围分开，提前停止不表示扫过整个文件。</p><pre v-if="range.object_inspection?.derived_objects?.length || range.object_inspection?.rejected_candidates?.length">{{ range.object_inspection }}</pre></article></details>
-          <article v-for="stage in group.stages" :key="stage.id">
-            <strong>{{ stage.key }} · {{ stage.mode }} · {{ stage.launchAfterAttach?'冷启动':'驻留' }} · {{ stage.required?'required':'optional' }}</strong>
-            <small>{{ stage.id }} · {{ stage.durationSeconds }}s</small>
-            <p v-if="!stage.attempts.length">planned（尚未执行）</p>
-            <div v-for="attempt in stage.attempts" :key="attempt.relation.attemptId">
-              <b>attempt {{ attempt.relation.attempt }} · {{ attempt.state }}</b>
+          <article v-for="stage in group.stages" :key="stage.id" class="ks-group-stage">
+            <header><strong>{{ captureStageLabel(stage.key) }}</strong><b :class="`state-${stage.attempts[stage.attempts.length - 1]?.state || 'planned'}`">{{ captureStateLabel(stage.attempts[stage.attempts.length - 1]?.state || 'planned') }}</b></header>
+            <small>{{ stage.mode }} · {{ stage.launchAfterAttach ? '冷启动' : '驻留' }}{{ stage.durationSeconds ? ` · ${stage.durationSeconds}s` : '' }} · {{ stage.required ? '必需阶段' : '可选阶段' }}</small>
+            <p v-if="!stage.attempts.length" class="ks-form-help">等待前置阶段完成</p>
+            <div v-for="attempt in stage.attempts" :key="attempt.relation.attemptId" class="ks-stage-attempt">
+              <b>第 {{ attempt.relation.attempt }} 次尝试 · {{ captureStateLabel(attempt.state) }}</b>
               <small>{{ formatDate(attempt.startedUnixMs) }} → {{ attempt.finishedUnixMs?formatDate(attempt.finishedUnixMs):'运行中/终态未知' }}</small>
               <button v-if="attempt.sessionId" class="ghost-button" @click="openGroupedSession(group,attempt.sessionId)">{{ shortSession(attempt.sessionId) }} · 子证据</button>
-              <small v-for="instance in attempt.processInstances" :key="String(instance.process_instance_id)">{{ instance.process_instance_id || 'agent 阶段身份' }} · PID {{ instance.pid }} · {{ instance.process_start_ticks?'start ticks='+instance.process_start_ticks:'start ns='+(instance.start_time_ns ?? '未知') }}</small><small v-if="attempt.omittedProcessInstances">清单省略 {{ attempt.omittedProcessInstances }} 实例，完整内容见子报告</small><small v-if="attempt.observationError">{{ attempt.observationError }}</small>
+              <details class="ks-attempt-diagnostics"><summary>进程与采集详情 · {{ attempt.processInstances ? `${attempt.processInstances.length} 个实例` : '实例数量未知' }}{{ attempt.omittedProcessInstances ? `，另省略 ${attempt.omittedProcessInstances}` : '' }}</summary><small v-for="instance in attempt.processInstances" :key="String(instance.process_instance_id)">{{ instance.process_instance_id || 'agent 阶段身份' }} · PID {{ instance.pid }} · {{ instance.process_start_ticks?'start ticks='+instance.process_start_ticks:'start ns='+(instance.start_time_ns ?? '未知') }}</small><small v-if="attempt.omittedProcessInstances">清单省略 {{ attempt.omittedProcessInstances }} 实例，完整内容见子报告</small><small v-if="attempt.observationError">{{ attempt.observationError }}</small>
               <code v-if="attempt.remoteArtifactRoot">{{ attempt.remoteArtifactRoot }}</code>
               <small v-if="stage.launchAfterAttach">{{ startupEvidenceLabel(attempt.remoteLifecycle) }}</small>
-              <small>{{ qualifiedSourceLabel(attempt.remoteLifecycle) }}</small>
-              <p v-if="attempt.error">{{ attempt.error }}</p>
+              <small>{{ qualifiedSourceLabel(attempt.remoteLifecycle) }}</small></details>
+              <p v-if="attempt.error" class="ks-attempt-error">{{ attempt.error }}</p>
+              <details v-if="attempt.diagnosticTail" class="ks-attempt-diagnostics"><summary>失败诊断 · 原始输出尾部</summary><pre>{{ attempt.diagnosticTail }}</pre></details>
             </div>
           </article>
-          <button v-if="!group.cancelRequested && group.state!=='succeeded' && group.state!=='running'" class="ghost-button" :disabled="captureRunning" @click="resumeCaptureGroup(group)">继续 / 重试未成功阶段</button>
-          <button v-if="group.state==='running'" class="ghost-button" @click="cancelCaptureGroup(group)">请求取消（当前阶段封存后停止）</button>
-          <button v-if="group.stages.some(s=>s.key==='dump'&&['succeeded','partial','failed'].includes(s.attempts[s.attempts.length-1]?.state||'')) && captureGroups.some(g=>g.id===group.id)" class="ghost-button" :disabled="pullingPackage" @click="pullCaptureGroup(group)">拉取本次主会话全部信息</button>
+          <div class="ks-group-actions"><button v-if="captureGroups.some(item => item.id === group.id && item.serial === device?.serial) && !group.cancelRequested && runningCaptureGroup !== group.id && group.state!=='succeeded' && group.state!=='running'" class="ghost-button" :disabled="captureRunning" @click="resumeCaptureGroup(group)">继续 / 重试未成功阶段</button>
+          <button v-if="!group.cancelRequested && (runningCaptureGroup === group.id || group.state === 'running') && captureGroups.some(item => item.id === group.id && item.serial === device?.serial)" class="ghost-button" @click="cancelCaptureGroup(group)">请求取消（当前阶段封存后停止）</button><span v-if="group.cancelRequested && runningCaptureGroup === group.id" class="ks-form-help" role="status">已请求取消，正在等待当前阶段封存</span>
+          <button v-if="group.stages.some(s=>s.key==='dump'&&['succeeded','partial','failed'].includes(s.attempts[s.attempts.length-1]?.state||'')) && captureGroups.some(g=>g.id===group.id)" class="ghost-button" :disabled="pullingPackage" @click="pullCaptureGroup(group)">拉取本次主会话全部信息</button></div>
         </details>
         <article v-for="session in legacyDeviceSessions" :key="session.session_id" class="ks-session-row" :class="{ active: selectedSession === session.session_id, 'pending-delete': pendingDeleteSession === session.session_id }">
           <button class="ks-session-open" :disabled="loadingReport || deletingSession === session.session_id" @click="loadSessionReport(session.session_id)">
@@ -222,16 +228,17 @@
             <button v-else type="button" class="ks-session-delete" :aria-label="`删除会话 ${session.session_id}`" :disabled="loadingReport || Boolean(deletingSession)" @click.stop="armDeleteDeviceSession(session.session_id)"><span class="material-symbols-outlined" aria-hidden="true">delete</span>删除</button>
           </div>
         </article>
-        <article v-for="bundle in visibleLocalSessionBundles" :key="`${bundle.root}:${bundle.package}`" class="ks-session-row local" :class="{ active: selectedSession === bundleSessionId(bundle) }"><button class="ks-session-open" :disabled="loadingReport" @click="loadLocalBundleSession(bundle)"><span><strong>{{ shortSession(bundleSessionId(bundle)) }}</strong><small>{{ bundle.package }} · Mac 本地</small></span><span><strong>{{ Number(bundle.sessionReport?.total_events || 0).toLocaleString() }} events</strong><small>{{ bundle.fileCount.toLocaleString() }} files · {{ formatBytes(bundle.totalBytes) }}</small></span><span class="ks-session-state"><b>LOCAL</b><small>{{ bundle.sessionReport?.execution_complete ? 'complete' : 'incomplete' }}</small></span></button><span class="ks-session-owned">随整包证据管理</span></article>
+        <article v-for="bundle in visibleLocalSessionBundles" :key="`${bundle.root}:${bundle.package}`" class="ks-session-row local" :class="{ active: selectedSession === bundleSessionId(bundle) && sessionSourceRoot === bundle.root }"><button class="ks-session-open" :disabled="loadingReport" @click="loadLocalBundleSession(bundle)"><span><strong>{{ shortSession(bundleSessionId(bundle)) }}</strong><small>{{ bundle.package }} · 本地</small></span><span><strong>{{ evidenceCountLabel(bundle.sessionReport?.total_events) }} events</strong><small>{{ bundle.fileCount.toLocaleString() }} files · {{ formatBytes(bundle.totalBytes) }}</small></span><span class="ks-session-state"><b>LOCAL</b><small>{{ executionStatusLabel(bundle.sessionReport?.execution_complete) }}</small></span></button><span class="ks-session-owned">随整包证据管理</span></article>
         <p v-if="!visibleLocalSessionBundles.length && !legacyDeviceSessions.length && !visibleCaptureGroups.length" class="ks-empty">{{ selectedPackage ? '当前包没有已导入的 Session，设备端也没有可重放会话。L2 文件证据仍可独立分析。' : '尚未导入或采集 Session。连接 KernSight 后，设备会话会直接列在这里。' }}</p>
       </div>
+      <details v-if="captureResult && selectedCaptureGroup === lastCaptureGroupId" class="ks-capture-log"><summary>本次自动采集日志 · 原始输出与错误</summary><code>{{ captureResult.commandPreview }}</code><pre>{{ [captureResult.stdout, captureResult.stderr].filter(Boolean).join('\n') || '没有返回文本日志，请展开阶段和子证据核对。' }}</pre></details>
       <div v-if="loadingReport" class="ks-loading"><span class="material-symbols-outlined spinning">sync</span>正在重放会话事件（不合并 dump）…</div>
       <template v-if="sessionReport && !loadingReport">
-        <details v-if="Array.isArray(sessionReport.mobilee_capture_edges)" class="ks-artifact-chain"><summary>主会话 → 阶段 → attempt → 子证据引用 · 子来源 {{ sessionReport.mobilee_child_source_status || '未核验' }}</summary><article v-for="(edge,index) in sessionReport.mobilee_capture_edges" :key="index"><code>{{ edge.from }}</code><strong>{{ edge.relation }}</strong><code>{{ edge.to }}</code></article></details>
+        <details v-if="Array.isArray(sessionReport.mobilee_capture_edges)" class="ks-artifact-chain ks-parent-links"><summary>主会话 → 阶段 → attempt → 子证据引用 · 子来源 {{ sessionReport.mobilee_child_source_status || '未核验' }}</summary><article v-for="(edge,index) in sessionReport.mobilee_capture_edges" :key="index"><code>{{ edge.from }}</code><strong>{{ edge.relation }}</strong><code>{{ edge.to }}</code></article></details>
         <div class="ks-case-head">
           <div>
-            <small>{{ shortSession(selectedSession) }} · Observe {{ Number(sessionReport.mode_counts?.observe || 0).toLocaleString() }} · Inspect {{ Number(sessionReport.mode_counts?.inspect || 0).toLocaleString() }} · 丢失 {{ reportLostRecords.toLocaleString() }}</small>
-            <strong>{{ sessionReport.execution_complete ? '采集结束' : '不完整，不能当完整行为记录' }}</strong>
+            <small>{{ shortSession(selectedSession) }} · Observe {{ evidenceCountLabel(sessionReport.mode_counts?.observe) }} · Inspect {{ evidenceCountLabel(sessionReport.mode_counts?.inspect) }} · 丢失 {{ evidenceCountLabel(reportLostRecords) }}</small>
+            <strong>{{ executionStatusLabel(sessionReport.execution_complete) }}</strong>
           </div>
           <div class="ks-case-actions">
             <button class="ghost-button" type="button" @click="openAiReview">{{ aiCopied ? '已复制链 JSON' : '复制链并打开 AI 复核' }}</button>
@@ -239,9 +246,9 @@
         </div>
         <div v-if="sessionMatchedPackage" class="ks-session-package-link">
           <div><small>检测到包名</small><strong>{{ sessionMatchedPackage }}</strong><span>{{ sessionPackageLinked ? '已显式接入 L2 包证据；关联强度仍按报告原值展示。' : '尚未加载 L2。当前只展示 Session 本身的数据。' }}</span></div>
-          <button v-if="!sessionPackageLinked && hasPackageEvidence(sessionMatchedPackage)" class="ghost-button" @click="linkSessionPackageEvidence">接入同包 L2 证据</button>
+          <button v-if="!sessionPackageLinked && canLinkSessionPackage" class="ghost-button" @click="linkSessionPackageEvidence">{{ sessionParentId || sessionSourceRoot ? '接入本次采集 L2 证据' : '接入同包 L2 证据' }}</button>
           <button v-else-if="sessionPackageLinked" class="ghost-button" @click="unlinkSessionPackageEvidence">断开 L2 关联</button>
-          <b v-else>没有可用包证据</b>
+          <b v-else>{{ sessionParentId ? '本次主会话尚无已导入 L2 证据' : '没有可用包证据' }}</b>
         </div>
         <nav class="ks-session-detail-tabs" aria-label="Session 详情分类">
           <button :class="{ active: sessionDetailSection === 'summary' }" @click="sessionDetailSection = 'summary'">摘要与证据链</button>
@@ -315,7 +322,7 @@
                 <div><strong>{{ row.source }}</strong><small>pid={{ row.process_id }} · {{ row.adapter }} · {{ plaintextOriginLabel(row) }}</small></div>
                 <div class="ks-plaintext-actions">
                   <b>{{ row.content_class || 'unknown' }}</b>
-                  <button type="button" class="ghost-button" :disabled="!row.preview" @click="togglePlaintextDecode(row, index)">{{ plaintextDecoded[plaintextCardKey(row, index)] ? '原文' : '转码' }}</button>
+                  <button type="button" class="ghost-button" :disabled="!row.preview" @click="togglePlaintextDecode(row, index)">{{ plaintextDecoding.has(plaintextCardKey(row, index)) ? '取消转码' : plaintextDecoded[plaintextCardKey(row, index)] ? '原文' : '转码' }}</button>
                 </div>
               </header>
               <ul v-if="plaintextUrlList(row).length" class="ks-url-list">
@@ -364,7 +371,7 @@
     </section>
 
     <section v-if="workspaceMode === 'evidence'" class="panel ks-package-panel">
-      <div class="section-title compact"><div><div class="eyebrow">PACKAGE EVIDENCE</div><h2>包证据</h2><p>MobileE 自动整理手机端已存会话、内存与文件证据；不提供单项删除，只能按整个 com 包管理。</p></div><div class="ks-title-actions"><button v-if="selectedPackage" class="ghost-button" title="关闭当前包工作区，不删除数据" @click="closePackageWorkspace">关闭当前包</button><template v-if="selectedPackage && selectedEvidenceSource === 'device'"><button v-if="pendingDeletePackage" class="ghost-button" :disabled="deletingPackage" @click="pendingDeletePackage = false">取消</button><button v-if="pendingDeletePackage" class="ghost-button danger-button" :disabled="deletingPackage" @click="confirmDeleteCurrentPackageEvidence">{{ deletingPackage ? '删除中…' : '确认删除整个包证据' }}</button><button v-else class="ghost-button danger-button" :disabled="deletingPackage" @click="pendingDeletePackage = true">删除整个包证据</button></template><span class="device-chip">MAC {{ localEvidenceBundles.length }} · DEVICE {{ devicePackageNames.size }}</span></div></div>
+      <div class="section-title compact"><div><div class="eyebrow">PACKAGE EVIDENCE</div><h2>包证据</h2><p>MobileE 自动整理手机端已存会话、内存与文件证据；不提供单项删除，只能按整个 com 包管理。</p></div><div class="ks-title-actions"><button v-if="selectedPackage" class="ghost-button" title="关闭当前包工作区，不删除数据" @click="closePackageWorkspace">关闭当前包</button><template v-if="selectedPackage && selectedEvidenceSource === 'device'"><button v-if="pendingDeletePackage" class="ghost-button" :disabled="deletingPackage" @click="pendingDeletePackage = false">取消</button><button v-if="pendingDeletePackage" class="ghost-button danger-button" :disabled="deletingPackage" @click="confirmDeleteCurrentPackageEvidence">{{ deletingPackage ? '删除中…' : '确认删除整个包证据' }}</button><button v-else class="ghost-button danger-button" :disabled="deletingPackage" @click="pendingDeletePackage = true">删除整个包证据</button></template><span class="device-chip">LOCAL {{ localEvidenceBundles.length }} · DEVICE {{ devicePackageNames.size }}</span></div></div>
       <div class="ks-package-list">
         <article v-for="dump in packageDumps" :key="dump.package" :class="{ selected: selectedPackage === dump.package }" @click="selectPackage(dump.package)">
           <div><strong>{{ dump.package }}</strong><small class="ks-source-badges"><b v-for="source in evidenceSources(dump.package)" :key="source.kind" :class="`source-${source.kind}`">{{ source.label }}</b></small><small>{{ evidenceLocationLabel(dump.package) }} · {{ dump.schema_version || 'legacy schema · 建议 recatalog' }}</small></div>
@@ -374,17 +381,19 @@
           <span><b>{{ sensitiveCount(dump, 'plaintext_candidate', dump.plaintext_windows) }}</b><small>明文候选文件</small></span>
           <span><b>{{ sensitiveCount(dump, 'key_candidate', dump.key_slots) }}</b><small>Key 候选文件</small></span>
           <span><b>{{ dump.sensitive_files?.length || 0 }}</b><small>已哈希文件</small></span>
-          <div class="ks-package-source-actions"><button v-if="hasLocalEvidence(dump.package)" class="ghost-button" :class="{ active: selectedPackage === dump.package && selectedEvidenceSource === 'local' }" @click.stop="selectPackageSource(dump.package, 'local')">打开 Mac</button><button v-if="devicePackageNames.has(dump.package)" class="ghost-button" :class="{ active: selectedPackage === dump.package && selectedEvidenceSource === 'device' }" @click.stop="selectPackageSource(dump.package, 'device')">打开手机</button></div>
+          <div class="ks-package-source-actions"><button v-if="hasLocalEvidence(dump.package)" class="ghost-button" :class="{ active: selectedPackage === dump.package && selectedEvidenceSource === 'local' }" @click.stop="selectPackageSource(dump.package, 'local')">打开本地</button><button v-if="devicePackageNames.has(dump.package)" class="ghost-button" :class="{ active: selectedPackage === dump.package && selectedEvidenceSource === 'device' }" @click.stop="selectPackageSource(dump.package, 'device')">打开手机</button></div>
         </article>
       </div>
       <p v-if="!packageDumps.length" class="ks-empty">当前没有 package dump。可以连接 KernSight 刷新设备证据，或导入本地包目录。</p>
     </section>
 
     <section v-if="workspaceMode === 'evidence' && selectedPackageDump" class="panel ks-package-evidence-panel">
-      <div class="section-title compact"><div><div class="eyebrow">FORENSIC EVIDENCE</div><h2>{{ selectedPackage }} · 产物与私有文件</h2><p>MobileE 会在载入后自动整理文件、内存、会话与映射关系；文件存在本身不代表本次运行已经执行或外发。</p></div><span class="device-chip">{{ evidenceFiles.length.toLocaleString() }} FILES · {{ formatMaybeBytes(selectedPackageDump.local_storage_accounting?.allocated_bytes ?? selectedPackageDump.physical_bytes) }}</span></div>
+      <div class="section-title compact"><div><div class="eyebrow">FORENSIC EVIDENCE</div><h2>{{ selectedPackage }} · 产物与私有文件</h2><p>MobileE 会在载入后自动整理文件、内存、会话与映射关系；文件存在本身不代表本次运行已经执行或外发。</p></div><span class="device-chip">{{ allEvidenceFiles.length.toLocaleString() }} FILES · {{ formatMaybeBytes(selectedPackageDump.local_storage_accounting?.allocated_bytes ?? selectedPackageDump.physical_bytes) }}</span></div>
       <template v-if="selectedPackageDump">
-      <div class="ks-selected-package-bar"><button v-if="device && selectedEvidenceSource === 'device'" class="primary-button" :disabled="pullingPackage" @click="pullSelectedPackageEvidence()">{{ pullingPackage ? '正在拉取并解析…' : '拉取全部信息' }}</button><button v-else-if="selectedLocalBundle" class="ghost-button" :disabled="pullingPackage" @click="exportSelectedEvidenceArchive">{{ pullingPackage ? '正在封装…' : '导出 .mee' }}</button><b :class="`source-${selectedEvidenceSource}`">{{ selectedEvidenceSource === 'local' ? 'MAC 本地证据' : '手机端证据' }}</b><span>Dump {{ selectedPackageDump.dump_id || 'legacy' }}</span><span v-if="selectedPackageDump.local_storage_accounting">本地逻辑 {{ formatBytes(Number(selectedPackageDump.local_storage_accounting.logical_file_bytes)) }} · 分配 {{ allocatedEvidenceLabel(selectedPackageDump.local_storage_accounting.allocated_bytes) }} · 已验证代码重复 {{ formatBytes(Number(selectedPackageDump.local_storage_accounting.verified_code_duplicate_bytes)) }}（账面，非物理节省）</span><span>{{ selectedPackageDump.launched ? '已执行 launch harvest' : '未执行 launch harvest' }}</span><span>物理 {{ allocatedEvidenceLabel(selectedPackageDump.local_storage_accounting?.allocated_bytes ?? selectedPackageDump.physical_bytes) }}</span><span v-if="selectedPackageDump.storage_accounting === 'kernsight.inode-accounting/v1'">硬链接共享逻辑字节 {{ formatBytes(Number(selectedPackageDump.deduplicated_bytes ?? 0)) }}</span></div>
-      <details v-if="selectedEvidenceSource === 'local'"><summary>本地运行时来源诊断与逐库加载段</summary><p v-if="!selectedPackageDump.local_storage_accounting?.runtime_source_diagnostics">旧数据：来源诊断未知。</p><pre>{{ selectedPackageDump.local_storage_accounting?.runtime_source_diagnostics }}</pre><article v-for="module in selectedPackageDump.local_storage_accounting?.elf_module_observations || []" :key="`${module.source_report}:${module.path}`"><p>{{ module.path }} · 已观察/已读范围 {{ module.verified_range_count ?? '未知' }} · 留存 {{ module.verified_range_bytes ?? '未知' }} B · PT_LOAD 可分析 {{ elfLoadCoverageLabel(module.all_load_file_bytes_covered) }} · 完整文件缺失（未重建）</p><details><summary>来源与缺口</summary><pre>{{ module }}</pre></details></article></details>
+      <div class="ks-selected-package-bar"><button v-if="device && selectedEvidenceSource === 'device'" class="primary-button" :disabled="pullingPackage" @click="pullSelectedPackageEvidence()">{{ pullingPackage ? '正在拉取并解析…' : '拉取全部信息' }}</button><button v-else-if="selectedLocalBundle" class="ghost-button" :disabled="pullingPackage" @click="exportSelectedEvidenceArchive">{{ pullingPackage ? '正在封装…' : '导出 .mee' }}</button><b :class="`source-${selectedEvidenceSource}`">{{ selectedEvidenceSource === 'local' ? '本地证据' : '手机端证据' }}</b><span>Dump {{ selectedPackageDump.dump_id || 'legacy' }}</span><span v-if="selectedPackageDump.local_storage_accounting">本地逻辑 {{ formatMaybeBytes(selectedPackageDump.local_storage_accounting.logical_file_bytes) }} · 分配 {{ allocatedEvidenceLabel(selectedPackageDump.local_storage_accounting.allocated_bytes) }} · 已验证代码重复 {{ formatMaybeBytes(selectedPackageDump.local_storage_accounting.verified_code_duplicate_bytes) }}（账面，非物理节省）</span><span>{{ selectedPackageDump.launched === true ? '已执行 launch harvest' : selectedPackageDump.launched === false ? '未执行 launch harvest' : 'launch harvest 状态未知' }}</span><span>物理 {{ allocatedEvidenceLabel(selectedPackageDump.local_storage_accounting?.allocated_bytes ?? selectedPackageDump.physical_bytes) }}</span><span v-if="selectedPackageDump.storage_accounting === 'kernsight.inode-accounting/v1'">硬链接共享逻辑字节 {{ formatBytes(Number(selectedPackageDump.deduplicated_bytes ?? 0)) }}</span></div>
+      <label v-if="selectedEvidenceSource === 'local' && selectedPackageBundles.length > 1" class="ks-local-capture-picker"><span>本地采集记录（{{ selectedPackageBundles.length }}）</span><select :value="selectedLocalBundle?.root" @change="selectLocalEvidenceRoot(($event.target as HTMLSelectElement).value)"><option v-for="bundle in selectedPackageBundles" :key="bundle.root" :value="bundle.root">{{ bundleSessionId(bundle) }} · {{ bundle.dumpReport.dump_id || 'legacy dump' }} · {{ bundle.root }}</option></select><small>列表统计、文件、导出与分析关联均使用此记录；不会按包名合并不同采集。</small></label>
+      <details v-if="selectedEvidenceSource === 'local'" class="ks-source-diagnostics"><summary>本地运行时来源诊断与逐库加载段</summary><p v-if="!selectedPackageDump.local_storage_accounting?.runtime_source_diagnostics">旧数据：来源诊断未知。</p><pre>{{ selectedPackageDump.local_storage_accounting?.runtime_source_diagnostics }}</pre><article v-for="module in selectedPackageDump.local_storage_accounting?.elf_module_observations || []" :key="`${module.source_report}:${module.path}`"><p>{{ module.path }} · 已观察/已读范围 {{ module.verified_range_count ?? '未知' }} · 留存 {{ module.verified_range_bytes ?? '未知' }} B · PT_LOAD 可分析 {{ elfLoadCoverageLabel(module.all_load_file_bytes_covered) }} · 完整文件缺失（未重建）</p><details><summary>来源与缺口</summary><pre>{{ module }}</pre></details></article></details>
+      <KernSightDexIndex :key="selectedLocalBundle?.root || selectedPackageDump.dump_id || selectedPackage" :dump="selectedPackageDump" />
       <section v-if="evidenceError" class="notice error-notice ks-pull-notice" role="alert"><span class="material-symbols-outlined">error</span><span>{{ evidenceError }}</span><button @click="evidenceError = ''">关闭</button></section>
       <section v-if="evidenceMessage" class="notice status-notice ks-pull-notice" role="status"><span class="material-symbols-outlined">task_alt</span><span>{{ evidenceMessage }}</span><button @click="evidenceMessage = ''">关闭</button></section>
       <section v-if="landedKeyFiles.length" class="ks-dex-ownership">
@@ -446,10 +455,13 @@
 </template>
 
 <script setup lang="ts">
+import { runCaptureGroupPlan, mergeCaptureResults, captureStateLabel, captureStageLabel, latestGroupSession } from '@/services/kernsightCaptureRunner'
 import { mergeCaptureGroups,groupSessionIds,captureGroupEdges } from '../services/kernsightCaptureGroups'
+import { packageEvidenceReports, importedSessionId, bundleForSession, linkedEvidenceMatches, createLatestRequest, createKeyedRequests, evidenceCountLabel, executionStatusLabel } from '../services/kernsightWorkspaceState'
 import { memoryCounterLabel, memoryEvidenceLabel } from '../services/kernsightMemoryEvidence'
-import { dexObjectGroups, verifiedDexObjectCount, indexedElfModuleCount, indexedDexCount, runtimeDexClassMatches, elfLoadCoverageLabel, codeEvidenceLabel, allocatedEvidenceLabel, ownershipEvidenceEntries, codeNoiseLayers, archiveCoverageLabel, dexScanSummary, dexScanSummaryForObject, fileScanLabel } from '../services/kernsightCodeEvidence'
-import { buildAutoCaptureStages, captureCodeOnlyChoice, startupEvidenceLabel, qualifiedSourceLabel, buildUnifiedStageSpec, type AutoStageReceipt } from '@/services/kernsightCapturePlan'
+import KernSightDexIndex from '@/components/KernSightDexIndex.vue'
+import { verifiedDexObjectCount, indexedElfModuleCount, indexedDexCount, runtimeDexClassMatches, elfLoadCoverageLabel, codeEvidenceLabel, allocatedEvidenceLabel, ownershipEvidenceEntries, codeNoiseLayers, archiveCoverageLabel, dexScanSummary, dexScanSummaryForObject, fileScanLabel } from '../services/kernsightCodeEvidence'
+import { buildAutoCaptureStages, captureCodeOnlyChoice, startupEvidenceLabel, qualifiedSourceLabel, type AutoStageReceipt } from '@/services/kernsightCapturePlan'
 import { computed, markRaw, nextTick, onErrorCaptured, onBeforeUnmount, onMounted, reactive, ref, shallowRef, watch } from 'vue'
 import { listen } from '@tauri-apps/api/event'
 import { save } from '@tauri-apps/plugin-dialog'
@@ -494,11 +506,15 @@ const probeError = ref('')
 const evidenceError = ref('')
 const evidenceMessage = ref('')
 const kernSight = ref<KernSightOverview | null>(null)
-const packageDumps = shallowRef<KernSightPackageDumpReport[]>([])
+const packageDumps = computed(() => packageEvidenceReports(devicePackageDumps.value, localEvidenceBundles.value, selectedRoots.value, selectedEvidenceSource.value === 'device' ? selectedPackage.value : ''))
 const devicePackageDumps = shallowRef<KernSightPackageDumpReport[]>([])
 const selectedReport = shallowRef<KernSightSessionReportDocument | null>(null)
 const selectedSession = ref('')
 const sessionMatchedPackage = ref('')
+const sessionSourceRoot = ref('')
+const sessionRequests = createLatestRequest()
+const evidenceRequests = createLatestRequest()
+const overviewRequests = createLatestRequest()
 const sessionPackageLinked = ref(false)
 const sessionDetailSection = ref<'summary' | 'plaintext' | 'network' | 'binder'>('summary')
 const loadingKernSight = ref(false)
@@ -511,7 +527,7 @@ const aiCopied = ref(false)
 const workspaceMode = ref<'evidence' | 'capture'>('evidence')
 const selectedPackage = ref('')
 const selectedEvidenceSource = ref<'local' | 'device'>('local')
-const { bundles: localEvidenceBundles, upsertBundle, importDirectory, importArchive, requestedPackage } = useKernSightEvidence()
+const { bundles: localEvidenceBundles, selectedRoots, bundleForPackage, selectBundle, upsertBundle, importDirectory, importArchive, requestedPackage } = useKernSightEvidence()
 const devicePackageNames = ref(new Set<string>())
 const importingLocal = ref(false)
 const pullingPackage = ref(false)
@@ -526,6 +542,9 @@ const evidencePreview = ref('')
 const evidenceDecodedPreview = ref('')
 const evidencePreviewKind = ref('text')
 const plaintextDecoded = ref<Record<string, string>>({})
+const plaintextDecoding = ref(new Set<string>())
+const plaintextRevision = ref(0)
+const plaintextDecodeRequests = createKeyedRequests()
 const selectedArtifact = ref<any | null>(null)
 const selectedEvidenceCategory = ref('')
 const selectedDexOwnership = ref<KernSightDexOwnershipCategory | ''>('')
@@ -548,7 +567,7 @@ function inspectModeHasJni(mode: InspectMode) {
 
 const captureForm = reactive({
   package: '',
-  durationSeconds: 45,
+  durationSeconds: 90,
   files: true,
   filesFd: false,
   network: true,
@@ -558,12 +577,12 @@ const captureForm = reactive({
   binder: true,
   sched: false,
   includeThreads: false,
-  inspectMode: 'none' as InspectMode,
+  inspectMode: 'tls_binder_jni' as InspectMode,
   hideDebug: false,
   sampleOneIn: 1,
   inspectMaxBytes: 65_536,
   inspectMaxHits: 0,
-  plan: 'capture' as 'capture' | 'dump' | 'auto',
+  plan: 'auto' as 'capture' | 'dump' | 'auto',
   codeOnly:false,
   isolatedRoot:"",isolatedAgent:"",isolatedSha256:"",
   totalBudgetMiB:2048,
@@ -623,10 +642,18 @@ const readinessTitle = computed(() => {
 })
 const readinessDetail = computed(() => capabilityProbe.value?.summary || (androidReady.value ? '先执行只读能力探测，再决定使用 Standard、Dev Root 或 System 模式。' : '选择一台已通过 USB 调试授权的 Android 设备。'))
 const sessionReport = computed<Record<string, any> | null>(() => selectedReport.value?.report as Record<string, any> || null)
-const selectedLocalBundle = computed(() => selectedEvidenceSource.value === 'local' ? localEvidenceBundles.value.find(bundle => bundle.package === selectedPackage.value) || null : null)
+const selectedLocalBundle = computed(() => selectedEvidenceSource.value === 'local' ? bundleForPackage(selectedPackage.value) : null)
+const selectedPackageBundles = computed(() => localEvidenceBundles.value.filter(bundle => bundle.package === selectedPackage.value))
 const selectedPackageDump = computed(() => selectedEvidenceSource.value === 'device'
   ? devicePackageDumps.value.find(dump => dump.package === selectedPackage.value) || null
-  : selectedLocalBundle.value?.dumpReport || packageDumps.value.find(dump => dump.package === selectedPackage.value) || null)
+  : selectedLocalBundle.value?.dumpReport || null)
+const sessionParentId = computed(() => String(sessionReport.value?.mobilee_capture_group?.id || ''))
+const sessionLocalBundle = computed(() => bundleForSession(localEvidenceBundles.value, sessionMatchedPackage.value, sessionSourceRoot.value, sessionParentId.value, selectedRoots.value[sessionMatchedPackage.value]))
+const canLinkSessionPackage = computed(() => sessionSourceRoot.value || sessionParentId.value ? Boolean(sessionLocalBundle.value) : hasPackageEvidence(sessionMatchedPackage.value))
+const linkedPackageDump = computed(() => {
+  if (sessionParentId.value && (!sessionLocalBundle.value || selectedLocalBundle.value !== sessionLocalBundle.value)) return null
+  return linkedEvidenceMatches(sessionPackageLinked.value, sessionMatchedPackage.value, selectedPackage.value, sessionSourceRoot.value, selectedLocalBundle.value?.root || '') ? selectedPackageDump.value : null
+})
 const evidenceNoiseLayers = computed(() => codeNoiseLayers(allEvidenceFiles.value as any[]))
 const dexOwnershipEntries = computed<KernSightDexOwnershipEntry[]>(() => ownershipEvidenceEntries(selectedPackageDump.value?.dex_ownership?.schema_version, selectedPackageDump.value?.dex_ownership?.entries || []))
 const dexOwnershipAvailable = computed(() => Boolean(selectedPackageDump.value?.dex_ownership))
@@ -697,9 +724,8 @@ function dexOwnershipLabel(category: KernSightDexOwnershipCategory) {
 const visibleLocalSessionBundles = computed(() => localEvidenceBundles.value.filter(bundle => bundle.sessionReport && !bundle.sessionReport.mobilee_capture_group))
 const completedSessions = computed(() => kernSight.value?.sessions.filter(session => session.state === 'completed').length || 0)
 const sensitiveFileCount = computed(() => packageDumps.value.reduce((total, dump) => total + (dump.sensitive_files?.length || 0), 0))
-const latestExecutionComplete = computed(() => Boolean(sessionReport.value?.execution_complete))
 const environmentTransitions = computed(() => Number(sessionReport.value?.environment_transitions || 0))
-const reportLostRecords = computed(() => Number((sessionReport.value?.quality as Record<string, unknown> | undefined)?.lost_records || 0))
+const reportLostRecords = computed(() => (sessionReport.value?.quality as Record<string, unknown> | undefined)?.lost_records)
 const processRows = computed<any[]>(() => asArray(sessionReport.value?.processes))
 const plaintextRows = computed<any[]>(() => asArray(sessionReport.value?.plaintext))
 const networkRows = computed<any[]>(() => asArray(sessionReport.value?.network_peers))
@@ -807,9 +833,9 @@ const networkBackbone = computed(() => networkRows.value.map((peer, index) => {
 }))
 const dumpSummaries = computed(() => {
   try {
-    if (!sessionPackageLinked.value || !sessionMatchedPackage.value || selectedPackage.value !== sessionMatchedPackage.value) return []
+    if (!linkedPackageDump.value) return []
     const merged = new Set(asArray(sessionReport.value?.merged_dumps).map((item: any) => item.package))
-    return packageDumps.value.filter(dump => dump.package === selectedPackage.value && (merged.size === 0 || merged.has(dump.package))).map(dump => {
+    return [linkedPackageDump.value].filter(dump => merged.size === 0 || merged.has(dump.package)).map(dump => {
       const frameworks = asArray(dump.native_framework_matches)
       const ruleProfile = frameworks.filter(item => item.category === 'packer_shell').map(item => item.name).join(' · ')
       return {
@@ -847,8 +873,8 @@ const dumpSummaries = computed(() => {
   }
 })
 const privateFocusFiles = computed(() => {
-  if (!sessionPackageLinked.value || selectedPackage.value !== sessionMatchedPackage.value) return []
-  const dump = selectedPackageDump.value
+  if (!linkedPackageDump.value) return []
+  const dump = linkedPackageDump.value
   const fromDump = asArray(dump?.sensitive_files).map((file: any) => ({ path: String(file.relative_path || ''), contentClass: String(file.content_class || '') }))
   const fromBundle = asArray(selectedLocalBundle.value?.files).map((file: any) => ({ path: String(file.relativePath || ''), contentClass: String(file.category || '') }))
   const fromArtifacts = asArray(dump?.artifacts).filter((file: any) => file.source === 'app-private').map((file: any) => ({ path: String(file.relative_path || ''), contentClass: 'app-private' }))
@@ -857,7 +883,7 @@ const privateFocusFiles = computed(() => {
 const httpCallRows = computed<any[]>(() => {
   const fromSession = asArray(sessionReport.value?.http_calls)
   if (fromSession.length) return fromSession
-  return asArray(selectedPackageDump.value?.http_calls)
+  return asArray(linkedPackageDump.value?.http_calls)
 })
 const analysisPathInput = computed(() => ({
   processes: processRows.value,
@@ -868,8 +894,8 @@ const analysisPathInput = computed(() => ({
   httpCalls: httpCallRows.value,
   httpCodeRefs: asArray(sessionReport.value?.http_code_refs).length
     ? asArray(sessionReport.value?.http_code_refs)
-    : asArray(selectedPackageDump.value?.http_code_refs),
-  jniExports: asArray(selectedPackageDump.value?.jni_exports),
+    : asArray(linkedPackageDump.value?.http_code_refs),
+  jniExports: asArray(linkedPackageDump.value?.jni_exports),
   kernelTokens: kernelBinderInterfaces.value,
   binderSemantic: binderSemanticRows.value,
   dump: dumpSummaries.value[0] || null,
@@ -1051,8 +1077,9 @@ const honestGaps = computed(() => {
   const gaps: string[] = []
   const quality = sessionReport.value?.quality as Record<string, any> | undefined
   const lostBySensor = quality?.lost_by_sensor || {}
-  if (!sessionReport.value?.execution_complete) gaps.push('execution_complete=false：不能把本会话当作完整行为记录。')
-  if (reportLostRecords.value) {
+  if (sessionReport.value?.execution_complete !== true) gaps.push(executionStatusLabel(sessionReport.value?.execution_complete))
+  if (reportLostRecords.value == null) gaps.push('丢失记录计数未知，不能按 0 条处理。')
+  if (typeof reportLostRecords.value === 'number' && reportLostRecords.value > 0) {
     const binderLost = Number(lostBySensor.binder || 0)
     gaps.push(`丢失 ${reportLostRecords.value.toLocaleString()} 条${binderLost ? `（Binder ${binderLost.toLocaleString()}）` : ''}。`)
   }
@@ -1075,7 +1102,7 @@ const enabledSensorLabels = computed(() => [
   captureForm.binder && 'Binder', captureForm.sched && 'Sched', captureForm.includeThreads && 'Threads',
   (captureForm.plan === 'auto' || inspectModeHasTls(captureForm.inspectMode)) && (captureForm.plan === 'auto' ? 'TLS（L1 阶段）' : 'TLS Inspect'), (captureForm.plan === 'auto' || inspectModeHasJni(captureForm.inspectMode)) && (captureForm.plan === 'auto' ? 'JNI（L1 阶段）' : 'JNI Inspect'), (captureForm.plan === 'auto' || inspectModeHasBinder(captureForm.inspectMode)) && (captureForm.plan === 'auto' ? 'Binder userspace（L1 阶段）' : 'Binder userspace Inspect'), (captureForm.plan === 'auto' || captureForm.inspectMode === 'linker_so_load') && (captureForm.plan === 'auto' ? 'Linker（独立阶段）' : 'Linker Inspect'),
 ].filter(Boolean) as string[])
-const captureScopeLabel = computed(() => captureForm.package ? `${captureForm.package}（含冒号进程）` : '整台设备')
+const captureScopeLabel = computed(() => captureForm.package ? `${captureForm.package}${captureForm.plan === 'auto' ? '（代码快照限定主进程）' : '（含冒号进程）'}` : '整台设备')
 const captureRisk = computed(() => {
   if (captureForm.hideDebug) return { label: '实验模式 · ADB 将暂时断开', tone: 'high' }
   if (captureForm.plan === 'dump') return { label: 'Forensic · dump --launch SIGSTOP', tone: 'high' }
@@ -1118,36 +1145,31 @@ const dumpCommandPreview = computed(() => {
 const captureCommandPreview = computed(() => {
   if (captureForm.plan === 'dump') return dumpCommandPreview.value
   if (captureForm.plan === 'auto') {
-    const pkg = captureForm.package || '<package>'
-    const durations = {l0:captureForm.autoL0Seconds,l1:captureForm.autoL1Seconds,linker:captureForm.autoLinkerSeconds}
-    if (captureForm.autoSessionMode === 'unified') {
-      let spec = '无效阶段时长'; try { spec = buildUnifiedStageSpec(durations) } catch { /* form validation explains */ }
-      return [
-        '# 新版 agent：同一 spool/session，L0 传感器全程保留；Inspect 顺序切换；仅首次启动。',
-        `# 阶段参数（完整对象路径与传感器命令见运行后日志）`,
-        `ksightd capture --package ${pkg} --spool-dir /data/local/tmp/ksight/spool --inspect-stages ${spec} --duration-seconds ${durations.l0 + durations.l1 + durations.linker} --sample-one-in ${captureForm.sampleOneIn} --inspect-max-bytes ${captureForm.inspectMaxBytes} --inspect-max-hits ${captureForm.inspectMaxHits}`,
-        '# 全部阶段和主进程身份通过后才取最终驻留快照；失败停止，旧 agent 不静默降级。',
-      ].join('\n')
-    }
-    return [
-      '# 启动重采兼容模式：三次启动、三个独立 session；快照在 L1 后、Linker 重启前。',
-      captureKsightctlLine({ duration: durations.l0, inspectMode: 'none', launch: true }),
-      captureKsightctlLine({ duration: durations.l1, inspectMode: 'tls_binder_jni', launch: true }),
-      `ksightctl device --serial ${props.device?.serial || '<serial>'} pull-package --package ${pkg} --dest packages`,
-      '# 快照必须确认当前进程仍在运行；不自动 --launch。',
-      captureKsightctlLine({ duration: durations.linker, inspectMode: 'linker_so_load', launch: true }),
-    ].join('\n')
+    let stages: ReturnType<typeof buildAutoCaptureStages>
+    try { stages = buildAutoCaptureStages(captureForm.autoL0Seconds, captureForm.autoL1Seconds, captureForm.autoLinkerSeconds, captureForm.autoSessionMode === 'startup_replay') }
+    catch { return '每阶段时长必须是 1–300 秒的整数' }
+    return JSON.stringify({
+      note: '主会话计划；不是可复制执行的 shell 命令。实际命令、阶段与 attempt ID 以执行后日志为准。',
+      mode: captureForm.autoSessionMode,
+      scope: '独占 UID 主进程已登记的代码/执行映射；L0 事件范围另按传感器核对',
+      package: captureForm.package || '<package>',
+      stages,
+      sessionBudget: { totalBytes: Number(captureForm.totalBudgetMiB) * 1048576, maxSeconds: Number(captureForm.maxSessionSeconds) },
+      sensors: enabledSensorLabels.value,
+      codeOnly: captureForm.codeOnly,
+      runtimeRoot: captureForm.isolatedRoot.trim() || '默认运行根',
+    }, null, 2)
   }
   return captureKsightctlLine({ duration: captureForm.durationSeconds, inspectMode: captureForm.inspectMode })
 })
 const captureValid = computed(() => {
   const packageValid = !captureForm.package || /^[A-Za-z0-9._]+$/.test(captureForm.package)
   const inspectValid = !(captureForm.inspectMode !== 'none' || captureForm.sched || captureForm.plan !== 'capture') || Boolean(captureForm.package)
-  const autoOk = captureForm.plan !== 'auto' || [captureForm.autoL0Seconds, captureForm.autoL1Seconds, captureForm.autoLinkerSeconds].every(n => Number.isInteger(n) && n >= 1 && n <= 300)
+  const autoOk = captureForm.plan !== 'auto' || (!captureForm.hideDebug && !captureForm.collectKeys && !captureForm.collectPrivate && !captureForm.collectMemoryWindows && [captureForm.autoL0Seconds, captureForm.autoL1Seconds, captureForm.autoLinkerSeconds].every(n => Number.isInteger(n) && n >= 1 && n <= 300))
   return packageValid && inspectValid && autoOk && captureForm.durationSeconds >= 1 && captureForm.durationSeconds <= 300 && captureForm.sampleOneIn >= 1
 })
 const capturePolicyHint = computed(() => {
-  if (!captureValid.value) return 'Inspect / Sched / Dump / 自动采集必须填写包名；时长 1–300 秒。'
+  if (!captureValid.value) return 'Inspect / Sched / Dump / 自动采集必须填写包名；时长 1–300 秒；父会话不支持额外密钥、私有存储、通用内存窗口或 Hide debug。'
   if (captureForm.plan === 'dump') return 'L2 dump --launch：force-stop 后由 dump 自己拉起 App，SIGSTOP 拷堆 DEX/SO/CE·DE。不是 eBPF 会话，不要同时挂 Inspect。'
   if (captureForm.plan === 'auto' && captureForm.autoSessionMode === 'startup_replay') return '启动重采保留各能力自己的启动窗口：L0 → 重启 L1 → 该实例快照 → 重启 Linker。三个 session 不能冒充同一进程生命周期。已确认退出、清理和预算结算的额度 partial 可继续独立冷启动，父流程仍保留 partial；取消、清理未知或其它失败停止并保留已有证据。'
   if (captureForm.plan === 'auto') return `统一 session：首次冷启动 → L0 ${captureForm.autoL0Seconds}s → L0+L1 ${captureForm.autoL1Seconds}s → Linker ${captureForm.autoLinkerSeconds}s → 最终驻留快照。后续阶段不重启 App，主进程退出或代际变化则停止。界面显示计划等待，实际起止和失败由 agent 阶段记录核对。按业务顺序逐步操作；阶段成功不代表所有动态代码已覆盖。Memory all 仍是高流量选项。`
@@ -1166,7 +1188,7 @@ const capturePolicyHint = computed(() => {
 const captureActionLabel = computed(() => {
   if (captureRunning.value) return `采集中 · ${captureElapsed.value}s${capturePhase.value ? ` · ${capturePhase.value}` : ''}`
   if (captureForm.plan === 'dump') return '开始 Dump --launch'
-  if (captureForm.plan === 'auto') return captureForm.autoSessionMode === 'unified' ? '开始统一阶段会话' : '开始启动重采（3 次启动）'
+  if (captureForm.plan === 'auto') return '一键开始全自动采集'
   return '开始采集并自动解析'
 })
 const aiContextJson = computed(() => JSON.stringify({
@@ -1281,29 +1303,30 @@ async function provisionKernSight() {
 
 async function loadKernSight() {
   if (!androidReady.value || !props.device) return
+  const request = overviewRequests.begin()
+  const serial = props.device.serial
   loadingKernSight.value = true
   probeError.value = ''
   try {
     const [overview, dumps, groups] = await Promise.all([
-      monitoringBackend.kernSightOverview(props.device.serial),
-      monitoringBackend.kernSightPackageDumps(props.device.serial),
-      monitoringBackend.listKernSightGroups(props.device.serial),
+      monitoringBackend.kernSightOverview(serial),
+      monitoringBackend.kernSightPackageDumps(serial),
+      monitoringBackend.listKernSightGroups(serial),
     ])
+    if (!overviewRequests.isCurrent(request) || props.device?.serial !== serial) return
     captureGroups.value=groups
     kernSight.value = overview
     devicePackageDumps.value = dumps.map(dump => markRaw(dump))
     devicePackageNames.value = new Set(dumps.map(dump => dump.package))
-    const merged = new Map(dumps.map(dump => [dump.package, markRaw(dump)]))
-    for (const bundle of localEvidenceBundles.value) merged.set(bundle.package, markRaw(bundle.dumpReport))
-    packageDumps.value = [...merged.values()]
   } catch (error) {
+    if (!overviewRequests.isCurrent(request)) return
+    captureGroups.value = []
     kernSight.value = null
     devicePackageDumps.value = []
     devicePackageNames.value = new Set()
-    packageDumps.value = localEvidenceBundles.value.map(bundle => markRaw(bundle.dumpReport))
     probeError.value = readableError(error)
   } finally {
-    loadingKernSight.value = false
+    if (overviewRequests.isCurrent(request)) loadingKernSight.value = false
   }
 }
 
@@ -1318,9 +1341,6 @@ async function importEvidenceDirectory(path?: string) {
   try {
     const bundle = await importDirectory(path)
     if (!bundle) return
-    const dumps = new Map(packageDumps.value.map(dump => [dump.package, dump]))
-    dumps.set(bundle.package, bundle.dumpReport)
-    packageDumps.value = [...dumps.values()]
     workspaceMode.value = 'evidence'
     selectPackage(bundle.package)
     evidenceMessage.value = `已索引 ${bundle.package} 的本地证据目录：${bundle.fileCount.toLocaleString()} 个文件，${formatBytes(bundle.totalBytes)}`
@@ -1346,9 +1366,6 @@ async function importEvidenceArchive() {
   try {
     const bundle = await importArchive()
     if (!bundle) return
-    const dumps = new Map(packageDumps.value.map(dump => [dump.package, dump]))
-    dumps.set(bundle.package, bundle.dumpReport)
-    packageDumps.value = [...dumps.values()]
     workspaceMode.value = 'evidence'
     selectPackage(bundle.package)
     evidenceMessage.value = `已打开 ${bundle.package} 的 MobileE 证据包：${bundle.fileCount.toLocaleString()} 个文件，${formatBytes(bundle.totalBytes)}`
@@ -1361,8 +1378,11 @@ async function importEvidenceArchive() {
 
 async function pullSelectedPackageEvidence(parentId?:string) {
   if (!props.device || !selectedPackage.value || pullingPackage.value) return
+  const serial = props.device.serial
+  const packageName = selectedPackage.value
+  const expectedBytes = Number(selectedPackageDump.value?.total_bytes ?? 0)
   const destination = await save({
-    defaultPath: `${selectedPackage.value}.mee`,
+    defaultPath: `${packageName}.mee`,
     filters: [{ name: 'ME evidence', extensions: ['mee'] }],
   })
   if (!destination) return
@@ -1370,14 +1390,10 @@ async function pullSelectedPackageEvidence(parentId?:string) {
   pullingPackage.value = true
   probeError.value = ''
   evidenceError.value = ''
-  const expectedBytes = Number(selectedPackageDump.value?.total_bytes ?? 0)
-  evidenceMessage.value = `正在拉取并封装 ME v2 内容引用归档 ${selectedPackage.value}${expectedBytes ? `（约 ${formatBytes(expectedBytes)}）` : ''}。目标旁会先出现 .part 文件，完成后原子替换为：${archivePath}`
+  evidenceMessage.value = `正在拉取并封装 ME v2 内容引用归档 ${packageName}${expectedBytes ? `（约 ${formatBytes(expectedBytes)}）` : ''}。目标旁会先出现 .part 文件，完成后原子替换为：${archivePath}`
   try {
-    const bundle = await monitoringBackend.pullKernSightPackageArchive(props.device.serial, selectedPackage.value, archivePath, typeof parentId==='string'?parentId:undefined)
+    const bundle = await monitoringBackend.pullKernSightPackageArchive(serial, packageName, archivePath, typeof parentId==='string'?parentId:undefined)
     upsertBundle(bundle)
-    const dumps = new Map(packageDumps.value.map(dump => [dump.package, dump]))
-    dumps.set(bundle.package, bundle.dumpReport)
-    packageDumps.value = [...dumps.values()]
     selectPackage(bundle.package)
     const includedSessions = Array.isArray(bundle.sessionReport?.mobilee_included_sessions) ? bundle.sessionReport.mobilee_included_sessions.length : 0
     const failedSessions = Array.isArray(bundle.sessionReport?.mobilee_session_failures) ? bundle.sessionReport.mobilee_session_failures.length : 0
@@ -1392,8 +1408,9 @@ async function pullSelectedPackageEvidence(parentId?:string) {
 
 async function exportSelectedEvidenceArchive() {
   if (!selectedLocalBundle.value || pullingPackage.value) return
+  const bundle = selectedLocalBundle.value
   const destination = await save({
-    defaultPath: `${selectedLocalBundle.value.package}.mee`,
+    defaultPath: `${bundle.package}.mee`,
     filters: [{ name: 'ME evidence', extensions: ['mee'] }],
   })
   if (!destination) return
@@ -1401,9 +1418,9 @@ async function exportSelectedEvidenceArchive() {
   pullingPackage.value = true
   probeError.value = ''
   evidenceError.value = ''
-  evidenceMessage.value = `正在导出 ${selectedLocalBundle.value.package} 的已留存运行时证据（覆盖仍按 partial/未知核对）：${archivePath}`
+  evidenceMessage.value = `正在导出 ${bundle.package} 的已留存运行时证据（覆盖仍按 partial/未知核对）：${archivePath}`
   try {
-    const savedPath = await monitoringBackend.exportKernSightEvidenceArchive(selectedLocalBundle.value.root, archivePath)
+    const savedPath = await monitoringBackend.exportKernSightEvidenceArchive(bundle.root, archivePath)
     evidenceMessage.value = `MobileE 证据包已导出：${savedPath}`
   } catch (error) {
     evidenceMessage.value = ''
@@ -1414,6 +1431,8 @@ async function exportSelectedEvidenceArchive() {
 }
 
 function selectPackage(packageName: string) {
+  sessionPackageLinked.value = false
+  pendingDeletePackage.value = false
   selectedPackage.value = packageName
   selectedEvidenceSource.value = hasLocalEvidence(packageName) ? 'local' : 'device'
   captureForm.package = packageName
@@ -1426,6 +1445,8 @@ function selectPackage(packageName: string) {
 }
 
 function selectPackageSource(packageName: string, source: 'local' | 'device') {
+  sessionPackageLinked.value = false
+  pendingDeletePackage.value = false
   selectedPackage.value = packageName
   selectedEvidenceSource.value = source
   captureForm.package = packageName
@@ -1435,6 +1456,13 @@ function selectPackageSource(packageName: string, source: 'local' | 'device') {
   dexOwnershipVisibleCount.value = 30
   evidenceVisibleCount.value = 100
   closeEvidencePreview()
+}
+
+function selectLocalEvidenceRoot(root: string) {
+  const bundle = localEvidenceBundles.value.find(item => item.root === root && item.package === selectedPackage.value)
+  if (!bundle) return
+  selectBundle(bundle)
+  selectPackageSource(bundle.package, 'local')
 }
 
 function hasLocalEvidence(packageName: string) {
@@ -1452,6 +1480,14 @@ function closePackageWorkspace() {
 }
 
 function clearCurrentSession() {
+  captureSelectionRevision += 1
+  sessionRequests.invalidate()
+  plaintextRevision.value += 1
+  plaintextDecoded.value = {}
+  plaintextDecoding.value = new Set()
+  plaintextDecodeRequests.invalidate()
+  loadingReport.value = false
+  sessionSourceRoot.value = ''
   selectedReport.value = null
   selectedSession.value = ''
   sessionMatchedPackage.value = ''
@@ -1503,7 +1539,9 @@ function hasPackageEvidence(packageName: string) {
 }
 
 function linkSessionPackageEvidence() {
-  if (!sessionMatchedPackage.value || !hasPackageEvidence(sessionMatchedPackage.value)) return
+  if (!sessionMatchedPackage.value || !canLinkSessionPackage.value) return
+  const bundle = sessionLocalBundle.value
+  if (bundle) selectBundle(bundle)
   selectPackage(sessionMatchedPackage.value)
   sessionPackageLinked.value = true
 }
@@ -1513,26 +1551,30 @@ function unlinkSessionPackageEvidence() {
 }
 
 function evidenceLocationLabel(packageName: string) {
-  const bundle = localEvidenceBundles.value.find(item => item.package === packageName)
+  const bundle = bundleForPackage(packageName)
   const onDevice = devicePackageNames.value.has(packageName)
-  if (bundle && onDevice) return `Mac ${bundle.root} · ${bundle.fileCount.toLocaleString()} files · 手机端也有副本`
-  if (bundle) return `Mac ${bundle.root} · ${bundle.fileCount.toLocaleString()} files · ${formatBytes(bundle.totalBytes)}`
+  if (onDevice && selectedPackage.value === packageName && selectedEvidenceSource.value === 'device') return '当前统计：手机端报告 · 本地副本独立选择'
+  if (bundle && onDevice) return `本地 ${bundle.root} · ${bundle.fileCount.toLocaleString()} files · 手机端也有副本`
+  if (bundle) return `本地 ${bundle.root} · ${bundle.fileCount.toLocaleString()} files · ${formatBytes(bundle.totalBytes)}`
   return '手机 /data/local/tmp/ksight/packages 受保护证据'
 }
 
 function evidenceSources(packageName: string) {
   const sources: Array<{ kind: string; label: string }> = []
-  if (localEvidenceBundles.value.some(item => item.package === packageName)) sources.push({ kind: 'local', label: 'MAC 本地' })
+  if (localEvidenceBundles.value.some(item => item.package === packageName)) sources.push({ kind: 'local', label: '本地' })
   if (devicePackageNames.value.has(packageName)) sources.push({ kind: 'device', label: '手机端' })
   return sources.length ? sources : [{ kind: 'unknown', label: '来源待确认' }]
 }
 
 function bundleSessionId(bundle: KernSightLocalEvidenceBundle) {
-  return String(bundle.sessionReport?.session_id || `${bundle.package}-local-session`)
+  return importedSessionId(bundle)
 }
 
 function loadLocalBundleSession(bundle: KernSightLocalEvidenceBundle) {
   if (!bundle.sessionReport) return
+  clearCurrentSession()
+  selectBundle(bundle)
+  sessionSourceRoot.value = bundle.root
   const sessionId = bundleSessionId(bundle)
   selectedSession.value = sessionId
   sessionMatchedPackage.value = bundle.package
@@ -1546,29 +1588,40 @@ function loadLocalBundleSession(bundle: KernSightLocalEvidenceBundle) {
   detailTab.value = 'chain'
 }
 
-async function loadSessionReport(sessionId: string) {
-  if (!props.device) return
-  selectedReport.value = null
+async function readSessionReport(
+  sessionId: string, read: () => Promise<KernSightSessionReportDocument>,
+  packageName = '', root = '', group?: KernSightCaptureGroup,
+) {
+  clearCurrentSession()
+  const request = sessionRequests.begin()
   selectedSession.value = sessionId
-  sessionMatchedPackage.value = ''
-  sessionPackageLinked.value = false
-  sessionDetailSection.value = 'summary'
+  sessionMatchedPackage.value = packageName
+  sessionSourceRoot.value = root
   loadingReport.value = true
   probeError.value = ''
   try {
-    selectedReport.value = markRaw(await monitoringBackend.kernSightReport(props.device.serial, sessionId))
-    const processes = asArray<Record<string, any>>(selectedReport.value.report?.processes)
-    const matchedPackage = processes
-      .map(process => String(process.package || ''))
-      .find(packageName => packageDumps.value.some(dump => dump.package === packageName))
-    sessionMatchedPackage.value = matchedPackage || processes.map(process => String(process.package || '')).find(Boolean) || ''
+    const document = await read()
+    if (!sessionRequests.isCurrent(request)) return
+    if (group && !document.report.mobilee_capture_group) {
+      document.report = { ...document.report, mobilee_capture_group: group, mobilee_capture_edges: captureGroupEdges(group) }
+    }
+    selectedReport.value = markRaw(document)
+    const processes = asArray<Record<string, any>>(document.report?.processes)
+    sessionMatchedPackage.value = packageName || processes.map(process => String(process.package || '')).find(Boolean) || ''
     detailTab.value = 'chain'
   } catch (error) {
+    if (!sessionRequests.isCurrent(request)) return
     clearCurrentSession()
     probeError.value = readableError(error)
   } finally {
-    loadingReport.value = false
+    if (sessionRequests.isCurrent(request)) loadingReport.value = false
   }
+}
+
+async function loadSessionReport(sessionId: string) {
+  if (!props.device) return
+  const serial = props.device.serial
+  await readSessionReport(sessionId, () => monitoringBackend.kernSightReport(serial, sessionId))
 }
 
 function applyCapturePreset(preset: 'whole' | 'tls-binder' | 'binder' | 'linker' | 'observe-pkg' | 'dump' | 'auto') {
@@ -1645,125 +1698,158 @@ function buildCaptureRequest(inspectMode: typeof captureForm.inspectMode, durati
   }
 }
 
-function mergeCaptureLogs(parts: KernSightCaptureResult[]): KernSightCaptureResult {
-  const last = parts[parts.length - 1]
-  return {
-    sessionId: [...parts].reverse().find(part => part.sessionId)?.sessionId || last?.sessionId,
-    startedUnixMs: parts[0]?.startedUnixMs || Date.now(),
-    finishedUnixMs: last?.finishedUnixMs || Date.now(),
-    commandPreview: parts.map(part => part.commandPreview).filter(Boolean).join('\n\n'),
-    stdout: parts.map(part => part.stdout).filter(Boolean).join('\n\n'),
-    stderr: parts.map(part => part.stderr).filter(Boolean).join('\n\n'),
-    exitCode: last?.exitCode,
-    hideDebug: captureForm.hideDebug,
-  }
+const lastCaptureGroupId = ref('')
+let captureSelectionRevision = 0
+
+function toggleCaptureGroup(id: string) {
+  captureSelectionRevision += 1
+  selectedCaptureGroup.value = selectedCaptureGroup.value === id ? '' : id
 }
 
-async function openAutoStageSession(sessionId: string) {
-  workspaceMode.value = 'evidence'
-  await loadSessionReport(sessionId)
-}
-
-async function startCapture() {
-  if (!props.device || !captureValid.value || captureRunning.value) return
+function resetCaptureRun() {
   captureRunning.value = true
   captureElapsed.value = 0
   capturePhase.value = ''
   captureResult.value = null
   autoStageReceipts.value = []
   probeError.value = ''
+  if (captureTimer) clearInterval(captureTimer)
   captureTimer = setInterval(() => {
     captureElapsed.value += 1
-    if (unifiedSessionAwaiting.value) {
-      const l0=captureForm.autoL0Seconds, l1=captureForm.autoL1Seconds, total=l0+l1+captureForm.autoLinkerSeconds
-      const phase=captureElapsed.value < l0 ? 'L0' : captureElapsed.value < l0+l1 ? 'L1' : captureElapsed.value < total ? 'Linker' : '等待 agent 退出'
-      capturePhase.value=`计划 ${phase}（时间估计；实际以 agent 记录为准）`
-    }
+    if (unifiedSessionAwaiting.value) capturePhase.value = '统一阶段执行中（实际进度以 agent 阶段记录为准）'
   }, 1000)
+}
+
+function finishCaptureRun() {
+  captureRunning.value = false
+  unifiedSessionAwaiting.value = false
+  capturePhase.value = ''
+  if (captureTimer) clearInterval(captureTimer)
+  captureTimer = undefined
+}
+
+async function openAutoStageSession(sessionId: string) {
+  workspaceMode.value = 'evidence'
+  const group = captureGroups.value.find(item => item.id === lastCaptureGroupId.value && groupSessionIds([item]).has(sessionId))
+  if (group) await openGroupedSession(group, sessionId)
+  else await loadSessionReport(sessionId)
+}
+
+async function refreshCaptureOverview(serial: string) {
+  if (props.device?.serial !== serial) return
+  const retained = captureGroups.value.find(group => group.id === lastCaptureGroupId.value)
+  await loadKernSight()
+  // A failed refresh cannot discard the last durable receipt already returned by the backend.
+  if (props.device?.serial === serial && retained && !captureGroups.value.some(group => group.id === retained.id)) replaceCaptureGroup(retained)
+}
+
+async function showCaptureOutcome(groupId: string, revision: number, serial: string) {
+  if (props.device?.serial !== serial || captureSelectionRevision !== revision) return
+  const group = captureGroups.value.find(item => item.id === groupId)
+  if (!group) return
+  workspaceMode.value = 'evidence'
+  selectedCaptureGroup.value = group.id
+  const sessionId = latestGroupSession(group)
+  const captureError = probeError.value
+  if (sessionId) await openGroupedSession(group, sessionId)
+  // Opening retained evidence must not hide the reason automatic capture stopped.
+  if (captureError) probeError.value = captureError
+}
+
+async function startCapture() {
+  if (!props.device || !captureValid.value || captureRunning.value) return
+  const serial = props.device.serial
+  const automatic = captureForm.plan === 'auto'
+  clearCurrentSession()
+  const revision = captureSelectionRevision
+  lastCaptureGroupId.value = ''
+  resetCaptureRun()
   try {
     if (captureForm.plan === 'dump') {
       capturePhase.value = 'L2 dump'
-      captureResult.value = await monitoringBackend.dumpKernSightPackage(props.device.serial, captureForm.package, captureForm.hideDebug, false)
-    } else if (captureForm.plan === 'auto') {
-      const durations=[Number(captureForm.autoL0Seconds),Number(captureForm.autoL1Seconds),Number(captureForm.autoLinkerSeconds)]
-      buildAutoCaptureStages(durations[0]!,durations[1]!,durations[2]!,true)
-      const group=await monitoringBackend.beginKernSightGroup(buildCaptureRequest('none',durations[0]!,false),durations,captureForm.autoSessionMode==='startup_replay')
+      captureResult.value = await monitoringBackend.dumpKernSightPackage(serial, captureForm.package, captureForm.hideDebug, false)
+    } else if (automatic) {
+      const durations = [Number(captureForm.autoL0Seconds), Number(captureForm.autoL1Seconds), Number(captureForm.autoLinkerSeconds)]
+      buildAutoCaptureStages(durations[0]!, durations[1]!, durations[2]!, true)
+      const group = await monitoringBackend.beginKernSightGroup(buildCaptureRequest('none', durations[0]!, false), durations, captureForm.autoSessionMode === 'startup_replay')
+      lastCaptureGroupId.value = group.id
+      if (captureSelectionRevision === revision) selectedCaptureGroup.value = group.id
       await executeCaptureGroup(group)
     } else {
       captureResult.value = await monitoringBackend.startKernSightCapture(buildCaptureRequest(captureForm.inspectMode, Number(captureForm.durationSeconds), false))
     }
-    await loadKernSight()
-    if (captureResult.value?.sessionId) {
-      workspaceMode.value = 'evidence'
-      await loadSessionReport(captureResult.value.sessionId)
-    }
   } catch (error) {
     probeError.value = readableError(error)
-    if (autoStageReceipts.value.length) {
-      try { await loadKernSight() } catch { /* Keep the original stage error and receipts. */ }
-    }
   } finally {
-    captureRunning.value = false
-    unifiedSessionAwaiting.value = false
-    capturePhase.value = ''
-    if (captureTimer) clearInterval(captureTimer)
-    captureTimer = undefined
+    const captureError = probeError.value
+    await refreshCaptureOverview(serial)
+    if (captureError) probeError.value = captureError
+    finishCaptureRun()
+    if (automatic && lastCaptureGroupId.value) await showCaptureOutcome(lastCaptureGroupId.value, revision, serial)
+    else if (props.device?.serial === serial && captureSelectionRevision === revision && captureResult.value?.sessionId) {
+      workspaceMode.value = 'evidence'
+      await loadSessionReport(captureResult.value.sessionId)
+      if (captureError) probeError.value = captureError
+    }
   }
 }
 
-function groupLedger(bundle:KernSightLocalEvidenceBundle):Record<string,any>|undefined {return bundle.dumpReport.local_storage_accounting as Record<string,any>|undefined}
-function replaceCaptureGroup(group:KernSightCaptureGroup) {
-  captureGroups.value=[group,...captureGroups.value.filter(g=>g.id!==group.id)]
-  selectedCaptureGroup.value=group.id
+function groupLedger(bundle: KernSightLocalEvidenceBundle): Record<string, any> | undefined { return bundle.dumpReport.local_storage_accounting as Record<string, any> | undefined }
+function replaceCaptureGroup(group: KernSightCaptureGroup) {
+  captureGroups.value = [group, ...captureGroups.value.filter(item => item.id !== group.id)]
 }
-async function executeCaptureGroup(group:KernSightCaptureGroup) {
-  runningCaptureGroup.value=group.id;replaceCaptureGroup(group)
+async function executeCaptureGroup(group: KernSightCaptureGroup) {
+  runningCaptureGroup.value = group.id
+  const results: KernSightCaptureResult[] = []
   try {
-    if(group.unified && group.stages.slice(0,3).some(s=>s.attempts[s.attempts.length-1]?.state!=='succeeded')) {
-      capturePhase.value=`统一阶段 · 主会话 ${shortSession(group.id)}`
-      const reply=await monitoringBackend.runKernSightUnifiedGroup(group.id)
-      group=reply.group;replaceCaptureGroup(group)
-      if(reply.result)captureResult.value=reply.result
-      if(reply.error)throw new Error(reply.error)
-      if(group.cancelRequested)return
-    }
-    for(const stage of group.stages) {
-      if(stage.attempts[stage.attempts.length-1]?.state==='succeeded')continue
-      capturePhase.value=`${stage.key} · 主会话 ${shortSession(group.id)}`
-      const reply=await monitoringBackend.runKernSightGroupStage(group.id,stage.key)
-      group=reply.group;replaceCaptureGroup(group)
-      if(reply.result) {
-        const receipt:AutoStageReceipt={stage:{key:stage.key as 'l0'|'l1'|'linker'|'dump',label:stage.key,launchAfterAttach:stage.launchAfterAttach,durationSeconds:stage.durationSeconds},result:reply.result,succeeded:!reply.error}
-        autoStageReceipts.value.push(receipt);captureResult.value={...mergeCaptureLogs(autoStageReceipts.value.map(r=>r.result)),sessionId:reply.result.sessionId}
-      }
-      if(reply.error && !reply.continueAfterPartial)throw new Error(reply.error)
-      if(group.cancelRequested)break
-    }
-  } finally {runningCaptureGroup.value=''}
+    await runCaptureGroupPlan(group, monitoringBackend, {
+      group: replaceCaptureGroup,
+      phase: key => { capturePhase.value = captureStageLabel(key) },
+      unified: active => { unifiedSessionAwaiting.value = active },
+      result: (result, key, current) => {
+        results.push(result)
+        captureResult.value = mergeCaptureResults(results)
+        const stage = current.stages.find(item => item.key === key)
+        autoStageReceipts.value.push({ stage: { key: key as AutoStageReceipt['stage']['key'], label: captureStageLabel(key), launchAfterAttach: stage?.launchAfterAttach || false, durationSeconds: stage?.durationSeconds }, result, succeeded: key === 'session' ? current.stages.filter(item => item.key !== 'dump').every(item => item.attempts[item.attempts.length - 1]?.state === 'succeeded') : stage?.attempts[stage.attempts.length - 1]?.state === 'succeeded' })
+      },
+    })
+  } finally { runningCaptureGroup.value = '' }
 }
-async function resumeCaptureGroup(group:KernSightCaptureGroup) {
-  if(captureRunning.value)return
-  captureRunning.value=true;probeError.value=''
-  try {await executeCaptureGroup(group);await loadKernSight()}catch(error){probeError.value=readableError(error)}finally{captureRunning.value=false;capturePhase.value=''}
-}
-async function cancelCaptureGroup(group:KernSightCaptureGroup) {
-  try {replaceCaptureGroup(await monitoringBackend.cancelKernSightGroup(group.id))}catch(error){probeError.value=readableError(error)}
-}
-async function openGroupedSession(group:KernSightCaptureGroup,sessionId:string) {
-  selectedCaptureGroup.value=group.id
-  const local=importedCaptureGroups.value.find(item=>item.group.id===group.id)
-  if(local) {
-    selectedReport.value=await monitoringBackend.localKernSightChildReport(local.bundle.root,group.id,sessionId)
-    selectedSession.value=sessionId
-  } else {
-    selectedReport.value=await monitoringBackend.kernSightGroupSessionReport(group.id,group.serial,group.package,sessionId)
-    selectedSession.value=sessionId
-    if(selectedReport.value) {
-      selectedReport.value.report.mobilee_capture_group=group
-      selectedReport.value.report.mobilee_capture_edges=captureGroupEdges(group)
-    }
+async function resumeCaptureGroup(group: KernSightCaptureGroup) {
+  if (captureRunning.value) return
+  clearCurrentSession()
+  const revision = captureSelectionRevision
+  const serial = group.serial
+  lastCaptureGroupId.value = group.id
+  selectedCaptureGroup.value = group.id
+  resetCaptureRun()
+  try { await executeCaptureGroup(group) }
+  catch (error) { probeError.value = readableError(error) }
+  finally {
+    const captureError = probeError.value
+    await refreshCaptureOverview(serial)
+    if (captureError) probeError.value = captureError
+    finishCaptureRun()
+    await showCaptureOutcome(group.id, revision, serial)
   }
 }
+async function cancelCaptureGroup(group: KernSightCaptureGroup) {
+  try { replaceCaptureGroup(await monitoringBackend.cancelKernSightGroup(group.id)) }
+  catch (error) { probeError.value = readableError(error) }
+}
+async function openGroupedSession(group: KernSightCaptureGroup, sessionId: string) {
+  captureSelectionRevision += 1
+  selectedCaptureGroup.value = group.id
+  const candidates = importedCaptureGroups.value.filter(item => item.group.id === group.id && groupSessionIds([item.group]).has(sessionId))
+  const local = candidates.find(item => item.bundle.root === selectedRoots.value[group.package]) || candidates[candidates.length - 1]
+  if (local) {
+    selectBundle(local.bundle)
+    await readSessionReport(sessionId, () => monitoringBackend.localKernSightChildReport(local.bundle.root, group.id, sessionId), group.package, local.bundle.root, group)
+  } else {
+    await readSessionReport(sessionId, () => monitoringBackend.kernSightGroupSessionReport(group.id, group.serial, group.package, sessionId), group.package, '', group)
+  }
+}
+
 async function pullCaptureGroup(group:KernSightCaptureGroup) {selectPackage(group.package);await pullSelectedPackageEvidence(group.id)}
 
 async function copyAiContext() {
@@ -1837,6 +1923,10 @@ function readableBinaryPreview(bytes: Uint8Array) {
 }
 
 async function loadEvidenceFile(packageName: string, relativePath: string) {
+  const request = evidenceRequests.begin()
+  selectedEvidence.value = null
+  evidencePreview.value = ''
+  evidenceDecodedPreview.value = ''
   loadingEvidence.value = true
   selectedEvidenceKey.value = `${packageName}:${relativePath}`
   probeError.value = ''
@@ -1847,6 +1937,7 @@ async function loadEvidenceFile(packageName: string, relativePath: string) {
       : props.device
         ? await monitoringBackend.kernSightPackageFile(props.device.serial, packageName, relativePath)
         : (() => { throw new Error('没有可读取的设备端或本地证据来源') })()
+    if (!evidenceRequests.isCurrent(request)) return
     selectedEvidence.value = result
     const binary = Uint8Array.from(atob(result.content), character => character.charCodeAt(0))
     const controlBytes = binary.slice(0, Math.min(binary.length, 4096)).filter(byte => byte === 0 || (byte < 9) || (byte > 13 && byte < 32)).length
@@ -1861,16 +1952,19 @@ async function loadEvidenceFile(packageName: string, relativePath: string) {
       evidenceDecodedPreview.value = ''
     }
   } catch (error) {
+    if (!evidenceRequests.isCurrent(request)) return
     selectedEvidence.value = null
     evidencePreview.value = ''
     evidenceDecodedPreview.value = ''
     probeError.value = readableError(error)
   } finally {
-    loadingEvidence.value = false
+    if (evidenceRequests.isCurrent(request)) loadingEvidence.value = false
   }
 }
 
 function closeEvidencePreview() {
+  evidenceRequests.invalidate()
+  loadingEvidence.value = false
   selectedEvidence.value = null
   selectedEvidenceKey.value = ''
   evidencePreview.value = ''
@@ -1908,7 +2002,7 @@ function isHttpLikePlaintext(row: Record<string, any>) {
 }
 
 function plaintextCardKey(row: Record<string, any>, index: number | string) {
-  return `${row.process_id || 0}:${row.adapter || ''}:${row.direction || ''}:${index}`
+  return `${plaintextRevision.value}:${selectedSession.value}:${sessionSourceRoot.value}:${row.process_id || 0}:${row.adapter || ''}:${row.direction || ''}:${index}`
 }
 
 function hexStringToBytes(hex: string) {
@@ -1979,6 +2073,11 @@ async function transcodePlaintextPreview(preview: string) {
 
 async function togglePlaintextDecode(row: Record<string, any>, index: number) {
   const key = plaintextCardKey(row, index)
+  if (plaintextDecoding.value.has(key)) {
+    plaintextDecodeRequests.cancel(key)
+    plaintextDecoding.value = new Set([...plaintextDecoding.value].filter(item => item !== key))
+    return
+  }
   if (plaintextDecoded.value[key]) {
     const next = { ...plaintextDecoded.value }
     delete next[key]
@@ -1987,7 +2086,21 @@ async function togglePlaintextDecode(row: Record<string, any>, index: number) {
   }
   const preview = String(row.preview || '')
   if (!preview) return
-  plaintextDecoded.value = { ...plaintextDecoded.value, [key]: await transcodePlaintextPreview(preview) }
+  const revision = plaintextRevision.value
+  const request = plaintextDecodeRequests.begin(key)
+  plaintextDecoding.value = new Set([...plaintextDecoding.value, key])
+  try {
+    const decoded = await transcodePlaintextPreview(preview)
+    if (plaintextRevision.value !== revision || !plaintextDecodeRequests.isCurrent(key, request)) return
+    plaintextDecoded.value = { ...plaintextDecoded.value, [key]: decoded }
+  } catch (error) {
+    if (plaintextRevision.value === revision && plaintextDecodeRequests.isCurrent(key, request)) probeError.value = readableError(error)
+  } finally {
+    if (plaintextDecodeRequests.isCurrent(key, request)) {
+      plaintextDecodeRequests.cancel(key)
+      plaintextDecoding.value = new Set([...plaintextDecoding.value].filter(item => item !== key))
+    }
+  }
 }
 
 function plaintextOriginLabel(row: Record<string, any>) {
@@ -2110,12 +2223,21 @@ function capabilityStatusLabel(status: string) {
   return 'UNKNOWN'
 }
 
+watch(() => [selectedPackage.value, selectedEvidenceSource.value, selectedLocalBundle.value?.root], () => {
+  if (!linkedPackageDump.value) sessionPackageLinked.value = false
+  selectedArtifact.value = null
+  closeEvidencePreview()
+})
+
 watch(() => props.device?.serial, () => {
+  overviewRequests.invalidate()
+  loadingKernSight.value = false
+  captureGroups.value = []
+  selectedCaptureGroup.value = ''
   capabilityProbe.value = null
   kernSight.value = null
   devicePackageDumps.value = []
   devicePackageNames.value = new Set()
-  packageDumps.value = localEvidenceBundles.value.map(bundle => bundle.dumpReport)
   clearCurrentSession()
   captureResult.value = null
   closeEvidencePreview()
@@ -2130,12 +2252,17 @@ onErrorCaptured((error) => {
 watch(requestedPackage, packageName => {
   if (!packageName) return
   workspaceMode.value = 'evidence'
-  const bundle = localEvidenceBundles.value.find(item => item.package === packageName)
+  const bundle = bundleForPackage(packageName)
   if (!bundle) return
   selectPackage(packageName)
 }, { immediate: true })
 
 onBeforeUnmount(() => {
+  sessionRequests.invalidate()
+  plaintextRevision.value += 1
+  plaintextDecodeRequests.invalidate()
+  evidenceRequests.invalidate()
+  overviewRequests.invalidate()
   if (captureTimer) clearInterval(captureTimer)
 })
 </script>
@@ -2223,10 +2350,28 @@ onBeforeUnmount(() => {
 .ks-install-gate{padding:18px;border-color:rgba(245,158,11,.24)}.ks-install-gate.ready{border-color:rgba(52,211,153,.24)}.ks-install-gate>header{display:grid;grid-template-columns:38px minmax(0,1fr) auto;gap:11px;align-items:center}.ks-install-gate>header>.material-symbols-outlined{display:grid;width:38px;height:38px;place-items:center;color:#e2ac50;border-radius:11px;background:rgba(245,158,11,.09)}.ks-install-gate.ready>header>.material-symbols-outlined{color:#62d2a5;background:rgba(52,211,153,.09)}.ks-install-gate h2{margin:4px 0 0;font-size:13px}.ks-install-gate header p{margin:5px 0 0;color:var(--muted);font-size:8px;line-height:1.5}.ks-install-gate header>b{color:#d9aa58;font-size:7px}.ks-install-gate.ready header>b{color:#62cea3}.ks-requirement-grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:7px;margin-top:13px}.ks-requirement-grid article{display:flex;align-items:center;gap:8px;padding:9px;border:1px solid rgba(245,158,11,.16);border-radius:9px;background:rgba(245,158,11,.035)}.ks-requirement-grid article.passed{border-color:rgba(52,211,153,.16);background:rgba(52,211,153,.025)}.ks-requirement-grid .material-symbols-outlined{color:#db9260;font-size:15px}.ks-requirement-grid article.passed .material-symbols-outlined{color:#5ecb9f}.ks-requirement-grid strong,.ks-requirement-grid small{display:block}.ks-requirement-grid strong{font-size:8px}.ks-requirement-grid small{margin-top:3px;color:var(--muted);font-size:7px}.ks-install-guidance{display:grid;grid-template-columns:20px minmax(0,1fr) auto auto;gap:9px;align-items:center;margin-top:11px;padding:10px;border:1px solid var(--line);border-radius:9px;background:rgba(255,255,255,.018)}.ks-install-guidance>.material-symbols-outlined{color:#77a4e8;font-size:16px}.ks-install-guidance p{margin:0;color:var(--muted);font-size:8px;line-height:1.55}.ks-install-guidance p strong{color:var(--text)}
 .ks-provision-result{padding:15px;border-color:rgba(52,211,153,.25)}.ks-provision-result>header{display:flex;align-items:flex-start;justify-content:space-between;gap:12px}.ks-provision-result h2{margin:4px 0 0;font-size:13px}.ks-provision-result header p{margin:5px 0 0;color:var(--muted);font-size:7px;word-break:break-all}.ks-provision-result header>a{color:var(--primary);font-size:8px}.ks-provision-steps{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:7px;margin-top:12px}.ks-provision-steps article{display:grid;grid-template-columns:22px minmax(0,1fr);gap:7px;align-items:start;padding:9px;border:1px solid rgba(52,211,153,.17);border-radius:8px;background:rgba(52,211,153,.035)}.ks-provision-steps .material-symbols-outlined{color:#62d3a7;font-size:16px}.ks-provision-steps strong,.ks-provision-steps small{display:block}.ks-provision-steps strong{font-size:8px}.ks-provision-steps small{overflow:hidden;margin-top:3px;color:var(--muted);font-size:6px;text-overflow:ellipsis;white-space:nowrap}
 .ks-session-panel, .ks-package-panel, .ks-package-evidence-panel { padding: 16px; }
+.runtime-monitor-layout .section-title { flex-wrap: wrap; align-items: flex-start; gap: 10px; }
+.runtime-monitor-layout .section-title > div:first-child { flex: 1 1 240px; min-width: 0; }
+.runtime-monitor-layout .section-title h2 { overflow-wrap: anywhere; word-break: break-word; }
 .ks-session-panel{order:10}.ks-package-panel{order:20}.ks-package-evidence-panel{order:30}
 .ks-workspace-switcher{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:8px;padding:9px}.ks-workspace-switcher>button{display:grid;grid-template-columns:28px minmax(0,1fr);gap:2px 9px;align-items:center;padding:10px;color:inherit;text-align:left;border:1px solid var(--line);border-radius:10px;background:rgba(4,8,13,.3)}.ks-workspace-switcher>button:hover,.ks-workspace-switcher>button.active{border-color:rgba(57,125,246,.4);background:rgba(57,125,246,.08)}.ks-workspace-switcher .material-symbols-outlined{grid-row:1/3;color:#78a7ed;font-size:19px}.ks-workspace-switcher strong,.ks-workspace-switcher small{display:block}.ks-workspace-switcher strong{font-size:9px}.ks-workspace-switcher small{color:#69788e;font-size:7px}
 .ks-session-panel .section-title p, .ks-package-panel .section-title p, .ks-package-evidence-panel .section-title p { margin: 4px 0 0; color: #6d7b90; font-size: 8px; }
-.ks-title-actions{display:flex;align-items:center;gap:7px}
+.ks-title-actions{display:flex;flex-wrap:wrap;align-items:center;gap:7px}
+.ks-capture-form .ks-unavailable-options { display: flex; flex-wrap: wrap; gap: 10px 16px; }
+.ks-capture-form .ks-unavailable-options > span { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; }
+.ks-capture-form .ks-unavailable-options input { width: auto; height: auto; margin: 0; }
+.ks-source-diagnostics { min-width: 0; max-width: 100%; margin: 12px 0; font-size: 12px; }
+.ks-source-diagnostics article, .ks-source-diagnostics p { min-width: 0; max-width: 100%; overflow-wrap: anywhere; }
+.ks-source-diagnostics pre { max-width: 100%; max-height: 360px; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; font-size: 11px; }
+.ks-range-table { max-width: 100%; overflow-x: auto; margin: 10px 0; border: 1px solid var(--line); border-radius: 7px; }
+.ks-range-table table { width: 100%; min-width: 760px; border-collapse: collapse; font-size: 12px; }
+.ks-range-table th, .ks-range-table td { padding: 8px 10px; text-align: left; vertical-align: top; border-bottom: 1px solid var(--line); }
+.ks-range-table th, .ks-range-table td:nth-child(-n+4) { white-space: nowrap; }
+.ks-range-table td:nth-child(n+5) { min-width: 180px; overflow-wrap: anywhere; }
+.ks-range-table:focus-visible { outline: 2px solid var(--primary); outline-offset: 2px; }
+.ks-local-capture-picker { display: grid; gap: 7px; min-width: 0; margin: 12px 0; font-size: 12px; }
+.ks-local-capture-picker select { width: 100%; min-width: 0; padding: 8px; color: var(--text); border: 1px solid var(--line-strong); border-radius: 7px; background: var(--surface); }
+.ks-local-capture-picker small { color: var(--muted); overflow-wrap: anywhere; }
 .danger-button{color:#d86d78;border-color:rgba(216,109,120,.3)}
 .ks-session-package-link{display:flex;align-items:center;gap:12px;margin-top:10px;padding:10px 12px;border:1px solid rgba(57,125,246,.22);border-radius:9px;background:rgba(57,125,246,.045)}
 .ks-session-package-link>div{display:grid;grid-template-columns:auto auto;align-items:center;gap:3px 8px;min-width:0;flex:1}.ks-session-package-link small{color:#718199;font-size:7px}.ks-session-package-link strong{font-size:9px}.ks-session-package-link span{grid-column:1/-1;color:#72839b;font-size:7px}.ks-session-package-link>b{color:#8694a8;font-size:7px}
@@ -2236,8 +2381,8 @@ onBeforeUnmount(() => {
 .ks-session-row{display:grid;grid-template-columns:minmax(0,1fr) auto;align-items:stretch;overflow:hidden;border:1px solid var(--line);border-radius:10px;background:var(--surface-soft)}
 /* Parent details must keep native summary flow; the legacy row grid hides its toggle. */
 details.ks-session-row { display: block; }
-details.ks-session-row > summary { display: list-item; list-style-position: inside; padding: 10px 12px; cursor: pointer; font-size: 12px; }
-details.ks-session-row > summary strong { display: inline; font-size: 12px; }
+details.ks-session-row > summary { display: list-item; list-style-position: inside; min-width: 0; padding: 10px 12px; cursor: pointer; font-size: 12px; overflow-wrap: anywhere; }
+details.ks-session-row > summary strong { display: inline; font-size: 12px; white-space: normal; overflow-wrap: anywhere; word-break: break-word; }
 details.ks-session-row > article { padding: 12px; border-top: 1px solid var(--line); overflow-wrap: anywhere; }
 details.ks-session-row > article > strong { font-size: 12px; }
 details.ks-session-row > p, details.ks-session-row > small, details.ks-session-row > details { margin: 10px 12px; overflow-wrap: anywhere; }
@@ -2448,4 +2593,60 @@ details.ks-session-row pre { max-height: 360px; overflow: auto; white-space: pre
   .runtime-monitor-layout .ks-session-state { text-align: left; }
   .runtime-monitor-layout .ks-session-delete-slot { flex-direction: column; }
 }
+
+/* Capture setup and parent receipts need explicit typography: raw <small>/<p>
+   otherwise inherit the app body size and dwarf the existing compact controls. */
+.ks-capture-panel .ks-presets { grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); }
+.ks-capture-panel .ks-presets button.active { border-color: var(--primary); background: var(--primary-soft); }
+.ks-capture-panel .ks-presets strong { font-size: 12px; }
+.ks-capture-panel .ks-presets small { font-size: 11px; line-height: 1.45; }
+.ks-capture-help { margin-top: 12px; font-size: 12px; color: var(--muted); }
+.ks-capture-help > summary, .ks-auto-settings > summary { cursor: pointer; }
+.ks-capture-form { grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; }
+.ks-capture-form > label { min-width: 0; }
+.ks-capture-form .wide { grid-column: 1 / -1; }
+.ks-capture-form label > span { font-size: 11px; color: var(--muted); }
+.ks-capture-form label > small, .ks-form-help { display: block; margin: 6px 0 0; color: var(--muted); font-size: 11px; line-height: 1.55; overflow-wrap: anywhere; }
+.ks-capture-form input:not([type="checkbox"]), .ks-capture-form select { width: 100%; min-width: 0; height: 36px; padding: 7px 9px; color: var(--text); background: var(--surface); font-size: 12px; }
+.ks-capture-form input[type="checkbox"] { width: 14px; height: 14px; padding: 0; margin: 0 6px 0 0; vertical-align: middle; accent-color: var(--primary); }
+.ks-capture-actions { align-items: flex-start; flex-wrap: wrap; }
+.ks-capture-actions > button { flex: 0 0 auto; }
+.ks-capture-actions > p { flex: 1 1 300px; font-size: 11px; }
+.ks-advanced-capture { margin-top: 14px; font-size: 12px; }
+.ks-auto-settings { padding: 10px 12px; border: 1px solid var(--line); border-radius: 9px; }
+.ks-capture-status { padding: 10px 12px; margin: 12px 0; color: var(--primary); background: var(--primary-soft); border-radius: 8px; font-size: 12px; line-height: 1.5; }
+.ks-session-list .ks-capture-group > summary { position: relative; display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 5px 12px; padding: 14px 14px 14px 24px; }
+.ks-session-list .ks-capture-group > summary::before { content: '▸'; position: absolute; top: 14px; left: 8px; }
+.ks-session-list .ks-capture-group[open] > summary::before { content: '▾'; }
+.ks-session-list .ks-capture-group > summary > strong { font-size: 13px; }
+.ks-session-list .ks-capture-group > summary > .ks-group-meta { grid-column: 1; font-size: 11px; color: var(--muted); line-height: 1.5; }
+.ks-session-list .ks-capture-group > summary > b { grid-column: 2; grid-row: 1 / 3; align-self: center; font-size: 11px; }
+.ks-capture-group p, .ks-capture-group summary, .ks-capture-group code { font-size: 12px; line-height: 1.55; overflow-wrap: anywhere; }
+.ks-capture-group .ks-group-budget { padding: 8px 10px; color: var(--muted); background: var(--surface-soft); border: 1px solid var(--line); border-radius: 8px; }
+.ks-capture-group .ks-group-budget > summary { cursor: pointer; }
+.ks-capture-group .ks-group-budget > p { margin: 8px 0; font-size: 11px; }
+.ks-capture-group .ks-group-stage > header { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 8px; }
+.ks-session-list .ks-group-stage > header > strong { font-size: 12px; }
+.ks-session-list .ks-group-stage > header > b { font-size: 11px; }
+.ks-session-list .ks-capture-group small { color: var(--muted); font-size: 11px; line-height: 1.5; overflow-wrap: anywhere; }
+.ks-stage-attempt { margin-top: 10px; padding: 10px; border: 1px solid var(--line); border-radius: 8px; background: var(--surface); }
+.ks-stage-attempt > b { font-size: 11px; }
+.ks-stage-attempt > button { margin-top: 8px; }
+.ks-attempt-diagnostics { margin-top: 9px; color: var(--muted); }
+.ks-attempt-diagnostics > summary { cursor: pointer; font-size: 11px; }
+.ks-attempt-diagnostics[open] { max-height: 300px; overflow: auto; }
+.ks-capture-group .ks-attempt-error { margin: 8px 0 0; padding: 8px; color: var(--red); background: color-mix(in srgb, var(--red) 7%, var(--surface)); border-radius: 6px; font-size: 12px; white-space: pre-wrap; }
+.ks-session-list .state-failed, .ks-session-list .state-interrupted { color: var(--red); }
+.ks-session-list .state-partial { color: var(--amber); }
+.ks-session-list .state-succeeded { color: var(--muted); }
+.ks-group-actions { display: flex; flex-wrap: wrap; gap: 8px; padding: 12px; border-top: 1px solid var(--line); }
+.ks-parent-links { margin: 12px 0; font-size: 12px; }
+.ks-parent-links > summary { cursor: pointer; color: var(--muted); line-height: 1.5; overflow-wrap: anywhere; }
+.ks-capture-log summary, .ks-capture-log code, .ks-capture-log pre { font-size: 11px; }
+@media (max-width: 650px) {
+  .ks-capture-panel .ks-presets, .ks-capture-form { grid-template-columns: minmax(0, 1fr); }
+  .ks-session-list .ks-capture-group > summary { grid-template-columns: minmax(0, 1fr); }
+  .ks-session-list .ks-capture-group > summary > b { grid-column: 1; grid-row: auto; }
+}
+
 </style>

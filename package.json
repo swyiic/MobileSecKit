@@ -8,11 +8,11 @@
     "typecheck": "vue-tsc --noEmit",
     "build": "vue-tsc --noEmit && vite build",
     "test:rust": "cargo test --manifest-path src-tauri/Cargo.toml --lib",
-    "check": "npm run typecheck && cargo fmt --manifest-path src-tauri/Cargo.toml --all -- --check && npm run test:rust",
+    "check": "npm run typecheck && npm run test:kernsight-evidence && cargo fmt --manifest-path src-tauri/Cargo.toml --all -- --check && npm run test:rust",
     "preview": "vite preview",
     "tauri": "tauri",
     "test:kernsight-plan": "node --test tests/kernsightCapturePlan.test.mjs",
-    "test:kernsight-evidence": "node --test tests/kernsightCapturePlan.test.mjs tests/kernsightCaptureGroups.test.mjs tests/kernsightMemoryEvidence.test.mjs tests/kernsightCodeEvidence.test.mjs"
+    "test:kernsight-evidence": "node --test tests/kernsightCapturePlan.test.mjs tests/kernsightCaptureGroups.test.mjs tests/kernsightMemoryEvidence.test.mjs tests/kernsightCodeEvidence.test.mjs tests/kernsightWorkspaceState.test.mjs tests/kernsightCaptureRunner.test.mjs"
   },
   "dependencies": {
     "@tauri-apps/api": "2.9.1",

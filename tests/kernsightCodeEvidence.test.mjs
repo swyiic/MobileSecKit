@@ -29,8 +29,8 @@ test('dex scan summary does not invent zero bytes or a clean stop',()=>{
   assert.match(dexScanSummaryForObject([],'abc'),/未知/)
   const sha='abc'
   const observations=[
-    {mapping:{path:'/mem/a'},source:{pid:1,exec_id:2},raw_evidence:'a.code',object_inspection:{file_bytes:100,scanned_through_offset:40,unscanned_tail_bytes:60,candidate_stop_reason:'rejected_candidate_limit',derived_objects:[{sha256:sha}]}},
-    {mapping:{path:'/mem/b'},source:{pid:1,exec_id:3},raw_evidence:'b.code',object_inspection:{file_bytes:100,scanned_through_offset:100,unscanned_tail_bytes:0,candidate_stop_reason:'complete',derived_objects:[{sha256:sha}]}},
+    {mapping:{path:'/mem/a'},source:{pid:1,exec_id:2},relative_path:'runtime/a.code',raw_evidence:'a.code',object_inspection:{file_bytes:100,scanned_through_offset:40,unscanned_tail_bytes:60,candidate_stop_reason:'rejected_candidate_limit',derived_objects:[{sha256:sha}]}},
+    {mapping:{path:'/mem/b'},source:{pid:1,exec_id:3},relative_path:'runtime/b.code',raw_evidence:'b.code',object_inspection:{file_bytes:100,scanned_through_offset:100,unscanned_tail_bytes:0,candidate_stop_reason:'complete',derived_objects:[{sha256:sha}]}},
   ]
   const both=dexScanSummaryForObject(observations,sha)
   assert.match(both,/\/mem\/a/)
@@ -51,6 +51,116 @@ test('dex scan summary does not invent zero bytes or a clean stop',()=>{
   const absent=fileScanLabel(undefined,{relativePath:'notes.txt'})
   assert.match(absent,/停止 未知/)
   assert.match(absent,/未扫描尾部 未知/)
+})
+
+function scanObservation(path, sha, tail, extra = {}) {
+  return {
+    mapping: { path },
+    source: { pid: 42, exec_id: 7 },
+    object_inspection: {
+      status: 'bounded_candidate_inspection', file_bytes: 1000,
+      scanned_through_offset: 1000 - tail, unscanned_tail_bytes: tail,
+      candidate_stop_reason: tail ? 'rejected_candidate_limit' : 'complete',
+      derived_objects: [{ sha256: sha }],
+    },
+    ...extra,
+  }
+}
+
+test('same basename with another SHA cannot hide the real unread tail in either file view', () => {
+  const sha = 'a'.repeat(64)
+  const observations = [
+    scanObservation('/other/classes.dex', 'b'.repeat(64), 0, { raw_evidence: 'classes.dex', relative_path: 'other/classes.dex' }),
+    scanObservation('/mem/target', sha, 600, { relative_path: 'runtime/bound-target.code' }),
+  ]
+  const file = { relative_path: 'apk-dex/classes.dex', sha256: sha, codeEvidence: [{ sha256: sha }] }
+  const noiseRow = codeNoiseLayers([file])[0].groups[0].rows[0]
+  const before = JSON.stringify(observations)
+  for (const displayFile of [file, { relativePath: noiseRow.path, codeEvidence: noiseRow.notes }]) {
+    const label = fileScanLabel(observations, displayFile)
+    assert.match(label, /\/mem\/target · pid 42 · exec 7/)
+    assert.match(label, /停止 rejected_candidate_limit · 未扫描尾部 600 B/)
+    assert.doesNotMatch(label, /\/other\/classes.dex|停止 complete|未扫描尾部 0 B/)
+  }
+  assert.equal(JSON.stringify(observations), before)
+})
+
+test('a basename hit does not hide other sources of the same SHA', () => {
+  const observations = [
+    scanObservation('/other/classes.dex', 'shared', 0),
+    scanObservation('/mem/target', 'shared', 600),
+  ]
+  const label = fileScanLabel(observations, { relativePath: 'apk-dex/classes.dex', sha256: 'shared' })
+  assert.equal(label, dexScanSummaryForObject(observations, 'shared'))
+  assert.match(label, /\/other\/classes.dex.*未扫描尾部 0 B；\/mem\/target.*未扫描尾部 600 B/)
+})
+
+test('exact retained artifact paths keep all source rows and their independent unknown fields', () => {
+  const observations = [
+    scanObservation('/mem/first', 'dex', 600, { relative_path: 'runtime/bound.code', source: { pid: 1, exec_id: 2 } }),
+    scanObservation('/mem/second', 'dex', 0, { relative_path: 'runtime/bound.code', source: { pid: 1, exec_id: 3 }, object_inspection: {} }),
+    scanObservation('/mem/elsewhere', 'dex', 0, { relative_path: 'runtime/other.code' }),
+  ]
+  const label = fileScanLabel(observations, { relativePath: 'runtime/bound.code', sha256: 'dex' })
+  assert.match(label, /\/mem\/first · pid 1 · exec 2.*未扫描尾部 600 B/)
+  assert.match(label, /\/mem\/second · pid 1 · exec 3.*停止 未知 · 未扫描尾部 未知/)
+  assert.doesNotMatch(label, /\/mem\/elsewhere/)
+})
+
+test('device mapping paths and raw basenames cannot override an explicit retained artifact path', () => {
+  const observations = [scanObservation('runtime/target.code', 'other', 0, {
+    relative_path: 'runtime/other.code', raw_evidence: 'target.code',
+  })]
+  for (const relativePath of ['runtime/target.code', 'target.code', 'apk-dex/other.code']) {
+    const label = fileScanLabel(observations, { relativePath })
+    assert.match(label, /^来源未知/)
+    assert.match(label, /停止 未知 · 未扫描尾部 未知/)
+    assert.doesNotMatch(label, /停止 complete|未扫描尾部 0 B/)
+  }
+})
+
+test('legacy raw artifacts are resolved relative to their source report, never by basename', () => {
+  const observations = [scanObservation('/mem/legacy', 'dex', 600, {
+    source_report: 'runtime/bound-source.json', raw_evidence: 'bound.code',
+  })]
+  assert.match(fileScanLabel(observations, { relativePath: 'runtime/bound.code' }), /未扫描尾部 600 B/)
+  for (const relativePath of ['bound.code', 'apk-dex/bound.code']) {
+    assert.match(fileScanLabel(observations, { relativePath }), /^来源未知/)
+  }
+  assert.match(fileScanLabel([{ ...observations[0], source_report: 'bound-source.json' }], { relativePath: 'bound.code' }), /未扫描尾部 600 B/)
+})
+
+test('an exact path with a conflicting retained hash cannot suppress matching object sources', () => {
+  const observations = [
+    scanObservation('/mem/stale', 'other', 0, { relative_path: 'runtime/bound.code', read: { sha256: 'stale-range' } }),
+    scanObservation('/mem/target', 'expected', 600, { relative_path: 'runtime/target.code' }),
+  ]
+  for (const file of [
+    { relativePath: 'runtime/bound.code', sha256: 'expected' },
+    { relativePath: 'runtime/bound.code', code_evidence: [{ sha256: 'expected' }] },
+  ]) {
+    const label = fileScanLabel(observations, file)
+    assert.match(label, /\/mem\/target.*未扫描尾部 600 B/)
+    assert.doesNotMatch(label, /\/mem\/stale|停止 complete/)
+    assert.match(fileScanLabel([observations[0]], file), /^来源未知/)
+  }
+})
+
+test('container hashes and derived object hashes are different identities', () => {
+  const observation = scanObservation('/mem/container', 'derived-dex', 600, {
+    relative_path: 'runtime/bound.code', read: { sha256: 'container' },
+  })
+  assert.match(fileScanLabel([observation], { relativePath: 'runtime/bound.code', sha256: 'container' }), /未扫描尾部 600 B/)
+  assert.match(fileScanLabel([observation], { relativePath: 'apk-dex/repaired.dex', codeEvidence: [{ sha256: 'repaired', raw_member_sha256: 'derived-dex' }] }), /未扫描尾部 600 B/)
+})
+
+test('unknown source evidence stays unknown without a path or SHA association', () => {
+  for (const observations of [undefined, null, {}, [], [null, 'invalid', {}], [scanObservation('/other/classes.dex', 'other', 0)]]) {
+    const label = fileScanLabel(observations, { relativePath: 'apk-dex/classes.dex' })
+    assert.match(label, /^来源未知/)
+    assert.match(label, /停止 未知 · 未扫描尾部 未知/)
+    assert.doesNotMatch(label, /停止 complete|未扫描尾部 0 B/)
+  }
 })
 
 test('old ownership is unknown without overwriting its original data',()=>{const old=[{category:'business',confidence:100}];const result=ownershipEvidenceEntries('mobilee.kernsight-dex-ownership/v3',old);assert.equal(result[0].category,'unknown');assert.equal(result[0].confidence,0);assert.equal(old[0].category,'business')})

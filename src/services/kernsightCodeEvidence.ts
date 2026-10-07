@@ -78,26 +78,23 @@ function scanSourceLabel(range: Record<string, any>): string {
   return `${path} · pid ${pid} · exec ${exec}`
 }
 
-function sourceBasename(value: string): string {
-  const cut = Math.max(value.lastIndexOf('/'), value.lastIndexOf('\\'))
-  return cut >= 0 ? value.slice(cut + 1) : value
+function observationArtifactPath(range: Record<string, any>): string {
+  // The local ledger resolves this path against the bundle root. Device mapping
+  // paths and matching basenames do not identify the retained local artifact.
+  if (typeof range.relative_path === 'string' && range.relative_path) return range.relative_path
+  const raw = range.raw_evidence
+  if (typeof raw !== 'string' || !raw) return ''
+  const report = range.source_report
+  if (typeof report !== 'string' || !report) return raw
+  // Older records can still identify an artifact relative to its source report.
+  // The producer accepts only a filename here, not an arbitrary relative path.
+  if (raw.includes('/') || raw.includes('\\') || raw === '.' || raw === '..') return ''
+  const cut = Math.max(report.lastIndexOf('/'), report.lastIndexOf('\\'))
+  return report.slice(0, cut + 1) + raw
 }
 
-function sameSourcePath(filePath: string, candidate: string): boolean {
-  if (!filePath || !candidate) return false
-  if (filePath === candidate) return true
-  const left = sourceBasename(filePath)
-  const right = sourceBasename(candidate)
-  return left.length > 0 && left === right
-}
-
-function observationPaths(range: Record<string, any>): string[] {
-  const mapping = range.mapping && typeof range.mapping === 'object' ? range.mapping.path : undefined
-  return [mapping, range.raw_evidence, range.relative_path].filter((value): value is string => typeof value === 'string' && value.length > 0)
-}
-
-/** Every matching source, not the first SHA hit. A path match hides other SHA hits. */
-function scanLines(observations: unknown, shas: string[], filePath: string, preferPath: boolean): string[] {
+/** An exact artifact gets its own rows; otherwise preserve every matching object source. */
+function scanLines(observations: unknown, shas: string[], filePath: string, preferPath: boolean, retainedShas: string[] = []): string[] {
   if (!Array.isArray(observations)) return []
   const byPath: string[] = []
   const bySha: string[] = []
@@ -107,7 +104,11 @@ function scanLines(observations: unknown, shas: string[], filePath: string, pref
     const inspection = row.object_inspection as ScanInspection | undefined
     const derived = Array.isArray(inspection?.derived_objects) ? inspection.derived_objects as Array<{ sha256?: string }> : []
     const shaHit = derived.some(object => typeof object?.sha256 === 'string' && shas.includes(object.sha256))
-    const pathHit = filePath.length > 0 && observationPaths(row).some(candidate => sameSourcePath(filePath, candidate))
+    const rangeSha = row.read?.sha256
+    // A range/container hash is not a derived DEX hash. Only compare it with
+    // known retained-file hashes when deciding whether a path is still current.
+    const conflictingHash = typeof rangeSha === 'string' && rangeSha.length > 0 && retainedShas.length > 0 && !retainedShas.includes(rangeSha)
+    const pathHit = filePath.length > 0 && filePath === observationArtifactPath(row) && !conflictingHash
     const line = `${scanSourceLabel(row)} · ${dexScanSummary(inspection)}`
     if (pathHit) byPath.push(line)
     else if (shaHit) bySha.push(line)
@@ -127,14 +128,18 @@ export function fileScanLabel(observations: unknown, file: { relativePath?: stri
   const filePath = file.relativePath || file.relative_path || ''
   const notes = file.codeEvidence || file.code_evidence || []
   const shas: string[] = []
+  const retainedShas: string[] = []
   if (typeof file.sha256 === 'string' && file.sha256) shas.push(file.sha256)
   for (const note of notes) {
+    for (const value of [note?.sha256, note?.read?.sha256]) {
+      if (typeof value === 'string' && value && !retainedShas.includes(value)) retainedShas.push(value)
+    }
     for (const key of ['sha256', 'raw_member_sha256'] as const) {
       const value = note?.[key]
       if (typeof value === 'string' && value && !shas.includes(value)) shas.push(value)
     }
   }
-  const lines = scanLines(observations, shas, filePath, true)
+  const lines = scanLines(observations, shas, filePath, true, file.sha256 ? [file.sha256] : retainedShas)
   return lines.length ? lines.join('；') : `来源未知 · ${dexScanSummary({})}`
 }
 

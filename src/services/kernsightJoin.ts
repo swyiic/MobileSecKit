@@ -1,3 +1,4 @@
+import { importedSessionId } from './kernsightWorkspaceState'
 import type {
   KernSightAnalyzerFact,
   KernSightAnalyzerJoin,
@@ -188,7 +189,7 @@ export function buildKernSightAnalyzerJoin(bundle: KernSightLocalEvidenceBundle)
     dumpId: dump.dump_id,
     agentVersion: dump.agent_version,
     dexOwnershipMode: ownershipEntries.length ? 'class-index' : 'legacy-path',
-    sessionId: String(session.session_id || ''),
+    sessionId: importedSessionId(bundle),
     fileCount: bundle.fileCount,
     facts,
     disclaimer: DISCLAIMER,

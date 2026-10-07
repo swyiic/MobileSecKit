@@ -37,7 +37,7 @@ npm run tauri dev
 npm run tauri build
 ```
 
-`npm run check` 会执行 Vue/TypeScript 类型检查、Rust 格式检查和 Rust 单元测试。
+`npm run check` 会执行 Vue/TypeScript 类型检查、KernSight 前端回归测试、Rust 格式检查和 Rust 单元测试。
 
 ## Android Runtime / KernSight
 
@@ -47,6 +47,10 @@ npm run tauri build
 - 单包 TLS：在经过校验的 `SSL_write` 边界保留 bounded 明文 preview 和 SHA-256；
 - 单包 SO：记录 Linker load boundary，再与 mmap、proc maps 和 package dump 关联；
 - Hide debug lab：按固定时长暂时断开 ADB，设备 watchdog 恢复后自动读取 session。
+
+“新建采集”默认选择“全自动采集”：填写目标包后，一次点击依次执行 L0（15 秒）→ L1（90 秒）→ 当前实例代码快照 → Linker（15 秒），所有阶段和重试保留在同一个父会话下。默认启动重采模式会分别冷启动 L0、L1 和 Linker；高级设置可选择 agent 支持的统一会话模式。切换侧栏或“证据链 / 新建采集”不会中断前台采集。
+
+自动采集完成或失败后，会打开该父会话中已返回的子证据。失败不会被显示为成功，依赖阶段仍受退出、清理、实例身份和预算校验约束；只在设备端确认可继续时推进额度 partial。可在原父会话继续未成功阶段，已有成功阶段和历史 attempts 保留。新版保存有界的失败诊断输出尾部，旧记录不会凭空补出日志。密钥、CE/DE 和通用内存窗口在当前父会话接口中不受支持，不能通过打开前端开关绕过。
 
 采集完成会自动选中新 session。详情页将确定性报告拆为总览/壳、明文、进程、网络、Binder、路径、数据链路、原始事件和 AI-ready Evidence JSON。原始事件支持传感器、关键词与分页过滤；`correlated` 边始终与 `confirmed` 分开显示。AI-ready JSON 保留明文 preview，但不会把 dump、静态特征或时间邻近关系自动提升成已确认因果。
 

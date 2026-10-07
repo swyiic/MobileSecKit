@@ -422,6 +422,6 @@ export interface KernSightCaptureGroup {
   schema:'mobilee.capture-group/v1';id:string;serial:string;package:string;createdUnixMs:number;cancelRequested:boolean;
   state:string;unified?:boolean;base:Record<string,unknown>;
   stages:Array<{id:string;key:string;mode:string;durationSeconds:number;launchAfterAttach:boolean;required:boolean;
-    attempts:Array<{relation:KernSightCaptureRelation;state:string;startedUnixMs:number;finishedUnixMs:number|null;sessionId:string|null;error:string|null;remoteArtifactRoot:string|null;remoteLifecycle?:Record<string,unknown>|null;processInstances:Array<Record<string,unknown>>;observationError:string|null;omittedProcessInstances:number;stageRecords:Array<Record<string,unknown>>}>}>
+    attempts:Array<{relation:KernSightCaptureRelation;state:string;startedUnixMs:number;finishedUnixMs:number|null;sessionId:string|null;error:string|null;diagnosticTail?:string|null;remoteArtifactRoot:string|null;remoteLifecycle?:Record<string,unknown>|null;processInstances:Array<Record<string,unknown>>;observationError:string|null;omittedProcessInstances:number;stageRecords:Array<Record<string,unknown>>}>}>
 }
 export interface KernSightGroupStageResult {group:KernSightCaptureGroup;result:KernSightCaptureResult|null;error:string|null;continueAfterPartial?:boolean}
