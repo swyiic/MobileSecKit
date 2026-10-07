@@ -2431,6 +2431,36 @@ async fn observe_remote_lifecycle(
     })
     .await
 }
+// The status envelope can contain several independently bounded 16KiB records.
+// Bound the complete wire response (including its newline) without shrinking
+// legitimate nested evidence or weakening identity/terminal validation.
+const MAX_REMOTE_CONTROL_BYTES: usize = 64 * 1024;
+const MAX_REMOTE_CONTROL_RECORD_BYTES: usize = 16 * 1024;
+
+fn decode_remote_lifecycle(
+    response: &crate::RawOutput,
+    relation: &Relation,
+) -> Result<Value, String> {
+    if response.code != Some(0) {
+        return Err("远端control RPC未确认".into());
+    }
+    if response.stdout.len() > MAX_REMOTE_CONTROL_BYTES {
+        return Err("远端control RPC响应超过64KiB，未确认".into());
+    }
+    let note: Value = serde_json::from_str(&response.stdout).map_err(|_| "远端control JSON未知")?;
+    for field in ["startup", "qualification", "qualification_failure"] {
+        if let Some(record) = note.get(field).filter(|value| !value.is_null()) {
+            if serde_json::to_vec(record).map_err(|e| e.to_string())?.len()
+                > MAX_REMOTE_CONTROL_RECORD_BYTES
+            {
+                return Err(format!("远端control {field}记录超过16KiB，未确认"));
+            }
+        }
+    }
+    validate_remote_lifecycle(&note, relation)?;
+    Ok(note)
+}
+
 async fn observe_remote_lifecycle_with<F, Fut>(
     r: &Relation,
     error: Option<&str>,
@@ -2461,12 +2491,7 @@ where
             let mut token = None;
             loop {
                 let response = rpc(command.clone()).await?;
-                if response.code != Some(0) || response.stdout.len() > 16384 {
-                    return Err("远端control RPC未确认".into());
-                }
-                let mut note: Value =
-                    serde_json::from_str(&response.stdout).map_err(|_| "远端control JSON未知")?;
-                validate_remote_lifecycle(&note, r)?;
+                let mut note = decode_remote_lifecycle(&response, r)?;
                 if token.as_ref().is_some_and(|v| v != &note["token"]) {
                     return Err("远端owner token发生变化".into());
                 }
@@ -2510,6 +2535,109 @@ mod remote_lifecycle_tests {
             code: Some(0),
         }
     }
+    fn padded_value(mut value: Value, bytes: usize) -> Value {
+        value["test_padding"] = serde_json::json!("");
+        let base = value.to_string().len();
+        assert!(base <= bytes);
+        value["test_padding"] = serde_json::json!("x".repeat(bytes - base));
+        assert_eq!(value.to_string().len(), bytes);
+        value
+    }
+    fn wire_response(value: Value, bytes: usize) -> crate::RawOutput {
+        let mut output = response(padded_value(value, bytes - 1));
+        output.stdout.push('\n');
+        assert_eq!(output.stdout.len(), bytes);
+        output
+    }
+
+    #[test]
+    fn lifecycle_status_wire_accepts_exact_64kib_and_rejects_one_more_byte() {
+        let relation = relation();
+        let value = note(&relation, Uuid::new_v4(), true, true);
+        for bytes in [
+            16 * 1024 + 1,
+            MAX_REMOTE_CONTROL_BYTES - 1,
+            MAX_REMOTE_CONTROL_BYTES,
+        ] {
+            let decoded =
+                decode_remote_lifecycle(&wire_response(value.clone(), bytes), &relation).unwrap();
+            assert!(remote_terminal_confirmed(&decoded));
+        }
+        let too_large = wire_response(value, MAX_REMOTE_CONTROL_BYTES + 1);
+        assert!(decode_remote_lifecycle(&too_large, &relation)
+            .unwrap_err()
+            .contains("64KiB"));
+    }
+
+    #[test]
+    fn lifecycle_nested_records_keep_their_independent_16kib_bounds() {
+        let relation = relation();
+        let mut value = note(&relation, Uuid::new_v4(), true, true);
+        for field in ["startup", "qualification", "qualification_failure"] {
+            value[field] = padded_value(
+                serde_json::json!({"schema":"synthetic-bounded-record"}),
+                MAX_REMOTE_CONTROL_RECORD_BYTES,
+            );
+        }
+        let output = response(value.clone());
+        assert!(output.stdout.len() > 3 * MAX_REMOTE_CONTROL_RECORD_BYTES);
+        assert!(output.stdout.len() < MAX_REMOTE_CONTROL_BYTES);
+        decode_remote_lifecycle(&output, &relation).unwrap();
+        for field in ["startup", "qualification", "qualification_failure"] {
+            let mut oversized = value.clone();
+            oversized[field] =
+                padded_value(serde_json::json!({}), MAX_REMOTE_CONTROL_RECORD_BYTES + 1);
+            assert!(decode_remote_lifecycle(&response(oversized), &relation)
+                .unwrap_err()
+                .contains("16KiB"));
+        }
+    }
+
+    #[test]
+    fn lifecycle_larger_status_still_rejects_truncation_foreign_identity_and_failed_rpc() {
+        let relation = relation();
+        let value = note(&relation, Uuid::new_v4(), true, true);
+        let mut truncated = wire_response(value.clone(), MAX_REMOTE_CONTROL_BYTES);
+        truncated.stdout.truncate(truncated.stdout.len() - 2);
+        assert!(decode_remote_lifecycle(&truncated, &relation).is_err());
+        let mut foreign = value.clone();
+        foreign["relation"]["attempt_id"] = serde_json::json!(Uuid::new_v4());
+        assert!(decode_remote_lifecycle(
+            &wire_response(foreign, MAX_REMOTE_CONTROL_BYTES),
+            &relation
+        )
+        .is_err());
+        let mut failed = wire_response(value, MAX_REMOTE_CONTROL_BYTES);
+        failed.code = Some(1);
+        assert!(decode_remote_lifecycle(&failed, &relation).is_err());
+    }
+
+    #[tokio::test]
+    async fn lifecycle_larger_status_cannot_turn_changed_token_into_confirmed_exit() {
+        let relation = relation();
+        let first_token = Uuid::new_v4();
+        let mut calls = 0;
+        let observed =
+            observe_remote_lifecycle_with(&relation, None, Duration::from_millis(350), |_| {
+                calls += 1;
+                let value = if calls == 1 {
+                    note(&relation, first_token, false, false)
+                } else {
+                    note(&relation, Uuid::new_v4(), true, true)
+                };
+                async move { Ok(wire_response(value, MAX_REMOTE_CONTROL_BYTES)) }
+            })
+            .await;
+        assert_eq!(calls, 2);
+        assert_eq!(observed["token"], first_token.to_string());
+        assert_eq!(observed["freshness"], "last_confirmed_observation");
+        assert!(observed["recovery_error"]
+            .as_str()
+            .unwrap()
+            .contains("token"));
+        assert!(!remote_terminal_confirmed(&observed));
+    }
+
     #[tokio::test]
     async fn lifecycle_remote_stop_ack_return_exit_require_distinct_receipts() {
         let r = relation();
