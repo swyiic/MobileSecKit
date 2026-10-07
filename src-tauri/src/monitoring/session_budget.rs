@@ -216,10 +216,14 @@ impl ReplayEnvelope {
 struct JsonMeasure<'a> {
     path: &'a Path,
     bytes: u64,
+    next_check: u64,
 }
 impl Write for JsonMeasure<'_> {
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-        charge(self.path, 0)?;
+        if self.bytes >= self.next_check {
+            charge(self.path, 0)?;
+            self.next_check = self.bytes.saturating_add(65536);
+        }
         self.bytes = self
             .bytes
             .checked_add(bytes.len() as u64)
@@ -238,8 +242,14 @@ impl Write for JsonMeasure<'_> {
 }
 
 pub fn measure_json(path: &Path, value: &impl Serialize) -> io::Result<u64> {
-    let mut measure = JsonMeasure { path, bytes: 0 };
+    charge(path, 0)?;
+    let mut measure = JsonMeasure {
+        path,
+        bytes: 0,
+        next_check: 65536,
+    };
     serde_json::to_writer(&mut measure, value).map_err(io::Error::other)?;
+    charge(path, 0)?;
     Ok(measure.bytes)
 }
 

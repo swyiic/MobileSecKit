@@ -4183,10 +4183,14 @@ pub async fn read_local_kernsight_evidence_file(
     if !canonical.starts_with(&root_canonical) || !canonical.is_file() {
         return Err("本地证据文件不在已导入目录内".into());
     }
-    let bytes =
-        std::fs::read(&canonical).map_err(|error| format!("读取本地证据文件失败：{error}"))?;
-    let size = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
-    let take = usize::try_from(max_bytes.min(size)).unwrap_or(bytes.len());
+    let file = File::open(&canonical).map_err(|error| format!("读取本地证据文件失败：{error}"))?;
+    let size = file
+        .metadata()
+        .map_err(|error| format!("读取本地证据文件失败：{error}"))?
+        .len();
+    let mut bytes = Vec::with_capacity(max_bytes.min(size) as usize);
+    std::io::Read::read_to_end(&mut std::io::Read::take(file, max_bytes), &mut bytes)
+        .map_err(|error| format!("读取本地证据文件失败：{error}"))?;
     use base64::Engine as _;
     Ok(KernSightEvidenceFileContent {
         package,
@@ -4194,7 +4198,7 @@ pub async fn read_local_kernsight_evidence_file(
         bytes: size,
         truncated: size > max_bytes,
         encoding: "base64".into(),
-        content: base64::engine::general_purpose::STANDARD.encode(&bytes[..take]),
+        content: base64::engine::general_purpose::STANDARD.encode(&bytes),
     })
 }
 
@@ -5168,3 +5172,46 @@ mod qualified_source_tests {
 
 #[cfg(test)]
 mod recovery_reliability_tests;
+
+#[cfg(test)]
+mod bounded_local_preview_tests {
+    use super::*;
+    #[tokio::test]
+    async fn large_sparse_file_preview_preserves_total_size_prefix_and_truncation() {
+        let root = std::env::temp_dir().join(format!("me-preview-{}", Uuid::new_v4()));
+        std::fs::create_dir(&root).unwrap();
+        let path = root.join("large.bin");
+        std::fs::write(&path, b"abc").unwrap();
+        File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_len(3 * 1024 * 1024 * 1024)
+            .unwrap();
+        let result = read_local_kernsight_evidence_file(
+            root.to_string_lossy().into_owned(),
+            "com.example.app".into(),
+            "large.bin".into(),
+            3,
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.bytes, 3 * 1024 * 1024 * 1024);
+        assert!(result.truncated);
+        assert_eq!(result.content, "YWJj");
+        assert_eq!(result.encoding, "base64");
+        std::fs::write(root.join("small.bin"), b"abc").unwrap();
+        let result = read_local_kernsight_evidence_file(
+            root.to_string_lossy().into_owned(),
+            "com.example.app".into(),
+            "small.bin".into(),
+            10,
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.bytes, 3);
+        assert!(!result.truncated);
+        assert_eq!(result.content, "YWJj");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+}
