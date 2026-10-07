@@ -12,7 +12,7 @@
     "preview": "vite preview",
     "tauri": "tauri",
     "test:kernsight-plan": "node --test tests/kernsightCapturePlan.test.mjs",
-    "test:kernsight-evidence": "node --test tests/kernsightCapturePlan.test.mjs tests/kernsightCaptureGroups.test.mjs tests/kernsightMemoryEvidence.test.mjs tests/kernsightCodeEvidence.test.mjs tests/kernsightWorkspaceState.test.mjs tests/kernsightCaptureRunner.test.mjs"
+    "test:kernsight-evidence": "node --test tests/kernsightCapturePlan.test.mjs tests/kernsightCaptureGroups.test.mjs tests/kernsightMemoryEvidence.test.mjs tests/kernsightCodeEvidence.test.mjs tests/kernsightWorkspaceState.test.mjs tests/kernsightCaptureRunner.test.mjs tests/kernsightCaptureDiagnostics.test.mjs"
   },
   "dependencies": {
     "@tauri-apps/api": "2.9.1",

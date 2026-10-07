@@ -417,12 +417,39 @@ export interface KernSightPackageDumpReport {
 }
 
 export interface KernSightCaptureRelation {parentId:string;stageId:string;attemptId:string;attempt:number;stageKey:string}
+export interface KernSightCaptureDiagnostic {
+  schema: 'mobilee.capture-diagnostic/v1'
+  source: 'remote_lifecycle' | 'stderr' | 'stdout' | null
+  record: Record<string, unknown> | null
+  errorExcerpt: string | null
+  stdoutBytes: number | null
+  stderrBytes: number | null
+  rawTailTruncated: boolean
+  errorExcerptTruncated: boolean
+  structuredRecordOmitted: boolean
+}
+export interface KernSightCaptureAttempt {
+  relation: KernSightCaptureRelation
+  state: string
+  startedUnixMs: number
+  finishedUnixMs: number | null
+  sessionId: string | null
+  error: string | null
+  diagnosticTail?: string | null
+  captureDiagnostic?: KernSightCaptureDiagnostic | null
+  remoteArtifactRoot: string | null
+  remoteLifecycle?: Record<string, unknown> | null
+  processInstances: Array<Record<string, unknown>>
+  observationError: string | null
+  omittedProcessInstances: number
+  stageRecords: Array<Record<string, unknown>>
+}
 export interface KernSightCaptureGroup {
   budget?:{schema:string;limits:{totalBytes:number;maxSeconds:number};deadlineUnixMs:number;reservations:Array<{id:string;kind:string;reservedBytes:number;chargedBytes:number|null;status:string}>}|null
   schema:'mobilee.capture-group/v1';id:string;serial:string;package:string;createdUnixMs:number;cancelRequested:boolean;
   state:string;unified?:boolean;base:Record<string,unknown>;
   stages:Array<{id:string;key:string;mode:string;durationSeconds:number;launchAfterAttach:boolean;required:boolean;
-    attempts:Array<{relation:KernSightCaptureRelation;state:string;startedUnixMs:number;finishedUnixMs:number|null;sessionId:string|null;error:string|null;diagnosticTail?:string|null;remoteArtifactRoot:string|null;remoteLifecycle?:Record<string,unknown>|null;processInstances:Array<Record<string,unknown>>;observationError:string|null;omittedProcessInstances:number;stageRecords:Array<Record<string,unknown>>}>}>
+    attempts:KernSightCaptureAttempt[]}>
 }
 export interface KernSightGroupStageResult {group:KernSightCaptureGroup;result:KernSightCaptureResult|null;error:string|null;continueAfterPartial?:boolean}
 

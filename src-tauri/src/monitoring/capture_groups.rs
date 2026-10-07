@@ -3,6 +3,7 @@ use super::*;
 use std::sync::{Mutex, OnceLock};
 use tauri::Manager;
 
+mod diagnostics;
 pub mod trash;
 
 const SCHEMA: &str = "mobilee.capture-group/v1";
@@ -31,6 +32,8 @@ pub struct Attempt {
     /// Bounded display-only output, kept separate from policy-classified errors.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub diagnostic_tail: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capture_diagnostic: Option<diagnostics::CaptureDiagnostic>,
     pub remote_artifact_root: Option<String>,
     #[serde(default)]
     pub process_instances: Vec<Value>,
@@ -351,6 +354,7 @@ impl Group {
             session_id: None,
             error: None,
             diagnostic_tail: None,
+            capture_diagnostic: None,
             remote_artifact_root: None,
             process_instances: vec![],
             observation_error: None,
@@ -670,6 +674,7 @@ fn capture_diagnostic_tail(result: &KernSightCaptureResult) -> Option<String> {
 fn retain_capture_diagnostic(attempt: &mut Attempt, result: Option<&KernSightCaptureResult>) {
     if !matches!(attempt.state.as_str(), "running" | "succeeded") {
         attempt.diagnostic_tail = result.and_then(capture_diagnostic_tail);
+        attempt.capture_diagnostic = diagnostics::collect(attempt, result);
     }
 }
 
@@ -1016,6 +1021,8 @@ mod tests {
         assert_eq!(retry.attempt, 2);
         assert_eq!(restored.stages[0].attempts[0].state, "failed");
         assert!(restored.stages[0].attempts[0].diagnostic_tail.is_some());
+        assert!(restored.stages[0].attempts[0].capture_diagnostic.is_some());
+        assert!(restored.stages[0].attempts[1].capture_diagnostic.is_none());
         assert!(restored.stages[0].attempts[1].diagnostic_tail.is_none());
         std::fs::remove_dir_all(root).unwrap();
     }
@@ -1735,6 +1742,7 @@ impl Group {
                 session_id: None,
                 error: None,
                 diagnostic_tail: None,
+                capture_diagnostic: None,
                 remote_artifact_root: None,
                 process_instances: vec![],
                 observation_error: None,
@@ -2245,6 +2253,7 @@ mod source_relation_tests {
                     session_id: Some(id),
                     error: None,
                     diagnostic_tail: None,
+                    capture_diagnostic: None,
                     remote_artifact_root: None,
                     process_instances: vec![],
                     observation_error: None,

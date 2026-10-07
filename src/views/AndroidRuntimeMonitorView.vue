@@ -217,7 +217,7 @@
               <small v-if="stage.launchAfterAttach">{{ startupEvidenceLabel(attempt.remoteLifecycle) }}</small>
               <small>{{ qualifiedSourceLabel(attempt.remoteLifecycle) }}</small></details>
               <p v-if="attempt.error" class="ks-attempt-error">{{ attempt.error }}</p>
-              <details v-if="attempt.diagnosticTail" class="ks-attempt-diagnostics"><summary>失败诊断 · 原始输出尾部</summary><pre>{{ attempt.diagnosticTail }}</pre></details>
+              <KernSightCaptureDiagnostics :group="group" :attempt="attempt" />
             </div>
           </article>
           <div class="ks-group-actions"><button v-if="captureGroups.some(item => item.id === group.id && item.serial === device?.serial) && !group.cancelRequested && runningCaptureGroup !== group.id && group.state!=='succeeded' && group.state!=='running'" class="ghost-button" :disabled="captureRunning" @click="resumeCaptureGroup(group)">继续 / 重试未成功阶段</button>
@@ -476,6 +476,7 @@ import { mergeCaptureGroups,groupSessionIds,captureGroupEdges,captureGroupCanTra
 import { packageEvidenceReports, importedSessionId, bundleForSession, linkedEvidenceMatches, createLatestRequest, createKeyedRequests, evidenceCountLabel, executionStatusLabel } from '../services/kernsightWorkspaceState'
 import { memoryCounterLabel, memoryEvidenceLabel } from '../services/kernsightMemoryEvidence'
 import KernSightDexIndex from '@/components/KernSightDexIndex.vue'
+import KernSightCaptureDiagnostics from '@/components/KernSightCaptureDiagnostics.vue'
 import { verifiedDexObjectCount, indexedElfModuleCount, indexedDexCount, runtimeDexClassMatches, elfLoadCoverageLabel, codeEvidenceLabel, allocatedEvidenceLabel, ownershipEvidenceEntries, codeNoiseLayers, archiveCoverageLabel, dexScanSummary, dexScanSummaryForObject, fileScanLabel } from '../services/kernsightCodeEvidence'
 import { buildAutoCaptureStages, captureCodeOnlyChoice, startupEvidenceLabel, qualifiedSourceLabel, type AutoStageReceipt } from '@/services/kernsightCapturePlan'
 import { computed, markRaw, nextTick, onErrorCaptured, onBeforeUnmount, onMounted, reactive, ref, shallowRef, watch } from 'vue'
