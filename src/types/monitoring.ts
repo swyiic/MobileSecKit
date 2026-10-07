@@ -425,3 +425,8 @@ export interface KernSightCaptureGroup {
     attempts:Array<{relation:KernSightCaptureRelation;state:string;startedUnixMs:number;finishedUnixMs:number|null;sessionId:string|null;error:string|null;diagnosticTail?:string|null;remoteArtifactRoot:string|null;remoteLifecycle?:Record<string,unknown>|null;processInstances:Array<Record<string,unknown>>;observationError:string|null;omittedProcessInstances:number;stageRecords:Array<Record<string,unknown>>}>}>
 }
 export interface KernSightGroupStageResult {group:KernSightCaptureGroup;result:KernSightCaptureResult|null;error:string|null;continueAfterPartial?:boolean}
+
+export interface KernSightCaptureGroupTrash {
+  schema: 'mobilee.capture-group-trash/v1'; group: KernSightCaptureGroup;
+  trashedUnixMs: number; managed: boolean; trashed?: boolean; retainedSessionIds?: string[]; importedRoots: string[];
+}

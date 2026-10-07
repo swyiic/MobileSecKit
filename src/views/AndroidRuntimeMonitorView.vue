@@ -178,22 +178,32 @@
     </section>
 
     <section v-if="workspaceMode === 'evidence'" class="panel ks-session-panel">
-      <div class="section-title compact"><div><div class="eyebrow">L0 / L1 SESSION</div><h2>{{ sessionMatchedPackage ? `${sessionMatchedPackage} · 会话链` : 'KernSight 会话' }}</h2><p>一次自动采集显示一个主会话，展开实际阶段与所有 attempts；无父 ID 的旧记录独立为 legacy，不按包名合并。</p></div><div class="ks-title-actions"><button v-if="selectedSession || selectedReport" class="ghost-button" title="只关闭当前详情，不删除任何数据" @click="clearCurrentSession">关闭详情</button><span class="device-chip">{{ visibleCaptureGroups.length + visibleLocalSessionBundles.length + legacyDeviceSessions.length }} SESSIONS</span></div></div>
+      <div class="section-title compact"><div><div class="eyebrow">L0 / L1 SESSION</div><h2>{{ sessionMatchedPackage ? `${sessionMatchedPackage} · 会话链` : 'KernSight 会话' }}</h2><p>一次自动采集显示一个主会话，展开实际阶段与所有 attempts；无父 ID 的旧记录独立为 legacy，不按包名合并。</p></div><div class="ks-title-actions"><button class="ghost-button" :disabled="Boolean(changingTrashGroup)" @click="loadLocalCaptureGroups">刷新本地记录</button><button v-if="selectedSession || selectedReport" class="ghost-button" title="只关闭当前详情，不删除任何数据" @click="clearCurrentSession">关闭详情</button><span class="device-chip">{{ visibleCaptureGroups.length + visibleLocalSessionBundles.length + legacyDeviceSessions.length }} SESSIONS</span></div></div>
       <p v-if="captureRunning && lastCaptureGroupId" class="ks-capture-status" role="status">自动采集进行中 · {{ capturePhase || '正在准备' }} · {{ captureElapsed }}s。可以查看已有证据，采集不会因切换页面而中断。</p>
+      <p v-if="!localOwnershipConfirmed" class="ks-trash-message" role="status">本地主会话归属尚未确认，暂不显示旧会话删除入口；可重试“刷新本地记录”。</p>
+      <p v-if="trashMessage" class="ks-trash-message" role="status">{{ trashMessage }}</p>
+      <details v-if="trashedCaptureGroups.length" class="ks-group-trash">
+        <summary>主会话回收站 · {{ trashedCaptureGroups.length }}</summary>
+        <p>这里只移除会话列表记录，可恢复。原始证据、导入目录与设备文件保留，不释放磁盘空间。</p>
+        <article v-for="entry in trashedCaptureGroups" :key="entry.group.id">
+          <span>{{ entry.group.package }} · {{ shortSession(entry.group.id) }} · {{ captureStateLabel(entry.group.state) }} · {{ formatDate(entry.trashedUnixMs) }}</span>
+          <button class="ghost-button" :disabled="Boolean(changingTrashGroup)" @click="restoreCaptureGroup(entry)">{{ changingTrashGroup === entry.group.id ? '处理中…' : '恢复主会话' }}</button>
+        </article>
+      </details>
       <div class="ks-session-list">
         <details v-for="group in visibleCaptureGroups" :key="group.id" class="ks-session-row ks-capture-group" :open="selectedCaptureGroup===group.id">
-          <summary @click.prevent="toggleCaptureGroup(group.id)"><strong>{{ group.package }}</strong><span class="ks-group-meta">{{ shortSession(group.id) }} · {{ formatDate(group.createdUnixMs) }} · {{ group.unified ? '统一阶段' : '启动重采' }} · 主会话</span><b :class="`state-${group.state}`">{{ runningCaptureGroup === group.id ? '自动执行中' : captureStateLabel(group.state) }}</b></summary>
+          <summary @click.prevent="toggleCaptureGroup(group.id)"><strong>{{ group.package }}</strong><span class="ks-group-meta">{{ shortSession(group.id) }} · {{ formatDate(group.createdUnixMs) }} · {{ group.unified ? '统一阶段' : '启动重采' }} · 主会话 · {{ group.serial }}</span><b :class="`state-${group.state}`">{{ runningCaptureGroup === group.id ? '自动执行中' : captureStateLabel(group.state) }}</b></summary>
           <details class="ks-group-budget"><summary>预算与采集边界</summary>
           <p class="muted">{{ group.budget ? `会话写入预算 ${formatBytes(group.budget.limits.totalBytes)} · 期限 ${group.budget.limits.maxSeconds}s · 预留 ${group.budget.reservations.length} 个输出操作；计量为写入准入 + 终态预留，物理占用见本地统计` : '旧会话预算 / 采集范围未知，不视为完整或受限成功' }}</p>
           <small v-for="operation in group.budget?.reservations || []" :key="operation.id">{{ operation.kind }} · {{ operation.status }} · 预留 {{ formatBytes(operation.reservedBytes) }} · 准入与终态预留 {{ operation.chargedBytes==null ? '未知' : formatBytes(operation.chargedBytes) }}</small>
           <p>预算累计写入准入及终态预留；读取不计入此计量。唯一内容、传输量和磁盘峰值另核算。有效 partial 归档仅保存已收到路径，不补齐缺页或失败字节。</p>
           <p>{{ group.unified ? '统一阶段按生产者记录核对同一进程实例。' : '启动重采各阶段属于不同进程实例。' }}未拉取时唯一内容/物理占用未知，执行成功不等于数据覆盖完整。</p></details>
-          <p v-for="item in importedCaptureGroups.filter(i=>i.group.id===group.id)" :key="item.bundle.root">本次导入树：逻辑 {{ formatMaybeBytes(groupLedger(item.bundle)?.logical_file_bytes) }} · 唯一 inode {{ groupLedger(item.bundle)?.unique_inode_bytes==null?'未知':formatBytes(Number(groupLedger(item.bundle)?.unique_inode_bytes)) }} · 实际分配 {{ allocatedEvidenceLabel(groupLedger(item.bundle)?.allocated_bytes) }} · 已核验代码唯一 {{ formatMaybeBytes(groupLedger(item.bundle)?.verified_code_unique_bytes) }}（其余内容未核验）；归档范围 {{ archiveCoverageLabel(item.bundle.dumpReport.mobilee_archive_coverage) }}；{{ item.bundle.sessionReport?.mobilee_capture_source_status || '来源状态未知' }} · 传输 {{ item.bundle.dumpReport.mobilee_transport_status ? 'partial（收到的目录不完整，归档可能未生成）' : '无 partial 终态记录；完整性另按预算与源清单核对' }}</p>
-          <p v-for="item in importedCaptureGroups.filter(i=>i.group.id===group.id)" :key="`open-${item.bundle.root}`"><button class="ghost-button" @click="loadLocalBundleSession(item.bundle)">打开本次导入的主会话报告</button><small>{{ item.bundle.root }}</small></p>
-          <KernSightDexIndex v-for="item in importedCaptureGroups.filter(i=>i.group.id===group.id)" :key="`classes-${item.bundle.root}`" :dump="item.bundle.dumpReport" />
-          <details v-for="item in importedCaptureGroups.filter(i=>i.group.id===group.id)" :key="`elf-${item.bundle.root}`"><summary>ELF 加载段覆盖（不是完整 SO 文件）</summary><p v-if="!groupLedger(item.bundle)?.elf_module_observations?.length">旧数据或未验证加载段：解析与覆盖未知。</p><article v-for="module in groupLedger(item.bundle)?.elf_module_observations || []" :key="`${module.source_report}:${module.path}`"><p>{{ module.path }} · PID {{ module.source?.pid ?? '未知' }} / birth {{ module.source?.birth_ns ?? '未知' }} · {{ module.source_report }}</p><p>PT_LOAD 文件部分：{{ elfLoadCoverageLabel(module.all_load_file_bytes_covered) }} · 内存部分（含 BSS）：{{ elfLoadCoverageLabel(module.all_load_memory_bytes_covered) }} · 完整 SO 未重建 · live/torn · 业务/SDK 归属未知</p><p>文件偏移关联由保留的 ELF 头推导，原 maps 未记录文件偏移；未补缺失节表、重定位或未读字节。</p><div v-if="module.segments?.length" class="ks-range-table" role="region" aria-label="ELF 加载段范围，可横向滚动" tabindex="0"><table><thead><tr><th>文件偏移</th><th>虚拟地址</th><th>文件字节</th><th>内存字节</th><th>文件缺口</th><th>内存缺口</th></tr></thead><tbody><tr v-for="(segment,index) in module.segments" :key="index"><td>{{ segment.file_offset }}</td><td>{{ segment.virtual_start }}</td><td>{{ segment.file_bytes }}</td><td>{{ segment.memory_bytes }}</td><td>{{ Array.isArray(segment.file_backed_gaps) ? (segment.file_backed_gaps.length ? segment.file_backed_gaps : '无（列示范围）') : '未知（缺字段）' }}</td><td>{{ Array.isArray(segment.memory_gaps) ? (segment.memory_gaps.length ? segment.memory_gaps : '无（列示范围）') : '未知（缺字段）' }}</td></tr></tbody></table></div><details><summary>原始范围、hash 与派生偏移链</summary><pre>{{ module }}</pre></details></article></details>
-          <details v-for="item in importedCaptureGroups.filter(i=>i.group.id===group.id)" :key="`source-diagnostics-${item.bundle.root}`"><summary>运行时来源记录诊断</summary><p v-if="!groupLedger(item.bundle)?.runtime_source_diagnostics">旧数据：逐来源诊断未知。</p><p>来源上限 {{ groupLedger(item.bundle)?.runtime_source_limit ?? '未知' }} · 未处理来源 {{ groupLedger(item.bundle)?.runtime_sources_omitted ?? '未知' }}</p><pre>{{ groupLedger(item.bundle)?.runtime_source_diagnostics }}</pre></details>
-          <details v-for="item in importedCaptureGroups.filter(i=>i.group.id===group.id)" :key="`runtime-${item.bundle.root}`"><summary>运行时代码范围（不代表完整 DEX/SO 或总覆盖率）</summary><p v-if="!groupLedger(item.bundle)?.runtime_observations?.length">旧数据或无范围记录：已提取、解析与来源状态未知。</p><article v-for="(range,index) in groupLedger(item.bundle)?.runtime_observations || []" :key="index"><p>{{ range.mapping?.path || '映射来源未知' }} · PID {{ range.source?.pid ?? '未知' }} / birth {{ range.source?.birth_ns ?? '未知' }} / exec {{ range.source?.exec_id ?? '未知' }} · {{ range.source_identity_status }}</p><p>请求 {{ range.read?.requested_length ?? '未知' }} B · 实际读 {{ range.read?.actual_length ?? '未知' }} B · 留存 {{ range.retained_file_bytes ?? '未知' }} B · {{ range.local_content_status }} · 映射完整 {{ range.mapping_complete == null ? '未知' : range.mapping_complete ? '是' : '否' }} · torn {{ range.read?.torn == null ? '未知' : range.read.torn ? '是' : '否' }}</p><p>映射 {{ range.requested_mapping_bytes ?? '未知' }} B · 选区 {{ range.selection_limit_bytes ?? '未知' }} B · 选区原因 {{ range.selection_limit_reason || '未知（旧数据缺字段）' }}；预算截断选区不等于读取失败。</p><p>读取 {{ range.read?.read_status || '未知' }} · 落盘 {{ range.read?.write_status || '未知' }} · 解析 {{ range.parse_status }} · 分类 {{ range.ownership }} · {{ range.relative_path }} · {{ range.source_report }}</p><p>派生关联：{{ range.derived == null ? '未知（缺字段）' : range.derived.length ? '原生产者记录，未在此范围核验语义' : '未记录提取 DEX/SO 的关联' }}</p><pre v-if="range.derived?.length">{{ range.derived }}</pre><p>本地对象检查：{{ dexScanSummary(range.object_inspection) }} · DEX 候选 {{ range.object_inspection?.dex_magic_count ?? '未知' }} · ELF 标记（未验证为完整对象）{{ range.object_inspection?.elf_magic_count ?? '未知' }}；文件总字节和 DEX 扫描范围分开，提前停止不表示扫过整个文件。</p><pre v-if="range.object_inspection?.derived_objects?.length || range.object_inspection?.rejected_candidates?.length">{{ range.object_inspection }}</pre></article></details>
+          <p v-for="item in visibleImportedCaptureGroups.filter(i=>i.group.id===group.id)" :key="item.bundle.root">本次导入树：逻辑 {{ formatMaybeBytes(groupLedger(item.bundle)?.logical_file_bytes) }} · 唯一 inode {{ groupLedger(item.bundle)?.unique_inode_bytes==null?'未知':formatBytes(Number(groupLedger(item.bundle)?.unique_inode_bytes)) }} · 实际分配 {{ allocatedEvidenceLabel(groupLedger(item.bundle)?.allocated_bytes) }} · 已核验代码唯一 {{ formatMaybeBytes(groupLedger(item.bundle)?.verified_code_unique_bytes) }}（其余内容未核验）；归档范围 {{ archiveCoverageLabel(item.bundle.dumpReport.mobilee_archive_coverage) }}；{{ item.bundle.sessionReport?.mobilee_capture_source_status || '来源状态未知' }} · 传输 {{ item.bundle.dumpReport.mobilee_transport_status ? 'partial（收到的目录不完整，归档可能未生成）' : '无 partial 终态记录；完整性另按预算与源清单核对' }}</p>
+          <p v-for="item in visibleImportedCaptureGroups.filter(i=>i.group.id===group.id)" :key="`open-${item.bundle.root}`"><button class="ghost-button" @click="loadLocalBundleSession(item.bundle)">打开本次导入的主会话报告</button><small>{{ item.bundle.root }}</small></p>
+          <KernSightDexIndex v-for="item in visibleImportedCaptureGroups.filter(i=>i.group.id===group.id)" :key="`classes-${item.bundle.root}`" :dump="item.bundle.dumpReport" />
+          <details v-for="item in visibleImportedCaptureGroups.filter(i=>i.group.id===group.id)" :key="`elf-${item.bundle.root}`"><summary>ELF 加载段覆盖（不是完整 SO 文件）</summary><p v-if="!groupLedger(item.bundle)?.elf_module_observations?.length">旧数据或未验证加载段：解析与覆盖未知。</p><article v-for="module in groupLedger(item.bundle)?.elf_module_observations || []" :key="`${module.source_report}:${module.path}`"><p>{{ module.path }} · PID {{ module.source?.pid ?? '未知' }} / birth {{ module.source?.birth_ns ?? '未知' }} · {{ module.source_report }}</p><p>PT_LOAD 文件部分：{{ elfLoadCoverageLabel(module.all_load_file_bytes_covered) }} · 内存部分（含 BSS）：{{ elfLoadCoverageLabel(module.all_load_memory_bytes_covered) }} · 完整 SO 未重建 · live/torn · 业务/SDK 归属未知</p><p>文件偏移关联由保留的 ELF 头推导，原 maps 未记录文件偏移；未补缺失节表、重定位或未读字节。</p><div v-if="module.segments?.length" class="ks-range-table" role="region" aria-label="ELF 加载段范围，可横向滚动" tabindex="0"><table><thead><tr><th>文件偏移</th><th>虚拟地址</th><th>文件字节</th><th>内存字节</th><th>文件缺口</th><th>内存缺口</th></tr></thead><tbody><tr v-for="(segment,index) in module.segments" :key="index"><td>{{ segment.file_offset }}</td><td>{{ segment.virtual_start }}</td><td>{{ segment.file_bytes }}</td><td>{{ segment.memory_bytes }}</td><td>{{ Array.isArray(segment.file_backed_gaps) ? (segment.file_backed_gaps.length ? segment.file_backed_gaps : '无（列示范围）') : '未知（缺字段）' }}</td><td>{{ Array.isArray(segment.memory_gaps) ? (segment.memory_gaps.length ? segment.memory_gaps : '无（列示范围）') : '未知（缺字段）' }}</td></tr></tbody></table></div><details><summary>原始范围、hash 与派生偏移链</summary><pre>{{ module }}</pre></details></article></details>
+          <details v-for="item in visibleImportedCaptureGroups.filter(i=>i.group.id===group.id)" :key="`source-diagnostics-${item.bundle.root}`"><summary>运行时来源记录诊断</summary><p v-if="!groupLedger(item.bundle)?.runtime_source_diagnostics">旧数据：逐来源诊断未知。</p><p>来源上限 {{ groupLedger(item.bundle)?.runtime_source_limit ?? '未知' }} · 未处理来源 {{ groupLedger(item.bundle)?.runtime_sources_omitted ?? '未知' }}</p><pre>{{ groupLedger(item.bundle)?.runtime_source_diagnostics }}</pre></details>
+          <details v-for="item in visibleImportedCaptureGroups.filter(i=>i.group.id===group.id)" :key="`runtime-${item.bundle.root}`"><summary>运行时代码范围（不代表完整 DEX/SO 或总覆盖率）</summary><p v-if="!groupLedger(item.bundle)?.runtime_observations?.length">旧数据或无范围记录：已提取、解析与来源状态未知。</p><article v-for="(range,index) in groupLedger(item.bundle)?.runtime_observations || []" :key="index"><p>{{ range.mapping?.path || '映射来源未知' }} · PID {{ range.source?.pid ?? '未知' }} / birth {{ range.source?.birth_ns ?? '未知' }} / exec {{ range.source?.exec_id ?? '未知' }} · {{ range.source_identity_status }}</p><p>请求 {{ range.read?.requested_length ?? '未知' }} B · 实际读 {{ range.read?.actual_length ?? '未知' }} B · 留存 {{ range.retained_file_bytes ?? '未知' }} B · {{ range.local_content_status }} · 映射完整 {{ range.mapping_complete == null ? '未知' : range.mapping_complete ? '是' : '否' }} · torn {{ range.read?.torn == null ? '未知' : range.read.torn ? '是' : '否' }}</p><p>映射 {{ range.requested_mapping_bytes ?? '未知' }} B · 选区 {{ range.selection_limit_bytes ?? '未知' }} B · 选区原因 {{ range.selection_limit_reason || '未知（旧数据缺字段）' }}；预算截断选区不等于读取失败。</p><p>读取 {{ range.read?.read_status || '未知' }} · 落盘 {{ range.read?.write_status || '未知' }} · 解析 {{ range.parse_status }} · 分类 {{ range.ownership }} · {{ range.relative_path }} · {{ range.source_report }}</p><p>派生关联：{{ range.derived == null ? '未知（缺字段）' : range.derived.length ? '原生产者记录，未在此范围核验语义' : '未记录提取 DEX/SO 的关联' }}</p><pre v-if="range.derived?.length">{{ range.derived }}</pre><p>本地对象检查：{{ dexScanSummary(range.object_inspection) }} · DEX 候选 {{ range.object_inspection?.dex_magic_count ?? '未知' }} · ELF 标记（未验证为完整对象）{{ range.object_inspection?.elf_magic_count ?? '未知' }}；文件总字节和 DEX 扫描范围分开，提前停止不表示扫过整个文件。</p><pre v-if="range.object_inspection?.derived_objects?.length || range.object_inspection?.rejected_candidates?.length">{{ range.object_inspection }}</pre></article></details>
           <article v-for="stage in group.stages" :key="stage.id" class="ks-group-stage">
             <header><strong>{{ captureStageLabel(stage.key) }}</strong><b :class="`state-${stage.attempts[stage.attempts.length - 1]?.state || 'planned'}`">{{ captureStateLabel(stage.attempts[stage.attempts.length - 1]?.state || 'planned') }}</b></header>
             <small>{{ stage.mode }} · {{ stage.launchAfterAttach ? '冷启动' : '驻留' }}{{ stage.durationSeconds ? ` · ${stage.durationSeconds}s` : '' }} · {{ stage.required ? '必需阶段' : '可选阶段' }}</small>
@@ -212,7 +222,13 @@
           </article>
           <div class="ks-group-actions"><button v-if="captureGroups.some(item => item.id === group.id && item.serial === device?.serial) && !group.cancelRequested && runningCaptureGroup !== group.id && group.state!=='succeeded' && group.state!=='running'" class="ghost-button" :disabled="captureRunning" @click="resumeCaptureGroup(group)">继续 / 重试未成功阶段</button>
           <button v-if="!group.cancelRequested && (runningCaptureGroup === group.id || group.state === 'running') && captureGroups.some(item => item.id === group.id && item.serial === device?.serial)" class="ghost-button" @click="cancelCaptureGroup(group)">请求取消（当前阶段封存后停止）</button><span v-if="group.cancelRequested && runningCaptureGroup === group.id" class="ks-form-help" role="status">已请求取消，正在等待当前阶段封存</span>
-          <button v-if="group.stages.some(s=>s.key==='dump'&&['succeeded','partial','failed'].includes(s.attempts[s.attempts.length-1]?.state||'')) && captureGroups.some(g=>g.id===group.id)" class="ghost-button" :disabled="pullingPackage" @click="pullCaptureGroup(group)">拉取本次主会话全部信息</button></div>
+          <button v-if="group.stages.some(s=>s.key==='dump'&&['succeeded','partial','failed'].includes(s.attempts[s.attempts.length-1]?.state||'')) && captureGroups.some(g=>g.id===group.id && g.serial===device?.serial)" class="ghost-button" :disabled="pullingPackage" @click="pullCaptureGroup(group)">拉取本次主会话全部信息</button>
+          <template v-if="pendingTrashGroup === group.id">
+            <p class="ks-trash-confirm">将此主会话及已打开的同次导入记录移入回收站？子会话归属与原始证据保留，可恢复；不会释放设备或本地空间。</p>
+            <button class="ghost-button" :disabled="Boolean(changingTrashGroup)" @click="pendingTrashGroup = ''">取消移除</button>
+            <button class="ghost-button danger-button" :disabled="!canTrashCaptureGroup(group)" @click="confirmTrashCaptureGroup(group)">确认移入回收站</button>
+          </template>
+          <button v-else class="ghost-button danger-button" :disabled="!canTrashCaptureGroup(group)" :title="canTrashCaptureGroup(group) ? '移除列表记录，可从回收站恢复；不释放磁盘空间' : '采集或拉取期间不可移除，请等待封存'" @click="pendingTrashGroup = group.id">移入回收站</button></div>
         </details>
         <article v-for="session in legacyDeviceSessions" :key="session.session_id" class="ks-session-row" :class="{ active: selectedSession === session.session_id, 'pending-delete': pendingDeleteSession === session.session_id }">
           <button class="ks-session-open" :disabled="loadingReport || deletingSession === session.session_id" @click="loadSessionReport(session.session_id)">
@@ -456,7 +472,7 @@
 
 <script setup lang="ts">
 import { runCaptureGroupPlan, mergeCaptureResults, captureStateLabel, captureStageLabel, latestGroupSession } from '@/services/kernsightCaptureRunner'
-import { mergeCaptureGroups,groupSessionIds,captureGroupEdges } from '../services/kernsightCaptureGroups'
+import { mergeCaptureGroups,groupSessionIds,captureGroupEdges,captureGroupCanTrash,captureGroupImportIsTrashed } from '../services/kernsightCaptureGroups'
 import { packageEvidenceReports, importedSessionId, bundleForSession, linkedEvidenceMatches, createLatestRequest, createKeyedRequests, evidenceCountLabel, executionStatusLabel } from '../services/kernsightWorkspaceState'
 import { memoryCounterLabel, memoryEvidenceLabel } from '../services/kernsightMemoryEvidence'
 import KernSightDexIndex from '@/components/KernSightDexIndex.vue'
@@ -474,6 +490,7 @@ import type {
   DeviceSummary,
   KernSightOverview,
   KernSightCaptureGroup,
+  KernSightCaptureGroupTrash,
   KernSightProvisionResult,
   KernSightCaptureRequest,
   KernSightCaptureResult,
@@ -491,13 +508,22 @@ const emit = defineEmits<{ 'open-devices': []; 'open-ai': []; 'show-evidence': [
 const captureGroups=ref<KernSightCaptureGroup[]>([])
 const selectedCaptureGroup=ref('')
 const runningCaptureGroup=ref('')
-const groupedSessionIds=computed(()=>groupSessionIds(visibleCaptureGroups.value))
-const legacyDeviceSessions=computed(()=>kernSight.value?.sessions.filter(s=>!groupedSessionIds.value.has(s.session_id))||[])
+const captureGroupTrash = ref<KernSightCaptureGroupTrash[]>([])
+const trashedCaptureGroups = computed(() => captureGroupTrash.value.filter(entry => entry.trashed !== false))
+const pendingTrashGroup = ref('')
+const changingTrashGroup = ref('')
+const trashMessage = ref('')
+const localGroupsRequests = createLatestRequest()
+const localOwnershipConfirmed = ref(false)
+const knownCaptureGroups = computed(() => [...captureGroups.value, ...importedCaptureGroups.value.map(item => item.group), ...captureGroupTrash.value.map(entry => entry.group)])
+const groupedSessionIds=computed(()=>new Set([...groupSessionIds(knownCaptureGroups.value), ...captureGroupTrash.value.flatMap(entry => entry.retainedSessionIds || [])]))
+const legacyDeviceSessions=computed(()=>localOwnershipConfirmed.value ? kernSight.value?.sessions.filter(s=>!groupedSessionIds.value.has(s.session_id))||[] : [])
 const importedCaptureGroups=computed(()=>localEvidenceBundles.value.flatMap(bundle=>{
   const g=bundle.sessionReport?.mobilee_capture_group as KernSightCaptureGroup|undefined
   return g?.schema==='mobilee.capture-group/v1'?[{group:g,bundle}]:[]
 }))
-const visibleCaptureGroups=computed(()=>mergeCaptureGroups(captureGroups.value,importedCaptureGroups.value.map(i=>i.group)))
+const visibleImportedCaptureGroups = computed(() => importedCaptureGroups.value.filter(item => !captureGroupImportIsTrashed(item.group, item.bundle.root, captureGroupTrash.value)))
+const visibleCaptureGroups=computed(()=>mergeCaptureGroups(captureGroups.value.filter(group => !trashedCaptureGroups.value.some(entry => entry.managed && entry.group.id === group.id)),visibleImportedCaptureGroups.value.map(i=>i.group)))
 const capabilityProbe = ref<AndroidMonitorCapabilityProbe | null>(null)
 const probing = ref(false)
 const provisioning = ref(false)
@@ -512,6 +538,7 @@ const selectedReport = shallowRef<KernSightSessionReportDocument | null>(null)
 const selectedSession = ref('')
 const sessionMatchedPackage = ref('')
 const sessionSourceRoot = ref('')
+const sessionRequestedGroup = shallowRef<Pick<KernSightCaptureGroup, 'id' | 'serial' | 'package'> | null>(null)
 const sessionRequests = createLatestRequest()
 const evidenceRequests = createLatestRequest()
 const overviewRequests = createLatestRequest()
@@ -1302,25 +1329,23 @@ async function provisionKernSight() {
 }
 
 async function loadKernSight() {
+  void loadLocalCaptureGroups()
   if (!androidReady.value || !props.device) return
   const request = overviewRequests.begin()
   const serial = props.device.serial
   loadingKernSight.value = true
   probeError.value = ''
   try {
-    const [overview, dumps, groups] = await Promise.all([
+    const [overview, dumps] = await Promise.all([
       monitoringBackend.kernSightOverview(serial),
       monitoringBackend.kernSightPackageDumps(serial),
-      monitoringBackend.listKernSightGroups(serial),
     ])
     if (!overviewRequests.isCurrent(request) || props.device?.serial !== serial) return
-    captureGroups.value=groups
     kernSight.value = overview
     devicePackageDumps.value = dumps.map(dump => markRaw(dump))
     devicePackageNames.value = new Set(dumps.map(dump => dump.package))
   } catch (error) {
     if (!overviewRequests.isCurrent(request)) return
-    captureGroups.value = []
     kernSight.value = null
     devicePackageDumps.value = []
     devicePackageNames.value = new Set()
@@ -1352,6 +1377,7 @@ async function importEvidenceDirectory(path?: string) {
 }
 
 onMounted(() => {
+  void loadLocalCaptureGroups()
   let started = false
   void listen<string>('me-import-directory', (event) => {
     if (started || !event.payload) return
@@ -1488,6 +1514,7 @@ function clearCurrentSession() {
   plaintextDecodeRequests.invalidate()
   loadingReport.value = false
   sessionSourceRoot.value = ''
+  sessionRequestedGroup.value = null
   selectedReport.value = null
   selectedSession.value = ''
   sessionMatchedPackage.value = ''
@@ -1496,13 +1523,82 @@ function clearCurrentSession() {
   aiCopied.value = false
 }
 
+async function loadLocalCaptureGroups() {
+  const request = localGroupsRequests.begin()
+  localOwnershipConfirmed.value = false
+  pendingDeleteSession.value = ''
+  try {
+    const [groups, trash] = await Promise.all([monitoringBackend.listKernSightGroups(), monitoringBackend.listKernSightGroupTrash()])
+    if (!localGroupsRequests.isCurrent(request)) return
+    captureGroups.value = groups
+    captureGroupTrash.value = trash
+    localOwnershipConfirmed.value = true
+    reconcileTrashedSelection()
+  } catch (error) {
+    if (localGroupsRequests.isCurrent(request)) probeError.value = `读取本地主会话失败：${readableError(error)}`
+  }
+}
+
+function reconcileTrashedSelection() {
+  if (trashedCaptureGroups.value.some(entry => entry.group.id === selectedCaptureGroup.value) && !visibleCaptureGroups.value.some(group => group.id === selectedCaptureGroup.value)) selectedCaptureGroup.value = ''
+  const requested = sessionRequestedGroup.value
+  const removedReport = trashedCaptureGroups.value.some(entry => sessionSourceRoot.value
+    ? requested?.id === entry.group.id && requested.serial === entry.group.serial && requested.package === entry.group.package && entry.importedRoots.includes(sessionSourceRoot.value)
+    : entry.managed && (sessionParentId.value === entry.group.id || groupSessionIds([entry.group]).has(selectedSession.value)))
+  if (removedReport) clearCurrentSession()
+}
+
+function canTrashCaptureGroup(group: KernSightCaptureGroup) {
+  return captureGroupCanTrash(group, runningCaptureGroup.value, captureRunning.value || pullingPackage.value || Boolean(changingTrashGroup.value))
+}
+
+async function confirmTrashCaptureGroup(group: KernSightCaptureGroup) {
+  if (pendingTrashGroup.value !== group.id || !canTrashCaptureGroup(group)) return
+  pendingTrashGroup.value = ''
+  changingTrashGroup.value = group.id
+  localGroupsRequests.invalidate()
+  probeError.value = ''
+  try {
+    const roots = visibleImportedCaptureGroups.value.filter(item => item.group.id === group.id).map(item => item.bundle.root)
+    const entry = await monitoringBackend.trashKernSightGroup(group.id, roots)
+    localGroupsRequests.invalidate()
+    captureGroupTrash.value = [...captureGroupTrash.value.filter(item => item.group.id !== group.id), entry]
+    if (entry.managed) captureGroups.value = captureGroups.value.filter(item => item.id !== group.id)
+    reconcileTrashedSelection()
+    trashMessage.value = `主会话 ${shortSession(group.id)} 已移入回收站，可恢复；原始文件与设备空间未清理。`
+  } catch (error) {
+    await loadLocalCaptureGroups()
+    probeError.value = `移入回收站失败：${readableError(error)}`
+  } finally { changingTrashGroup.value = '' }
+}
+
+async function restoreCaptureGroup(entry: KernSightCaptureGroupTrash) {
+  if (changingTrashGroup.value) return
+  changingTrashGroup.value = entry.group.id
+  localGroupsRequests.invalidate()
+  probeError.value = ''
+  try {
+    const restored = await monitoringBackend.restoreKernSightGroup(entry.group.id)
+    localGroupsRequests.invalidate()
+    captureGroupTrash.value = [...captureGroupTrash.value.filter(item => item.group.id !== entry.group.id), { ...restored, trashed: false }]
+    if (entry.managed) replaceCaptureGroup(entry.group)
+    selectedCaptureGroup.value = entry.group.id
+    trashMessage.value = `主会话 ${shortSession(entry.group.id)} 已恢复${entry.managed ? '' : '；如本地证据未打开，请重新导入原目录或归档'}。`
+    await loadLocalCaptureGroups()
+  } catch (error) {
+    await loadLocalCaptureGroups()
+    probeError.value = `恢复主会话失败：${readableError(error)}`
+  } finally { changingTrashGroup.value = '' }
+}
+
 function armDeleteDeviceSession(sessionId: string) {
+  if (!localOwnershipConfirmed.value || groupedSessionIds.value.has(sessionId)) return
   pendingDeletePackage.value = false
   pendingDeleteSession.value = sessionId
 }
 
 async function confirmDeleteDeviceSession(sessionId: string) {
-  if (!props.device || deletingSession.value || pendingDeleteSession.value !== sessionId) return
+  if (!props.device || !localOwnershipConfirmed.value || groupedSessionIds.value.has(sessionId) || deletingSession.value || pendingDeleteSession.value !== sessionId) return
   pendingDeleteSession.value = ''
   deletingSession.value = sessionId
   probeError.value = ''
@@ -1575,6 +1671,8 @@ function loadLocalBundleSession(bundle: KernSightLocalEvidenceBundle) {
   clearCurrentSession()
   selectBundle(bundle)
   sessionSourceRoot.value = bundle.root
+  const group = bundle.sessionReport.mobilee_capture_group as KernSightCaptureGroup | undefined
+  sessionRequestedGroup.value = group?.schema === 'mobilee.capture-group/v1' ? { id: group.id, serial: group.serial, package: group.package } : null
   const sessionId = bundleSessionId(bundle)
   selectedSession.value = sessionId
   sessionMatchedPackage.value = bundle.package
@@ -1597,6 +1695,7 @@ async function readSessionReport(
   selectedSession.value = sessionId
   sessionMatchedPackage.value = packageName
   sessionSourceRoot.value = root
+  sessionRequestedGroup.value = group ? { id: group.id, serial: group.serial, package: group.package } : null
   loadingReport.value = true
   probeError.value = ''
   try {
@@ -1840,7 +1939,7 @@ async function cancelCaptureGroup(group: KernSightCaptureGroup) {
 async function openGroupedSession(group: KernSightCaptureGroup, sessionId: string) {
   captureSelectionRevision += 1
   selectedCaptureGroup.value = group.id
-  const candidates = importedCaptureGroups.value.filter(item => item.group.id === group.id && groupSessionIds([item.group]).has(sessionId))
+  const candidates = visibleImportedCaptureGroups.value.filter(item => item.group.id === group.id && groupSessionIds([item.group]).has(sessionId))
   const local = candidates.find(item => item.bundle.root === selectedRoots.value[group.package]) || candidates[candidates.length - 1]
   if (local) {
     selectBundle(local.bundle)
@@ -1850,7 +1949,11 @@ async function openGroupedSession(group: KernSightCaptureGroup, sessionId: strin
   }
 }
 
-async function pullCaptureGroup(group:KernSightCaptureGroup) {selectPackage(group.package);await pullSelectedPackageEvidence(group.id)}
+async function pullCaptureGroup(group:KernSightCaptureGroup) {
+  if (props.device?.serial !== group.serial) return
+  selectPackage(group.package)
+  await pullSelectedPackageEvidence(group.id)
+}
 
 async function copyAiContext() {
   try {
@@ -2232,7 +2335,8 @@ watch(() => [selectedPackage.value, selectedEvidenceSource.value, selectedLocalB
 watch(() => props.device?.serial, () => {
   overviewRequests.invalidate()
   loadingKernSight.value = false
-  captureGroups.value = []
+  pendingTrashGroup.value = ''
+  void loadLocalCaptureGroups()
   selectedCaptureGroup.value = ''
   capabilityProbe.value = null
   kernSight.value = null
@@ -2389,7 +2493,7 @@ details.ks-session-row > p, details.ks-session-row > small, details.ks-session-r
 details.ks-session-row pre { max-height: 360px; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; font-size: 11px; }
 .ks-session-row:hover,.ks-session-row.active{border-color:rgba(57,125,246,.35);background:rgba(57,125,246,.07)}
 .ks-session-open{display:grid;grid-template-columns:minmax(150px,.8fr) minmax(180px,1fr) auto;align-items:center;gap:12px;width:100%;padding:10px 12px;border:0;color:inherit;text-align:left;background:transparent}
-.ks-session-delete-slot{display:flex;min-width:88px;align-items:stretch}.ks-session-delete,.ks-session-delete-cancel{min-width:72px;padding:8px 10px;border:0;border-left:1px solid var(--line);font-size:8px}.ks-session-delete{color:#e8b4b4;background:rgba(214,74,74,.06)}.ks-session-delete:hover{background:rgba(214,74,74,.14)}.ks-session-delete.confirm{color:#fff;background:#8f2f38;font-weight:600}.ks-session-delete.confirm:hover{background:#a33b45}.ks-session-delete-cancel{color:#9aa8bb;background:rgba(255,255,255,.03)}.ks-session-delete-cancel:hover{background:rgba(255,255,255,.08)}.ks-session-row.pending-delete{border-color:rgba(216,109,120,.45)}
+.ks-group-trash{padding:12px;margin-bottom:12px;border:1px solid var(--line);border-radius:8px;font-size:12px}.ks-group-trash article{display:flex;justify-content:space-between;gap:12px;align-items:center;flex-wrap:wrap;padding:8px 0}.ks-group-trash span,.ks-trash-message,.ks-trash-confirm{overflow-wrap:anywhere;line-height:1.6}.ks-trash-confirm{flex-basis:100%;margin:4px 0}.ks-session-delete-slot{display:flex;min-width:88px;align-items:stretch}.ks-session-delete,.ks-session-delete-cancel{min-width:72px;padding:8px 10px;border:0;border-left:1px solid var(--line);font-size:8px}.ks-session-delete{color:#e8b4b4;background:rgba(214,74,74,.06)}.ks-session-delete:hover{background:rgba(214,74,74,.14)}.ks-session-delete.confirm{color:#fff;background:#8f2f38;font-weight:600}.ks-session-delete.confirm:hover{background:#a33b45}.ks-session-delete-cancel{color:#9aa8bb;background:rgba(255,255,255,.03)}.ks-session-delete-cancel:hover{background:rgba(255,255,255,.08)}.ks-session-row.pending-delete{border-color:rgba(216,109,120,.45)}
 .ks-session-owned{display:grid;min-width:92px;padding:8px 10px;place-items:center;border-left:1px solid var(--line);color:#718096;font-size:6px;text-align:center}
 .ks-session-list span, .ks-session-list strong, .ks-session-list small { display: block; min-width: 0; }
 .ks-session-list strong { font-size: 8px; }.ks-session-list small { margin-top: 3px; color: #657388; font-size: 7px; }

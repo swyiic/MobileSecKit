@@ -3,6 +3,8 @@ use super::*;
 use std::sync::{Mutex, OnceLock};
 use tauri::Manager;
 
+pub mod trash;
+
 const SCHEMA: &str = "mobilee.capture-group/v1";
 static IO_LOCK: Mutex<()> = Mutex::new(());
 static EPOCH: OnceLock<Uuid> = OnceLock::new();
@@ -453,6 +455,9 @@ fn save(root: &Path, g: &Group) -> Result<(), String> {
 fn load(root: &Path, id: Uuid) -> Result<Group, String> {
     let mut g: Group = serde_json::from_str(&read_bounded_text(&path(root, id), 1024 * 1024)?)
         .map_err(|e| e.to_string())?;
+    if g.id != id {
+        return Err("主会话清单与文件身份冲突".into());
+    }
     g.validate()?;
     g.recover(epoch());
     save(root, &g)?;
@@ -600,6 +605,9 @@ pub fn list_kernsight_groups(
             .and_then(|s| s.to_str())
             .and_then(|s| Uuid::parse_str(s).ok())
         {
+            if trash::managed_is_trashed(&root, id)? {
+                continue;
+            }
             let g = load(&root, id)?;
             if serial.as_deref().is_none_or(|s| s == g.serial) {
                 out.push(g);
@@ -680,6 +688,7 @@ async fn run_group_stage_at(
 ) -> Result<StageResult, String> {
     let (mut g, r, stage) = {
         let _guard = IO_LOCK.lock().map_err(|e| e.to_string())?;
+        trash::ensure_not_trashed(&root, parent_id)?;
         let mut g = load(&root, parent_id)?;
         if let Ok(entries) = std::fs::read_dir(&root) {
             for entry in entries {
@@ -917,7 +926,7 @@ async fn run_group_stage_at(
 #[cfg(test)]
 mod tests {
     use super::*;
-    fn group() -> Group {
+    pub(super) fn group() -> Group {
         Group {
             schema: SCHEMA.into(),
             id: Uuid::new_v4(),
@@ -1829,6 +1838,7 @@ pub async fn run_kernsight_unified_group(
     let root = root(&app)?;
     let (mut g, relations) = {
         let _guard = IO_LOCK.lock().map_err(|e| e.to_string())?;
+        trash::ensure_not_trashed(&root, parent_id)?;
         let mut g = load(&root, parent_id)?;
         for entry in std::fs::read_dir(&root).map_err(|e| e.to_string())? {
             let p = entry.map_err(|e| e.to_string())?.path();

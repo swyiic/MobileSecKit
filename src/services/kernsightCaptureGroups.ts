@@ -1,4 +1,4 @@
-import type { KernSightCaptureGroup, KernSightLocalEvidenceBundle } from '../types/monitoring'
+import type { KernSightCaptureGroup, KernSightCaptureGroupTrash, KernSightLocalEvidenceBundle } from '../types/monitoring'
 export function mergeCaptureGroups(device:KernSightCaptureGroup[], imported:KernSightCaptureGroup[]):KernSightCaptureGroup[] {
   const groups=new Map(device.map(group=>[group.id,group]))
   for(const group of imported)if(!groups.has(group.id))groups.set(group.id,group)
@@ -23,4 +23,15 @@ export function captureGroupEdges(group:KernSightCaptureGroup):Array<{from:strin
       ...(attempt.remoteArtifactRoot?[{from:attempt.relation.attemptId,relation:'artifact_source',to:attempt.remoteArtifactRoot}]:[]),
     ]),
   ])
+}
+
+/** A trash marker applies to one parent and only the explicitly included import roots. */
+export function captureGroupImportIsTrashed(group: KernSightCaptureGroup, root: string, trash: KernSightCaptureGroupTrash[]): boolean {
+  return trash.some(entry => entry.trashed !== false && entry.group.id === group.id && entry.group.serial === group.serial
+    && entry.group.package === group.package && entry.importedRoots.includes(root))
+}
+
+export function captureGroupCanTrash(group: KernSightCaptureGroup, runningParent = '', busy = false): boolean {
+  return !busy && group.id !== runningParent && group.state !== 'running'
+    && !group.stages.some(stage => stage.attempts.some(attempt => attempt.state === 'running'))
 }
