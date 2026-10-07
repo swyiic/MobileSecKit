@@ -59,11 +59,13 @@ test('UI loads local parents independently of device handshake and exposes a rec
  assert.match(vue,/不会释放设备或本地空间/)
 })
 
-test('legacy deletion stays closed until ownership loads and rechecks current membership', () => {
+test('legacy rows require loaded ownership and expose viewing without destructive cleanup', () => {
  const vue = readFileSync(new URL('../src/views/AndroidRuntimeMonitorView.vue',import.meta.url),'utf8')
  assert.match(vue,/const legacyDeviceSessions=computed\(\(\)=>localOwnershipConfirmed.value \?/)
- const confirm = vue.slice(vue.indexOf('async function confirmDeleteDeviceSession('),vue.indexOf('async function confirmDeleteCurrentPackageEvidence('))
- assert.match(confirm,/!localOwnershipConfirmed.value \|\| groupedSessionIds.value.has\(sessionId\)/)
+ assert.match(vue,/仅支持查看，清理不可用/)
+ assert.match(vue,/缺少父会话归属，需先核对所有权；不会执行删除/)
+ assert.doesNotMatch(vue,/confirmDeleteDeviceSession|armDeleteDeviceSession|cleanupKernSightSession/)
+ assert.match(vue,/@click="loadSessionReport\(session.session_id\)"/)
  const load = vue.slice(vue.indexOf('async function loadLocalCaptureGroups('),vue.indexOf('function canTrashCaptureGroup('))
  assert.match(load,/localOwnershipConfirmed.value = false/)
  assert.match(load,/localOwnershipConfirmed.value = true/)
@@ -75,4 +77,14 @@ test('restored import marker no longer hides sources while retaining child owner
  assert.equal(captureGroupImportIsTrashed(g,'/evidence/a',[restored]),false)
  const known = new Set([...groupSessionIds([g]), ...restored.retainedSessionIds])
  assert.ok(known.has('imported-extra'))
+})
+
+test('package evidence preserves open and pull while retiring unowned package-wide cleanup',()=>{
+ const vue=readFileSync(new URL('../src/views/AndroidRuntimeMonitorView.vue',import.meta.url),'utf8')
+ assert.match(vue,/整包清理不可用：包名不足以确认父会话归属/)
+ assert.match(vue,/@click="pullSelectedPackageEvidence\(\)"/)
+ assert.match(vue,/@click="selectPackage\(dump.package\)"/)
+ assert.doesNotMatch(vue,/confirmDeleteCurrentPackageEvidence|cleanupKernSightPackageDump/)
+ const backend=readFileSync(new URL('../src/services/backend/monitoring.ts',import.meta.url),'utf8')
+ assert.doesNotMatch(backend,/cleanup_kernsight_session|cleanup_kernsight_package_dump/)
 })

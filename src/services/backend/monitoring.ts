@@ -6,6 +6,8 @@ import type {
   KernSightOverview,
   KernSightCaptureGroup,
   KernSightCaptureGroupTrash,
+  KernSightGroupPurgePlan,
+  KernSightGroupPurgeReport,
   KernSightGroupStageResult,
   KernSightProvisionResult,
   KernSightCaptureRequest,
@@ -19,6 +21,10 @@ import type {
 } from '@/types/monitoring'
 
 export const monitoringBackend = {
+  prepareKernSightGroupPurge: (parentId: string, importedRoots: string[], localOnly: boolean) => invoke<KernSightGroupPurgePlan>('prepare_kernsight_group_purge', { parentId, importedRoots, localOnly }),
+  executeKernSightGroupPurge: (planId: string, confirmationToken: string) => invoke<KernSightGroupPurgeReport>('execute_kernsight_group_purge', { planId, confirmationToken }),
+  listKernSightGroupPurges: () => invoke<KernSightGroupPurgeReport[]>('list_kernsight_group_purges'),
+  prepareKernSightGroupPurgeRetry: (planId: string, localOnly = false) => invoke<KernSightGroupPurgePlan>('prepare_kernsight_group_purge_retry', { planId, localOnly }),
   kernSightGroupSessionReport:(parentId:string,serial:string,packageName:string,sessionId:string)=>invoke<KernSightSessionReportDocument>('get_kernsight_group_session_report',{parentId,serial,package:packageName,sessionId}),
   localKernSightChildReport:(root:string,parentId:string,sessionId:string)=>invoke<KernSightSessionReportDocument>('get_local_kernsight_child_report',{root,parentId,sessionId}),
   beginKernSightGroup:(request:KernSightCaptureRequest,durations:number[],startupReplay:boolean)=>invoke<KernSightCaptureGroup>(captureGroupIPC(request),{request,durations,startupReplay}),
@@ -37,8 +43,6 @@ export const monitoringBackend = {
     invoke<KernSightOverview>('get_kernsight_overview', { serial }),
   kernSightReport: (serial: string, sessionId: string) =>
     invoke<KernSightSessionReportDocument>('get_kernsight_session_report', { serial, sessionId }),
-  cleanupKernSightSession: (serial: string, sessionId: string) =>
-    invoke<void>('cleanup_kernsight_session', { serial, sessionId }),
   kernSightEvents: (serial: string, sessionId: string, offset = 0, limit = 50, sensor?: string, query?: string) =>
     invoke<KernSightEventPage>('get_kernsight_session_events', { serial, sessionId, offset, limit, sensor, query }),
   startKernSightCapture: (request: KernSightCaptureRequest) =>
@@ -65,6 +69,4 @@ export const monitoringBackend = {
     invoke<KernSightLocalEvidenceBundle>('pull_kernsight_package_archive', { serial, package: packageName, outputPath, parentId:parentId||null }),
   localKernSightEvidenceFile: (root: string, packageName: string, relativePath: string, maxBytes = 1_048_576) =>
     invoke<KernSightEvidenceFileContent>('read_local_kernsight_evidence_file', { root, package: packageName, relativePath, maxBytes }),
-  cleanupKernSightPackageDump: (serial: string, packageName: string) =>
-    invoke<void>('cleanup_kernsight_package_dump', { serial, package: packageName }),
 }

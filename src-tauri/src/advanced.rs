@@ -32,6 +32,7 @@ mod knowledge;
 mod model;
 mod report;
 mod rules;
+mod tool_version;
 
 pub use boundaries::DataBoundaryObservation;
 pub use model::*;
@@ -898,25 +899,18 @@ async fn tool_status_at(
     let path = executable_path_in(name, directory);
     let version = if path.is_some() {
         let args: Vec<String> = version_args.iter().map(|value| (*value).into()).collect();
-        run_host_at(name, &args, directory)
-            .await
-            .ok()
-            .map(|output| {
-                output_text(&output)
-                    .lines()
-                    .next()
-                    .unwrap_or_default()
-                    .to_string()
-            })
-            .filter(|value| !value.is_empty())
+        tool_version::describe(run_host_at(name, &args, directory).await)
     } else {
-        None
+        tool_version::ToolVersion::default()
     };
     ToolStatus {
         name: label.into(),
         executable: name.into(),
         available: path.is_some(),
-        version,
+        version: version.version,
+        version_output: version.output,
+        version_output_truncated: version.truncated,
+        version_error: version.error,
         path,
         category: category.into(),
         group: if matches!(

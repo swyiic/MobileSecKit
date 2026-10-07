@@ -1,5 +1,6 @@
 <template>
   <div class="runtime-monitor-layout">
+    <KernSightGroupPurge v-if="purgeTarget" :target="purgeTarget" :busy="purgeBusy" :active="active && workspaceMode === 'evidence'" @close="closePurgePreview" @executing="purgeExecuting = $event" @complete="completePurge" @uncertain="loadPurgeReports" />
     <section class="runtime-hero panel">
       <div class="runtime-hero-copy">
         <div class="eyebrow">ANDROID · L0 OBSERVE · L1 INSPECT · L2 DUMP</div>
@@ -23,16 +24,23 @@
 
     <section class="runtime-device-strip panel">
       <div><span>目标设备</span><strong>{{ device?.model || '未选择' }}</strong><small>{{ device?.serial || '请先连接 Android 设备' }}</small></div>
-      <div><span>传输</span><strong>{{ kernSight ? `KernSight ${kernSight.agentVersion}` : androidReady ? 'USB · ADB tunnel' : '未建立' }}</strong><small>{{ kernSight ? `Protocol ${kernSight.protocolMajor}.${kernSight.protocolMinor}` : '控制与数据通道' }}</small></div>
-      <div><span>内核</span><strong>{{ capabilityProbe?.kernelVersion || details?.kernelVersion || '待检测' }}</strong><small>{{ capabilityProbe ? `${capabilityProbe.architecture} · BTF ${capabilityProbe.btfStatus}` : details?.architecture || 'BTF / BPF 能力待检测' }}</small></div>
+      <div><span>传输</span><strong>{{ kernSight ? `KernSight ${kernSight.agentBuildIdentity?.version || kernSight.agentVersion}` : androidReady ? 'USB · ADB tunnel' : '未建立' }}</strong><small>{{ kernSight ? `Protocol ${kernSight.protocolMajor}.${kernSight.protocolMinor}` : '控制与数据通道' }}</small>
+        <details v-if="kernSight" class="agent-build-details"><summary>构建身份{{ kernSight.agentBuildIdentity?.gitCommit ? '' : ' · 未知' }}</summary>
+          <p>设备 Agent 报告的构建信息</p>
+          <FullValue label="KernSight Git commit" :value="kernSight.agentBuildIdentity?.gitCommit" empty-text="Git commit 未知（旧 Agent 或未提供有效构建信息）" monospace />
+          <p>{{ kernSight.agentBuildIdentity?.gitDirty === true ? '工作区：dirty' : kernSight.agentBuildIdentity?.gitDirty === false ? '工作区：clean' : '工作区状态：未知' }} · 来源 {{ kernSight.agentBuildIdentity?.source || 'unknown' }}</p>
+          <template v-if="kernSight.agentBuildIdentity?.binarySha256"><p>Agent binary SHA-256</p><FullValue label="Agent binary SHA-256" :value="kernSight.agentBuildIdentity.binarySha256" monospace /></template>
+        </details>
+      </div>
+      <div><span>内核</span><FullValue label="Kernel" :value="capabilityProbe?.kernelVersion || details?.kernelVersion" empty-text="待检测" monospace /><small>{{ capabilityProbe ? `${capabilityProbe.architecture} · BTF ${capabilityProbe.btfStatus}` : details?.architecture || 'BTF / BPF 能力待检测' }}</small></div>
       <div><span>信任等级</span><strong :class="trustTone">{{ trustLabel }}</strong><small>{{ trustHint }}</small></div>
     </section>
 
     <section class="ks-workspace-switcher panel">
       <button :class="{ active: workspaceMode === 'evidence' }" @click="workspaceMode = 'evidence'"><span class="material-symbols-outlined">account_tree</span><strong>证据链</strong><small>先选包，再看 L0/L1 session 与 L2 dump</small></button>
       <button :class="{ active: workspaceMode === 'capture' }" @click="workspaceMode = 'capture'"><span class="material-symbols-outlined">radio_button_checked</span><strong>新建采集</strong><small>L0 内核事实 · 可选 L1 Inspect</small></button>
-      <button class="import-local" :disabled="importingLocal" @click="importLocalEvidence"><span class="material-symbols-outlined">folder_open</span><strong>{{ importingLocal ? '正在索引…' : '导入本地证据' }}</strong><small>选择包含 dump-report.json 的包目录</small></button>
-      <button class="import-local" :disabled="importingLocal" @click="importEvidenceArchive"><span class="material-symbols-outlined">folder_zip</span><strong>{{ importingLocal ? '正在载入…' : '打开证据' }}</strong><small>.mee · 兼容旧格式</small></button>
+      <button class="import-local" :disabled="importingLocal || purgeExecuting" @click="importLocalEvidence"><span class="material-symbols-outlined">folder_open</span><strong>{{ importingLocal ? '正在索引…' : '导入本地证据' }}</strong><small>选择包含 dump-report.json 的包目录</small></button>
+      <button class="import-local" :disabled="importingLocal || purgeExecuting" @click="importEvidenceArchive"><span class="material-symbols-outlined">folder_zip</span><strong>{{ importingLocal ? '正在载入…' : '打开证据' }}</strong><small>.mee · 兼容旧格式</small></button>
     </section>
 
     <section v-if="probeError" class="notice error-notice runtime-probe-error" role="alert"><span class="material-symbols-outlined">error</span><span>{{ probeError }}</span><button @click="probeError = ''">关闭</button></section>
@@ -130,7 +138,7 @@
         </div>
       </details>
       <div class="ks-capture-actions">
-        <button class="primary-button" :disabled="captureRunning || !captureValid" @click="startCapture"><span class="material-symbols-outlined" :class="{ spinning: captureRunning }">{{ captureRunning ? 'sync' : 'radio_button_checked' }}</span>{{ captureActionLabel }}</button>
+        <button class="primary-button" :disabled="captureRunning || purgeExecuting || !captureValid" @click="startCapture"><span class="material-symbols-outlined" :class="{ spinning: captureRunning }">{{ captureRunning ? 'sync' : 'radio_button_checked' }}</span>{{ captureActionLabel }}</button>
         <p>{{ capturePolicyHint }}</p>
       </div>
       <div class="ks-capture-plan">
@@ -182,12 +190,21 @@
       <p v-if="captureRunning && lastCaptureGroupId" class="ks-capture-status" role="status">自动采集进行中 · {{ capturePhase || '正在准备' }} · {{ captureElapsed }}s。可以查看已有证据，采集不会因切换页面而中断。</p>
       <p v-if="!localOwnershipConfirmed" class="ks-trash-message" role="status">本地主会话归属尚未确认，暂不显示旧会话删除入口；可重试“刷新本地记录”。</p>
       <p v-if="trashMessage" class="ks-trash-message" role="status">{{ trashMessage }}</p>
+      <p v-if="purgeMessage" class="ks-trash-message" role="status">{{ purgeMessage }}</p>
+      <p v-if="purgeLoadError" class="ks-trash-message" role="alert">{{ purgeLoadError }} <button class="ghost-button" @click="loadPurgeReports">重试读取清理记录</button></p>
+      <details v-if="executedPurges.length" class="ks-group-trash ks-purge-journal" :open="Boolean(incompletePurges.length)">
+        <summary>永久清理记录 · {{ executedPurges.length }}（未完成 {{ incompletePurges.length }}）</summary>
+        <p>本地和手机分别核验。待清理部分不会自动执行，必须重新预览并确认。</p>
+        <article v-for="report in executedPurges" :key="report.id"><div><strong>{{ purgeReportLabel(report) }}</strong><p>{{ report.parentId }} · {{ report.serial }} · {{ report.package }}</p><p>本地 {{ report.localState }} · 手机 {{ report.deviceState }} · 更新 {{ formatDate(report.updatedUnixMs) }}</p><p v-if="report.error">{{ report.error }}</p><p v-for="warning in report.warnings" :key="warning">{{ warning }}</p></div><button v-if="report.state !== 'completed'" class="ghost-button" :disabled="purgeBusy || purgeExecuting || report.state === 'running'" @click="openPurgeRetry(report)">{{ report.state === 'running' ? '执行中，请刷新记录' : '重新预览剩余清理' }}</button></article>
+        <button class="ghost-button" :disabled="purgeExecuting" @click="loadPurgeReports">刷新清理记录</button>
+      </details>
       <details v-if="trashedCaptureGroups.length" class="ks-group-trash">
         <summary>主会话回收站 · {{ trashedCaptureGroups.length }}</summary>
         <p>这里只移除会话列表记录，可恢复。原始证据、导入目录与设备文件保留，不释放磁盘空间。</p>
         <article v-for="entry in trashedCaptureGroups" :key="entry.group.id">
           <span>{{ entry.group.package }} · {{ shortSession(entry.group.id) }} · {{ captureStateLabel(entry.group.state) }} · {{ formatDate(entry.trashedUnixMs) }}</span>
           <button class="ghost-button" :disabled="Boolean(changingTrashGroup)" @click="restoreCaptureGroup(entry)">{{ changingTrashGroup === entry.group.id ? '处理中…' : '恢复主会话' }}</button>
+          <button class="ghost-button danger-button" :disabled="!canPurgeCaptureGroup(entry.group)" @click="openPurgePreview(entry.group)">永久清理本地与手机…</button>
         </article>
       </details>
       <div class="ks-session-list">
@@ -220,29 +237,24 @@
               <KernSightCaptureDiagnostics :group="group" :attempt="attempt" />
             </div>
           </article>
-          <div class="ks-group-actions"><button v-if="captureGroups.some(item => item.id === group.id && item.serial === device?.serial) && !group.cancelRequested && runningCaptureGroup !== group.id && group.state!=='succeeded' && group.state!=='running'" class="ghost-button" :disabled="captureRunning" @click="resumeCaptureGroup(group)">继续 / 重试未成功阶段</button>
+          <div class="ks-group-actions"><button v-if="captureGroups.some(item => item.id === group.id && item.serial === device?.serial) && !group.cancelRequested && runningCaptureGroup !== group.id && group.state!=='succeeded' && group.state!=='running'" class="ghost-button" :disabled="captureRunning || purgeExecuting" @click="resumeCaptureGroup(group)">继续 / 重试未成功阶段</button>
           <button v-if="!group.cancelRequested && (runningCaptureGroup === group.id || group.state === 'running') && captureGroups.some(item => item.id === group.id && item.serial === device?.serial)" class="ghost-button" @click="cancelCaptureGroup(group)">请求取消（当前阶段封存后停止）</button><span v-if="group.cancelRequested && runningCaptureGroup === group.id" class="ks-form-help" role="status">已请求取消，正在等待当前阶段封存</span>
-          <button v-if="group.stages.some(s=>s.key==='dump'&&['succeeded','partial','failed'].includes(s.attempts[s.attempts.length-1]?.state||'')) && captureGroups.some(g=>g.id===group.id && g.serial===device?.serial)" class="ghost-button" :disabled="pullingPackage" @click="pullCaptureGroup(group)">拉取本次主会话全部信息</button>
+          <button v-if="group.stages.some(s=>s.key==='dump'&&['succeeded','partial','failed'].includes(s.attempts[s.attempts.length-1]?.state||'')) && captureGroups.some(g=>g.id===group.id && g.serial===device?.serial)" class="ghost-button" :disabled="pullingPackage || purgeExecuting" @click="pullCaptureGroup(group)">拉取本次主会话全部信息</button>
           <template v-if="pendingTrashGroup === group.id">
             <p class="ks-trash-confirm">将此主会话及已打开的同次导入记录移入回收站？子会话归属与原始证据保留，可恢复；不会释放设备或本地空间。</p>
             <button class="ghost-button" :disabled="Boolean(changingTrashGroup)" @click="pendingTrashGroup = ''">取消移除</button>
             <button class="ghost-button danger-button" :disabled="!canTrashCaptureGroup(group)" @click="confirmTrashCaptureGroup(group)">确认移入回收站</button>
           </template>
-          <button v-else class="ghost-button danger-button" :disabled="!canTrashCaptureGroup(group)" :title="canTrashCaptureGroup(group) ? '移除列表记录，可从回收站恢复；不释放磁盘空间' : '采集或拉取期间不可移除，请等待封存'" @click="pendingTrashGroup = group.id">移入回收站</button></div>
+          <button v-else class="ghost-button danger-button" :disabled="!canTrashCaptureGroup(group)" :title="canTrashCaptureGroup(group) ? '移除列表记录，可从回收站恢复；不释放磁盘空间' : '采集或拉取期间不可移除，请等待封存'" @click="pendingTrashGroup = group.id">移入回收站</button>
+          <button class="ghost-button danger-button" :disabled="!canPurgeCaptureGroup(group)" @click="openPurgePreview(group)">永久清理本地与手机…</button></div>
         </details>
-        <article v-for="session in legacyDeviceSessions" :key="session.session_id" class="ks-session-row" :class="{ active: selectedSession === session.session_id, 'pending-delete': pendingDeleteSession === session.session_id }">
-          <button class="ks-session-open" :disabled="loadingReport || deletingSession === session.session_id" @click="loadSessionReport(session.session_id)">
+        <article v-for="session in legacyDeviceSessions" :key="session.session_id" class="ks-session-row" :class="{ active: selectedSession === session.session_id, 'legacy-readonly': true }">
+          <button class="ks-session-open" :disabled="loadingReport" @click="loadSessionReport(session.session_id)">
             <span :title="session.session_id"><strong>{{ shortSession(session.session_id) }}</strong><small>{{ formatDate(session.started_unix_ms) }} · legacy（无父 ID）</small></span>
             <span><strong>{{ Number(session.event_count || 0).toLocaleString() }} 条事件</strong><small>{{ session.batch_count || 0 }} 批次 · {{ formatBytes(session.used_bytes || 0) }}</small></span>
             <span class="ks-session-state"><b>{{ session.state }}</b><small>{{ session.stop_reason || (session.compressed ? 'LZ4 batches' : 'uncompressed') }}</small></span>
           </button>
-          <div class="ks-session-delete-slot">
-            <template v-if="pendingDeleteSession === session.session_id">
-              <button type="button" class="ks-session-delete-cancel" :disabled="Boolean(deletingSession)" @click.stop="pendingDeleteSession = ''">取消</button>
-              <button type="button" class="ks-session-delete confirm" :disabled="Boolean(deletingSession)" @click.stop="confirmDeleteDeviceSession(session.session_id)">{{ deletingSession === session.session_id ? '删除中…' : '确认删除' }}</button>
-            </template>
-            <button v-else type="button" class="ks-session-delete" :aria-label="`删除会话 ${session.session_id}`" :disabled="loadingReport || Boolean(deletingSession)" @click.stop="armDeleteDeviceSession(session.session_id)"><span class="material-symbols-outlined" aria-hidden="true">delete</span>删除</button>
-          </div>
+          <p class="ks-session-readonly"><strong>仅支持查看，清理不可用</strong><span>缺少父会话归属，需先核对所有权；不会执行删除。</span></p>
         </article>
         <article v-for="bundle in visibleLocalSessionBundles" :key="`${bundle.root}:${bundle.package}`" class="ks-session-row local" :class="{ active: selectedSession === bundleSessionId(bundle) && sessionSourceRoot === bundle.root }"><button class="ks-session-open" :disabled="loadingReport" @click="loadLocalBundleSession(bundle)"><span><strong>{{ shortSession(bundleSessionId(bundle)) }}</strong><small>{{ bundle.package }} · 本地</small></span><span><strong>{{ evidenceCountLabel(bundle.sessionReport?.total_events) }} events</strong><small>{{ bundle.fileCount.toLocaleString() }} files · {{ formatBytes(bundle.totalBytes) }}</small></span><span class="ks-session-state"><b>LOCAL</b><small>{{ executionStatusLabel(bundle.sessionReport?.execution_complete) }}</small></span></button><span class="ks-session-owned">随整包证据管理</span></article>
         <p v-if="!visibleLocalSessionBundles.length && !legacyDeviceSessions.length && !visibleCaptureGroups.length" class="ks-empty">{{ selectedPackage ? '当前包没有已导入的 Session，设备端也没有可重放会话。L2 文件证据仍可独立分析。' : '尚未导入或采集 Session。连接 KernSight 后，设备会话会直接列在这里。' }}</p>
@@ -387,7 +399,7 @@
     </section>
 
     <section v-if="workspaceMode === 'evidence'" class="panel ks-package-panel">
-      <div class="section-title compact"><div><div class="eyebrow">PACKAGE EVIDENCE</div><h2>包证据</h2><p>MobileE 自动整理手机端已存会话、内存与文件证据；不提供单项删除，只能按整个 com 包管理。</p></div><div class="ks-title-actions"><button v-if="selectedPackage" class="ghost-button" title="关闭当前包工作区，不删除数据" @click="closePackageWorkspace">关闭当前包</button><template v-if="selectedPackage && selectedEvidenceSource === 'device'"><button v-if="pendingDeletePackage" class="ghost-button" :disabled="deletingPackage" @click="pendingDeletePackage = false">取消</button><button v-if="pendingDeletePackage" class="ghost-button danger-button" :disabled="deletingPackage" @click="confirmDeleteCurrentPackageEvidence">{{ deletingPackage ? '删除中…' : '确认删除整个包证据' }}</button><button v-else class="ghost-button danger-button" :disabled="deletingPackage" @click="pendingDeletePackage = true">删除整个包证据</button></template><span class="device-chip">LOCAL {{ localEvidenceBundles.length }} · DEVICE {{ devicePackageNames.size }}</span></div></div>
+      <div class="section-title compact"><div><div class="eyebrow">PACKAGE EVIDENCE</div><h2>包证据</h2><p>MobileE 自动整理手机端已存会话、内存与文件证据。清理需从已核验的主会话进入，按精确路径预览。</p></div><div class="ks-title-actions"><button v-if="selectedPackage" class="ghost-button" title="关闭当前包工作区，不删除数据" @click="closePackageWorkspace">关闭当前包</button><span v-if="selectedPackage && selectedEvidenceSource === 'device'" class="ks-package-cleanup-unavailable">整包清理不可用：包名不足以确认父会话归属；仍可打开与拉取证据。</span><span class="device-chip">LOCAL {{ localEvidenceBundles.length }} · DEVICE {{ devicePackageNames.size }}</span></div></div>
       <div class="ks-package-list">
         <article v-for="dump in packageDumps" :key="dump.package" :class="{ selected: selectedPackage === dump.package }" @click="selectPackage(dump.package)">
           <div><strong>{{ dump.package }}</strong><small class="ks-source-badges"><b v-for="source in evidenceSources(dump.package)" :key="source.kind" :class="`source-${source.kind}`">{{ source.label }}</b></small><small>{{ evidenceLocationLabel(dump.package) }} · {{ dump.schema_version || 'legacy schema · 建议 recatalog' }}</small></div>
@@ -406,7 +418,7 @@
     <section v-if="workspaceMode === 'evidence' && selectedPackageDump" class="panel ks-package-evidence-panel">
       <div class="section-title compact"><div><div class="eyebrow">FORENSIC EVIDENCE</div><h2>{{ selectedPackage }} · 产物与私有文件</h2><p>MobileE 会在载入后自动整理文件、内存、会话与映射关系；文件存在本身不代表本次运行已经执行或外发。</p></div><span class="device-chip">{{ allEvidenceFiles.length.toLocaleString() }} FILES · {{ formatMaybeBytes(selectedPackageDump.local_storage_accounting?.allocated_bytes ?? selectedPackageDump.physical_bytes) }}</span></div>
       <template v-if="selectedPackageDump">
-      <div class="ks-selected-package-bar"><button v-if="device && selectedEvidenceSource === 'device'" class="primary-button" :disabled="pullingPackage" @click="pullSelectedPackageEvidence()">{{ pullingPackage ? '正在拉取并解析…' : '拉取全部信息' }}</button><button v-else-if="selectedLocalBundle" class="ghost-button" :disabled="pullingPackage" @click="exportSelectedEvidenceArchive">{{ pullingPackage ? '正在封装…' : '导出 .mee' }}</button><b :class="`source-${selectedEvidenceSource}`">{{ selectedEvidenceSource === 'local' ? '本地证据' : '手机端证据' }}</b><span>Dump {{ selectedPackageDump.dump_id || 'legacy' }}</span><span v-if="selectedPackageDump.local_storage_accounting">本地逻辑 {{ formatMaybeBytes(selectedPackageDump.local_storage_accounting.logical_file_bytes) }} · 分配 {{ allocatedEvidenceLabel(selectedPackageDump.local_storage_accounting.allocated_bytes) }} · 已验证代码重复 {{ formatMaybeBytes(selectedPackageDump.local_storage_accounting.verified_code_duplicate_bytes) }}（账面，非物理节省）</span><span>{{ selectedPackageDump.launched === true ? '已执行 launch harvest' : selectedPackageDump.launched === false ? '未执行 launch harvest' : 'launch harvest 状态未知' }}</span><span>物理 {{ allocatedEvidenceLabel(selectedPackageDump.local_storage_accounting?.allocated_bytes ?? selectedPackageDump.physical_bytes) }}</span><span v-if="selectedPackageDump.storage_accounting === 'kernsight.inode-accounting/v1'">硬链接共享逻辑字节 {{ formatBytes(Number(selectedPackageDump.deduplicated_bytes ?? 0)) }}</span></div>
+      <div class="ks-selected-package-bar"><button v-if="device && selectedEvidenceSource === 'device'" class="primary-button" :disabled="pullingPackage || purgeExecuting" @click="pullSelectedPackageEvidence()">{{ pullingPackage ? '正在拉取并解析…' : '拉取全部信息' }}</button><button v-else-if="selectedLocalBundle" class="ghost-button" :disabled="pullingPackage || purgeExecuting" @click="exportSelectedEvidenceArchive">{{ pullingPackage ? '正在封装…' : '导出 .mee' }}</button><b :class="`source-${selectedEvidenceSource}`">{{ selectedEvidenceSource === 'local' ? '本地证据' : '手机端证据' }}</b><span>Dump {{ selectedPackageDump.dump_id || 'legacy' }}</span><span v-if="selectedPackageDump.local_storage_accounting">本地逻辑 {{ formatMaybeBytes(selectedPackageDump.local_storage_accounting.logical_file_bytes) }} · 分配 {{ allocatedEvidenceLabel(selectedPackageDump.local_storage_accounting.allocated_bytes) }} · 已验证代码重复 {{ formatMaybeBytes(selectedPackageDump.local_storage_accounting.verified_code_duplicate_bytes) }}（账面，非物理节省）</span><span>{{ selectedPackageDump.launched === true ? '已执行 launch harvest' : selectedPackageDump.launched === false ? '未执行 launch harvest' : 'launch harvest 状态未知' }}</span><span>物理 {{ allocatedEvidenceLabel(selectedPackageDump.local_storage_accounting?.allocated_bytes ?? selectedPackageDump.physical_bytes) }}</span><span v-if="selectedPackageDump.storage_accounting === 'kernsight.inode-accounting/v1'">硬链接共享逻辑字节 {{ formatBytes(Number(selectedPackageDump.deduplicated_bytes ?? 0)) }}</span></div>
       <label v-if="selectedEvidenceSource === 'local' && selectedPackageBundles.length > 1" class="ks-local-capture-picker"><span>本地采集记录（{{ selectedPackageBundles.length }}）</span><select :value="selectedLocalBundle?.root" @change="selectLocalEvidenceRoot(($event.target as HTMLSelectElement).value)"><option v-for="bundle in selectedPackageBundles" :key="bundle.root" :value="bundle.root">{{ bundleSessionId(bundle) }} · {{ bundle.dumpReport.dump_id || 'legacy dump' }} · {{ bundle.root }}</option></select><small>列表统计、文件、导出与分析关联均使用此记录；不会按包名合并不同采集。</small></label>
       <details v-if="selectedEvidenceSource === 'local'" class="ks-source-diagnostics"><summary>本地运行时来源诊断与逐库加载段</summary><p v-if="!selectedPackageDump.local_storage_accounting?.runtime_source_diagnostics">旧数据：来源诊断未知。</p><pre>{{ selectedPackageDump.local_storage_accounting?.runtime_source_diagnostics }}</pre><article v-for="module in selectedPackageDump.local_storage_accounting?.elf_module_observations || []" :key="`${module.source_report}:${module.path}`"><p>{{ module.path }} · 已观察/已读范围 {{ module.verified_range_count ?? '未知' }} · 留存 {{ module.verified_range_bytes ?? '未知' }} B · PT_LOAD 可分析 {{ elfLoadCoverageLabel(module.all_load_file_bytes_covered) }} · 完整文件缺失（未重建）</p><details><summary>来源与缺口</summary><pre>{{ module }}</pre></details></article></details>
       <KernSightDexIndex :key="selectedLocalBundle?.root || selectedPackageDump.dump_id || selectedPackage" :dump="selectedPackageDump" />
@@ -471,12 +483,15 @@
 </template>
 
 <script setup lang="ts">
+import FullValue from '@/components/FullValue.vue'
 import { runCaptureGroupPlan, mergeCaptureResults, captureStateLabel, captureStageLabel, latestGroupSession } from '@/services/kernsightCaptureRunner'
 import { mergeCaptureGroups,groupSessionIds,captureGroupEdges,captureGroupCanTrash,captureGroupImportIsTrashed } from '../services/kernsightCaptureGroups'
 import { packageEvidenceReports, importedSessionId, bundleForSession, linkedEvidenceMatches, createLatestRequest, createKeyedRequests, evidenceCountLabel, executionStatusLabel } from '../services/kernsightWorkspaceState'
 import { memoryCounterLabel, memoryEvidenceLabel } from '../services/kernsightMemoryEvidence'
 import KernSightDexIndex from '@/components/KernSightDexIndex.vue'
 import KernSightCaptureDiagnostics from '@/components/KernSightCaptureDiagnostics.vue'
+import KernSightGroupPurge from '@/components/KernSightGroupPurge.vue'
+import { bundleRemovedByPurge, purgeReportLabel, type PurgeTarget } from '@/services/kernsightGroupPurge'
 import { verifiedDexObjectCount, indexedElfModuleCount, indexedDexCount, runtimeDexClassMatches, elfLoadCoverageLabel, codeEvidenceLabel, allocatedEvidenceLabel, ownershipEvidenceEntries, codeNoiseLayers, archiveCoverageLabel, dexScanSummary, dexScanSummaryForObject, fileScanLabel } from '../services/kernsightCodeEvidence'
 import { buildAutoCaptureStages, captureCodeOnlyChoice, startupEvidenceLabel, qualifiedSourceLabel, type AutoStageReceipt } from '@/services/kernsightCapturePlan'
 import { computed, markRaw, nextTick, onErrorCaptured, onBeforeUnmount, onMounted, reactive, ref, shallowRef, watch } from 'vue'
@@ -492,6 +507,8 @@ import type {
   KernSightOverview,
   KernSightCaptureGroup,
   KernSightCaptureGroupTrash,
+  KernSightGroupPurgePlan,
+  KernSightGroupPurgeReport,
   KernSightProvisionResult,
   KernSightCaptureRequest,
   KernSightCaptureResult,
@@ -503,7 +520,7 @@ import type {
   KernSightSessionReportDocument,
 } from '@/types'
 
-const props = defineProps<{ device?: DeviceSummary; details: DeviceDetails | null }>()
+const props = withDefaults(defineProps<{ device?: DeviceSummary; details: DeviceDetails | null; active?: boolean }>(), { active: true })
 const emit = defineEmits<{ 'open-devices': []; 'open-ai': []; 'show-evidence': [] }>()
 
 const captureGroups=ref<KernSightCaptureGroup[]>([])
@@ -514,10 +531,19 @@ const trashedCaptureGroups = computed(() => captureGroupTrash.value.filter(entry
 const pendingTrashGroup = ref('')
 const changingTrashGroup = ref('')
 const trashMessage = ref('')
+const purgeTarget = shallowRef<PurgeTarget | null>(null)
+const purgeExecuting = ref(false)
+const purgeReports = ref<KernSightGroupPurgeReport[]>([])
+const purgeMessage = ref('')
+const purgeLoadError = ref('')
+const purgeRequests = createLatestRequest()
+const purgeBusy = computed(() => !localOwnershipConfirmed.value || captureRunning.value || pullingPackage.value || importingLocal.value || Boolean(changingTrashGroup.value))
+const executedPurges = computed(() => purgeReports.value.filter(report => report.state !== 'prepared'))
+const incompletePurges = computed(() => executedPurges.value.filter(report => report.state !== 'completed'))
 const localGroupsRequests = createLatestRequest()
 const localOwnershipConfirmed = ref(false)
 const knownCaptureGroups = computed(() => [...captureGroups.value, ...importedCaptureGroups.value.map(item => item.group), ...captureGroupTrash.value.map(entry => entry.group)])
-const groupedSessionIds=computed(()=>new Set([...groupSessionIds(knownCaptureGroups.value), ...captureGroupTrash.value.flatMap(entry => entry.retainedSessionIds || [])]))
+const groupedSessionIds=computed(()=>new Set([...groupSessionIds(knownCaptureGroups.value), ...captureGroupTrash.value.flatMap(entry => entry.retainedSessionIds || []), ...purgeReports.value.flatMap(entry => entry.retainedSessionIds || [])]))
 const legacyDeviceSessions=computed(()=>localOwnershipConfirmed.value ? kernSight.value?.sessions.filter(s=>!groupedSessionIds.value.has(s.session_id))||[] : [])
 const importedCaptureGroups=computed(()=>localEvidenceBundles.value.flatMap(bundle=>{
   const g=bundle.sessionReport?.mobilee_capture_group as KernSightCaptureGroup|undefined
@@ -559,10 +585,6 @@ const { bundles: localEvidenceBundles, selectedRoots, bundleForPackage, selectBu
 const devicePackageNames = ref(new Set<string>())
 const importingLocal = ref(false)
 const pullingPackage = ref(false)
-const deletingSession = ref('')
-const pendingDeleteSession = ref('')
-const deletingPackage = ref(false)
-const pendingDeletePackage = ref(false)
 const loadingEvidence = ref(false)
 const selectedEvidence = ref<KernSightEvidenceFileContent | null>(null)
 const selectedEvidenceKey = ref('')
@@ -660,7 +682,7 @@ watch(
 
 const androidReady = computed(() => props.device?.platform === 'android' && props.device.status === 'device')
 const readinessTitle = computed(() => {
-  if (kernSight.value) return `KernSight ${kernSight.value.agentVersion} · 已连接`
+  if (kernSight.value) return `KernSight ${kernSight.value.agentBuildIdentity?.version || kernSight.value.agentVersion} · 已连接`
   if (probing.value) return '正在检测设备能力'
   if (capabilityProbe.value) return `${recommendedModeLabel.value} · 探测完成`
   if (!props.device) return '等待设备'
@@ -1361,6 +1383,7 @@ async function importLocalEvidence() {
 }
 
 async function importEvidenceDirectory(path?: string) {
+  if (purgeExecuting.value) return
   importingLocal.value = true
   probeError.value = ''
   emit('show-evidence')
@@ -1388,6 +1411,7 @@ onMounted(() => {
 })
 
 async function importEvidenceArchive() {
+  if (purgeExecuting.value) return
   importingLocal.value = true
   probeError.value = ''
   try {
@@ -1404,7 +1428,7 @@ async function importEvidenceArchive() {
 }
 
 async function pullSelectedPackageEvidence(parentId?:string) {
-  if (!props.device || !selectedPackage.value || pullingPackage.value) return
+  if (!props.device || !selectedPackage.value || pullingPackage.value || purgeExecuting.value) return
   const serial = props.device.serial
   const packageName = selectedPackage.value
   const expectedBytes = Number(selectedPackageDump.value?.total_bytes ?? 0)
@@ -1434,7 +1458,7 @@ async function pullSelectedPackageEvidence(parentId?:string) {
 }
 
 async function exportSelectedEvidenceArchive() {
-  if (!selectedLocalBundle.value || pullingPackage.value) return
+  if (!selectedLocalBundle.value || pullingPackage.value || purgeExecuting.value) return
   const bundle = selectedLocalBundle.value
   const destination = await save({
     defaultPath: `${bundle.package}.mee`,
@@ -1459,7 +1483,6 @@ async function exportSelectedEvidenceArchive() {
 
 function selectPackage(packageName: string) {
   sessionPackageLinked.value = false
-  pendingDeletePackage.value = false
   selectedPackage.value = packageName
   selectedEvidenceSource.value = hasLocalEvidence(packageName) ? 'local' : 'device'
   captureForm.package = packageName
@@ -1473,7 +1496,6 @@ function selectPackage(packageName: string) {
 
 function selectPackageSource(packageName: string, source: 'local' | 'device') {
   sessionPackageLinked.value = false
-  pendingDeletePackage.value = false
   selectedPackage.value = packageName
   selectedEvidenceSource.value = source
   captureForm.package = packageName
@@ -1525,14 +1547,16 @@ function clearCurrentSession() {
 }
 
 async function loadLocalCaptureGroups() {
+  purgeRequests.invalidate()
   const request = localGroupsRequests.begin()
   localOwnershipConfirmed.value = false
-  pendingDeleteSession.value = ''
   try {
-    const [groups, trash] = await Promise.all([monitoringBackend.listKernSightGroups(), monitoringBackend.listKernSightGroupTrash()])
+    const [groups, trash, purges] = await Promise.all([monitoringBackend.listKernSightGroups(), monitoringBackend.listKernSightGroupTrash(), monitoringBackend.listKernSightGroupPurges()])
     if (!localGroupsRequests.isCurrent(request)) return
     captureGroups.value = groups
     captureGroupTrash.value = trash
+    purgeReports.value = purges
+    purgeLoadError.value = ''
     localOwnershipConfirmed.value = true
     reconcileTrashedSelection()
   } catch (error) {
@@ -1549,8 +1573,69 @@ function reconcileTrashedSelection() {
   if (removedReport) clearCurrentSession()
 }
 
+function closePurgePreview() {
+  if (!purgeExecuting.value) purgeTarget.value = null
+}
+function canPurgeCaptureGroup(group: KernSightCaptureGroup) {
+  return localOwnershipConfirmed.value && captureGroupCanTrash(group, runningCaptureGroup.value, purgeBusy.value || purgeExecuting.value)
+}
+function openPurgePreview(group: KernSightCaptureGroup) {
+  if (!props.active || !canPurgeCaptureGroup(group)) return
+  pendingTrashGroup.value = ''
+  const importedRoots = importedCaptureGroups.value.filter(item => item.group.id === group.id && item.group.serial === group.serial && item.group.package === group.package).map(item => item.bundle.root)
+  purgeTarget.value = { parentId: group.id, serial: group.serial, package: group.package, importedRoots: [...new Set(importedRoots)] }
+  purgeMessage.value = ''
+}
+function openPurgeRetry(report: KernSightGroupPurgeReport) {
+  if (!props.active || purgeBusy.value || purgeExecuting.value || report.state === 'running') return
+  purgeTarget.value = { parentId: report.parentId, serial: report.serial, package: report.package, importedRoots: report.importedRoots, retryPlanId: report.id }
+  purgeMessage.value = ''
+}
+async function loadPurgeReports() {
+  const ticket = purgeRequests.begin()
+  try {
+    const reports = await monitoringBackend.listKernSightGroupPurges()
+    if (!purgeRequests.isCurrent(ticket)) return
+    purgeReports.value = reports
+    purgeLoadError.value = ''
+  } catch (error) {
+    if (purgeRequests.isCurrent(ticket)) purgeLoadError.value = `读取永久清理记录失败：${readableError(error)}`
+  }
+}
+async function completePurge(report: KernSightGroupPurgeReport, plan: KernSightGroupPurgePlan) {
+  purgeRequests.invalidate()
+  purgeTarget.value = null
+  if (report.parentId !== plan.parentId || report.serial !== plan.serial || report.package !== plan.package) {
+    purgeMessage.value = '返回清理结果的会话身份不一致；请刷新记录核对，当前列表未据此移除。'
+    await loadPurgeReports()
+    return
+  }
+  purgeReports.value = [...purgeReports.value.filter(item => item.id !== report.id), report]
+  purgeMessage.value = `${purgeReportLabel(report)} · 父会话 ${report.parentId} · 本地 ${report.localState} / 手机 ${report.deviceState}。${report.error || ''}`
+  if (report.localState === 'completed') {
+    const displayedRoot = sessionSourceRoot.value || selectedLocalBundle.value?.root || ''
+    const removedRoots = new Set(localEvidenceBundles.value.filter(bundle => bundleRemovedByPurge(bundle, plan, report)).map(bundle => bundle.root))
+    localEvidenceBundles.value = localEvidenceBundles.value.filter(bundle => !removedRoots.has(bundle.root))
+    const selections = { ...selectedRoots.value }
+    for (const [packageName, root] of Object.entries(selections)) if (removedRoots.has(root)) delete selections[packageName]
+    selectedRoots.value = selections
+    captureGroups.value = captureGroups.value.filter(group => !(group.id === plan.parentId && group.serial === plan.serial && group.package === plan.package))
+    captureGroupTrash.value = captureGroupTrash.value.filter(entry => !(entry.group.id === plan.parentId && entry.group.serial === plan.serial && entry.group.package === plan.package))
+    if (removedRoots.has(sessionSourceRoot.value) || (!sessionSourceRoot.value && sessionRequestedGroup.value?.id === plan.parentId && sessionRequestedGroup.value.serial === plan.serial)) clearCurrentSession()
+    if (selectedCaptureGroup.value === plan.parentId && !visibleCaptureGroups.value.some(group => group.id === plan.parentId)) selectedCaptureGroup.value = ''
+    if (selectedEvidence.value && removedRoots.has(displayedRoot)) closeEvidencePreview()
+  }
+  await loadLocalCaptureGroups()
+  await loadPurgeReports()
+  // Avoid selecting another device or reopening details when the user navigated during execution.
+  if (props.active && props.device?.serial === plan.serial && kernSight.value) {
+    try { await loadKernSight() } catch { /* durable per-side report remains visible */ }
+  }
+}
+watch(() => [props.active, props.device?.serial, props.device?.status, workspaceMode.value, selectedCaptureGroup.value, selectedPackage.value], closePurgePreview, { flush: 'sync' })
+
 function canTrashCaptureGroup(group: KernSightCaptureGroup) {
-  return captureGroupCanTrash(group, runningCaptureGroup.value, captureRunning.value || pullingPackage.value || Boolean(changingTrashGroup.value))
+  return captureGroupCanTrash(group, runningCaptureGroup.value, captureRunning.value || pullingPackage.value || Boolean(changingTrashGroup.value) || purgeExecuting.value)
 }
 
 async function confirmTrashCaptureGroup(group: KernSightCaptureGroup) {
@@ -1574,7 +1659,7 @@ async function confirmTrashCaptureGroup(group: KernSightCaptureGroup) {
 }
 
 async function restoreCaptureGroup(entry: KernSightCaptureGroupTrash) {
-  if (changingTrashGroup.value) return
+  if (changingTrashGroup.value || purgeExecuting.value) return
   changingTrashGroup.value = entry.group.id
   localGroupsRequests.invalidate()
   probeError.value = ''
@@ -1590,45 +1675,6 @@ async function restoreCaptureGroup(entry: KernSightCaptureGroupTrash) {
     await loadLocalCaptureGroups()
     probeError.value = `恢复主会话失败：${readableError(error)}`
   } finally { changingTrashGroup.value = '' }
-}
-
-function armDeleteDeviceSession(sessionId: string) {
-  if (!localOwnershipConfirmed.value || groupedSessionIds.value.has(sessionId)) return
-  pendingDeletePackage.value = false
-  pendingDeleteSession.value = sessionId
-}
-
-async function confirmDeleteDeviceSession(sessionId: string) {
-  if (!props.device || !localOwnershipConfirmed.value || groupedSessionIds.value.has(sessionId) || deletingSession.value || pendingDeleteSession.value !== sessionId) return
-  pendingDeleteSession.value = ''
-  deletingSession.value = sessionId
-  probeError.value = ''
-  try {
-    await monitoringBackend.cleanupKernSightSession(props.device.serial, sessionId)
-    if (selectedSession.value === sessionId) clearCurrentSession()
-    await loadKernSight()
-  } catch (error) {
-    probeError.value = `删除 Session 失败：${readableError(error)}`
-  } finally {
-    deletingSession.value = ''
-  }
-}
-
-async function confirmDeleteCurrentPackageEvidence() {
-  if (!props.device || !selectedPackage.value || selectedEvidenceSource.value !== 'device' || deletingPackage.value || !pendingDeletePackage.value) return
-  const packageName = selectedPackage.value
-  pendingDeletePackage.value = false
-  deletingPackage.value = true
-  probeError.value = ''
-  try {
-    await monitoringBackend.cleanupKernSightPackageDump(props.device.serial, packageName)
-    closePackageWorkspace()
-    await loadKernSight()
-  } catch (error) {
-    probeError.value = `删除整个包证据失败：${readableError(error)}`
-  } finally {
-    deletingPackage.value = false
-  }
 }
 
 function hasPackageEvidence(packageName: string) {
@@ -1857,7 +1903,7 @@ async function showCaptureOutcome(groupId: string, revision: number, serial: str
 }
 
 async function startCapture() {
-  if (!props.device || !captureValid.value || captureRunning.value) return
+  if (!props.device || !captureValid.value || captureRunning.value || purgeExecuting.value) return
   const serial = props.device.serial
   const automatic = captureForm.plan === 'auto'
   clearCurrentSession()
@@ -1916,7 +1962,7 @@ async function executeCaptureGroup(group: KernSightCaptureGroup) {
   } finally { runningCaptureGroup.value = '' }
 }
 async function resumeCaptureGroup(group: KernSightCaptureGroup) {
-  if (captureRunning.value) return
+  if (captureRunning.value || purgeExecuting.value) return
   clearCurrentSession()
   const revision = captureSelectionRevision
   const serial = group.serial
@@ -2363,6 +2409,8 @@ watch(requestedPackage, packageName => {
 }, { immediate: true })
 
 onBeforeUnmount(() => {
+  purgeRequests.invalidate()
+  purgeTarget.value = null
   sessionRequests.invalidate()
   plaintextRevision.value += 1
   plaintextDecodeRequests.invalidate()
@@ -2495,6 +2543,7 @@ details.ks-session-row pre { max-height: 360px; overflow: auto; white-space: pre
 .ks-session-row:hover,.ks-session-row.active{border-color:rgba(57,125,246,.35);background:rgba(57,125,246,.07)}
 .ks-session-open{display:grid;grid-template-columns:minmax(150px,.8fr) minmax(180px,1fr) auto;align-items:center;gap:12px;width:100%;padding:10px 12px;border:0;color:inherit;text-align:left;background:transparent}
 .ks-group-trash{padding:12px;margin-bottom:12px;border:1px solid var(--line);border-radius:8px;font-size:12px}.ks-group-trash article{display:flex;justify-content:space-between;gap:12px;align-items:center;flex-wrap:wrap;padding:8px 0}.ks-group-trash span,.ks-trash-message,.ks-trash-confirm{overflow-wrap:anywhere;line-height:1.6}.ks-trash-confirm{flex-basis:100%;margin:4px 0}.ks-session-delete-slot{display:flex;min-width:88px;align-items:stretch}.ks-session-delete,.ks-session-delete-cancel{min-width:72px;padding:8px 10px;border:0;border-left:1px solid var(--line);font-size:8px}.ks-session-delete{color:#e8b4b4;background:rgba(214,74,74,.06)}.ks-session-delete:hover{background:rgba(214,74,74,.14)}.ks-session-delete.confirm{color:#fff;background:#8f2f38;font-weight:600}.ks-session-delete.confirm:hover{background:#a33b45}.ks-session-delete-cancel{color:#9aa8bb;background:rgba(255,255,255,.03)}.ks-session-delete-cancel:hover{background:rgba(255,255,255,.08)}.ks-session-row.pending-delete{border-color:rgba(216,109,120,.45)}
+.ks-session-readonly{margin:0;padding:10px;max-width:280px;line-height:1.5;font-size:12px;color:var(--muted);overflow-wrap:anywhere}.ks-session-readonly strong,.ks-session-readonly span{display:block}.ks-package-cleanup-unavailable{max-width:420px;font-size:12px;line-height:1.5;overflow-wrap:anywhere;color:var(--muted)}
 .ks-session-owned{display:grid;min-width:92px;padding:8px 10px;place-items:center;border-left:1px solid var(--line);color:#718096;font-size:6px;text-align:center}
 .ks-session-list span, .ks-session-list strong, .ks-session-list small { display: block; min-width: 0; }
 .ks-session-list strong { font-size: 8px; }.ks-session-list small { margin-top: 3px; color: #657388; font-size: 7px; }
@@ -2754,4 +2803,11 @@ details.ks-session-row pre { max-height: 360px; overflow: auto; white-space: pre
   .ks-session-list .ks-capture-group > summary > b { grid-column: 1; grid-row: auto; }
 }
 
+</style>
+
+<style scoped>
+.agent-build-details { margin-top:8px; min-width:0; }
+.agent-build-details summary { cursor:pointer; font-size:10px; color:var(--primary); overflow-wrap:anywhere; }
+.agent-build-details p { color:var(--muted); font-size:10px; line-height:1.6; overflow-wrap:anywhere; }
+.runtime-device-strip > div > strong, .runtime-device-strip > div > small { overflow:visible; white-space:normal; overflow-wrap:anywhere; }
 </style>

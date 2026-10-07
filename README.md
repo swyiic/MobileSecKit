@@ -39,6 +39,10 @@ npm run tauri build
 
 `npm run check` 会执行 Vue/TypeScript 类型检查、KernSight 前端回归测试、Rust 格式检查和 Rust 单元测试。
 
+设备 ABI / Kernel、分析文件 SHA-256 和 Frida 工具版本提供可选择的完整文本及复制按钮。Frida 的“完整版本输出与路径”支持键盘展开，保留多行版本输出（最多 32 KiB，超限及检测失败会明确提示）。KernSight 构建身份来自设备 Agent 的 `code-capabilities`，显示短 Git 后缀，可展开复制完整 commit / Agent SHA-256；旧 Agent 或元数据无效时标记未知，不从本机源码推断。版本比较仍使用原有基础版本。
+
+长字段浏览器回归：`npm run test:long-fields-browser`（需可用 Playwright / Chromium，可用 `ME_PLAYWRIGHT_MODULE`、`ME_CHROMIUM_PATH` 指定已有安装；所有设备接口均为 mock，测试不连接手机）。
+
 ## Android Runtime / KernSight
 
 在 `Android Runtime` 页面连接 KernSight 后，可以直接选择：
@@ -53,6 +57,8 @@ npm run tauri build
 自动采集完成或失败后，会打开该父会话中已返回的子证据。失败不会被显示为成功，依赖阶段仍受退出、清理、实例身份和预算校验约束；只在设备端确认可继续时推进额度 partial。可在原父会话继续未成功阶段，已有成功阶段和历史 attempts 保留。新版失败诊断优先显示已匹配的结构化失败收据和独立的 Error / Caused-by 摘要，原始输出尾部、遗漏与截断状态分别保留。可复制本阶段全部已留存诊断 JSON（包含父会话、attempt 和生命周期），但不能恢复未保存的原始输出；缺少字段不用于推断已安装二进制版本或真实退出原因。密钥、CE/DE 和通用内存窗口在当前父会话接口中不受支持，不能通过打开前端开关绕过。
 
 父会话（成功、失败或 partial）可在展开后“移入回收站”，并从会话列表上方恢复；本地记录离线也可管理。此操作只改变列表可见性，保留子会话归属、原始证据与已导入文件，不释放设备或本地空间。进行中的采集不可移入回收站，需先取消并等待阶段封存。导入副本按父 ID 和本次已打开的来源目录处理，不按包名批量移除。
+
+需要释放数据时，使用独立的“永久清理本地与手机”入口：先核对精确范围，再输入当次确认；不会放入回收站。手机离线可明确选择仅清理本地，手机保持待处理，可从持久清理记录重新预览并确认。旧版无归属直接删除已停用；未知终态、共享/越界或不支持的来源保持原件。具体支持范围见 [清理边界与恢复流程](docs/KERNSIGHT_CAPTURE_STAGES.md#主会话永久清理两阶段)。
 
 采集完成会自动选中新 session。详情页将确定性报告拆为总览/壳、明文、进程、网络、Binder、路径、数据链路、原始事件和 AI-ready Evidence JSON。原始事件支持传感器、关键词与分页过滤；`correlated` 边始终与 `confirmed` 分开显示。AI-ready JSON 保留明文 preview，但不会把 dump、静态特征或时间邻近关系自动提升成已确认因果。
 

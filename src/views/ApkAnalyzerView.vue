@@ -57,14 +57,14 @@
           <div><span>Name</span><strong>{{ analysis.displayName || '—' }}</strong></div>
           <div><span>{{ analysis.platform === 'ios' ? 'Version / Build' : 'Version' }}</span><strong>{{ analysis.versionName || '—' }} ({{ analysis.versionCode || '—' }})</strong></div>
           <div><span>Size</span><strong>{{ formatSize(analysis.fileSize) }}</strong></div>
-          <div><span>Architectures</span><strong>{{ analysis.architectures.join(', ') || '未解析' }}</strong></div>
+          <div><span>Architectures</span><FullValue label="Architectures" :value="analysis.architectures.join(', ')" empty-text="未解析" /></div>
           <div><span>Likely framework</span><details class="summary-details"><summary>{{ analysis.frameworks[0] || 'Native / 未判断' }}</summary><p>{{ analysis.frameworks.join(', ') || 'Native / 未判断' }}</p></details></div>
           <div v-if="analysis.minSdk"><span>Min SDK</span><strong>{{ analysis.minSdk }}</strong></div>
           <div v-if="analysis.targetSdk"><span>Target SDK</span><strong>{{ analysis.targetSdk }}</strong></div>
           <div><span>Protection</span><strong :class="analysis.protection.status.includes('未命中') || analysis.protection.status.includes('未加密') || analysis.protection.status.includes('已经砸壳') ? 'safe' : 'warning'">{{ analysis.protection.status }}</strong></div>
           <div v-if="analysis.protection.packers.length"><span>Packer hints</span><strong>{{ analysis.protection.packers.join(', ') }}</strong></div>
           <div><span>Third-party libraries</span><details class="summary-details"><summary>{{ analysis.thirdPartyLibraries.length }} detected</summary><p>{{ analysis.thirdPartyLibraries.join(', ') || '未识别' }}</p></details></div>
-          <div><span>Artifact SHA-256</span><strong :title="analysis.artifactSha256">{{ analysis.artifactSha256.slice(0, 16) }}…</strong></div>
+          <div><span>Artifact SHA-256</span><FullValue label="Artifact SHA-256" :value="analysis.artifactSha256" monospace /></div>
         </div>
         <section class="scan-coverage" :class="{ incomplete: !analysis.scanCoverage.complete }">
           <header><div><strong>扫描覆盖度</strong><small>{{ analysis.scanCoverage.complete ? '本轮未触发扫描预算截断' : '本轮存在未扫描或被裁剪的数据' }}</small></div><b>{{ analysis.scanCoverage.complete ? 'COMPLETE' : 'PARTIAL' }}</b></header>
@@ -162,6 +162,7 @@
 </template>
 
 <script setup lang="ts">
+import FullValue from '@/components/FullValue.vue'
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { open, save } from '@tauri-apps/plugin-dialog'
 import { aiBackend, backend, readableError } from '@/services/backend'

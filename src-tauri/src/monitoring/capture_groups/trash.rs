@@ -26,7 +26,7 @@ fn trash_path(root: &Path, id: Uuid) -> PathBuf {
     root.join("trash").join(format!("{id}.json"))
 }
 
-fn read_entry(root: &Path, id: Uuid) -> Result<TrashEntry, String> {
+pub(super) fn read_entry(root: &Path, id: Uuid) -> Result<TrashEntry, String> {
     let entry: TrashEntry =
         serde_json::from_str(&read_bounded_text(&trash_path(root, id), 2 * 1024 * 1024)?)
             .map_err(|e| e.to_string())?;
@@ -54,6 +54,7 @@ pub(super) fn managed_is_trashed(root: &Path, id: Uuid) -> Result<bool, String> 
 }
 
 pub(super) fn ensure_not_trashed(root: &Path, id: Uuid) -> Result<(), String> {
+    purge::ensure_not_purging(root, id)?;
     if managed_is_trashed(root, id)? {
         return Err("主会话已移入回收站，请先恢复；未启动采集".into());
     }
@@ -117,6 +118,7 @@ fn trash_at(
     parent_id: Uuid,
     imported_roots: Vec<String>,
 ) -> Result<TrashEntry, String> {
+    purge::ensure_not_purging(root, parent_id)?;
     if parent_id.is_nil() || imported_roots.len() > 128 {
         return Err("无效主会话或导入来源过多".into());
     }
@@ -191,7 +193,7 @@ fn trash_at(
     Ok(entry)
 }
 
-fn list_at(root: &Path) -> Result<Vec<TrashEntry>, String> {
+pub(super) fn list_at(root: &Path) -> Result<Vec<TrashEntry>, String> {
     let directory = root.join("trash");
     if !directory.try_exists().map_err(|e| e.to_string())? {
         return Ok(vec![]);
@@ -215,6 +217,7 @@ fn list_at(root: &Path) -> Result<Vec<TrashEntry>, String> {
 }
 
 fn restore_at(root: &Path, parent_id: Uuid) -> Result<TrashEntry, String> {
+    purge::ensure_not_purging(root, parent_id)?;
     let mut entry = read_entry(root, parent_id)?;
     if entry.managed && !path(root, parent_id).is_file() {
         return Err("原主会话清单已在应用外移走，请先找回原清单；回收站记录已保留".into());

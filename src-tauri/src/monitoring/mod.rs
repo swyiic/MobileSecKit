@@ -1,4 +1,5 @@
 mod archive_objects;
+mod build_identity;
 pub mod capture_groups;
 mod dex_class_index;
 mod dump_policy;
@@ -398,6 +399,7 @@ pub struct AndroidMonitorCapabilityProbe {
 #[serde(rename_all = "camelCase")]
 pub struct KernSightOverview {
     agent_version: String,
+    agent_build_identity: Option<build_identity::AgentBuildIdentity>,
     protocol_major: u16,
     protocol_minor: u16,
     status: AgentStatus,
@@ -1326,12 +1328,22 @@ pub async fn get_kernsight_overview(serial: String) -> Result<KernSightOverview,
     sessions.sort_by_key(|session| std::cmp::Reverse(session.started_unix_ms.unwrap_or(0)));
     let agent_version = connection.agent_version.clone();
     connection.close().await?;
-    let (private_package_bytes, public_package_bytes) = tokio::join!(
+    let build_command = format!("{KSIGHT_AGENT} code-capabilities");
+    let (private_package_bytes, public_package_bytes, build_output) = tokio::join!(
         directory_bytes(&serial, KSIGHT_PACKAGES),
-        directory_bytes(&serial, KSIGHT_PUBLIC_PACKAGES)
+        directory_bytes(&serial, KSIGHT_PUBLIC_PACKAGES),
+        timeout(
+            Duration::from_secs(4),
+            run_device_root_script(&serial, &build_command)
+        )
     );
+    let agent_build_identity = build_output
+        .ok()
+        .and_then(Result::ok)
+        .and_then(|output| build_identity::parse(output.code, &output.stdout, &agent_version));
     Ok(KernSightOverview {
         agent_version,
+        agent_build_identity,
         protocol_major: CURRENT_PROTOCOL.major,
         protocol_minor: CURRENT_PROTOCOL.minor,
         status,
@@ -1418,17 +1430,11 @@ pub async fn cleanup_kernsight_session(serial: String, session_id: String) -> Re
     validate_serial(&serial)?;
     let session_id = Uuid::parse_str(&session_id)
         .map_err(|error| format!("KernSight session UUID 无效：{error}"))?;
-    let session_path = format!("{KSIGHT_SPOOL}/{session_id}");
-    let output = run_device_root_script(&serial, &format!("rm -rf {session_path}")).await?;
-    if output.code == Some(0) {
-        Ok(())
-    } else {
-        Err(if output.stderr.is_empty() {
-            "清理 KernSight session 失败".into()
-        } else {
-            output.stderr
-        })
-    }
+    let _ = session_id;
+    Err(
+        "旧版直接删除已停用：请使用父会话的永久清理预览并明确确认；无归属证明的旧 session 保留"
+            .into(),
+    )
 }
 
 /// A new IPC command keeps an old backend from silently ignoring the new field.
@@ -4161,20 +4167,10 @@ pub async fn read_local_kernsight_evidence_file(
 pub async fn cleanup_kernsight_package_dump(serial: String, package: String) -> Result<(), String> {
     validate_serial(&serial)?;
     validate_package(&package)?;
-    let output = run_device_root_script(
-        &serial,
-        &format!("rm -rf {KSIGHT_PACKAGES}/{package} {KSIGHT_PUBLIC_PACKAGES}/{package}"),
+    Err(
+        "旧版按包名批量清理已停用：请使用有归属证明的父会话永久清理预览；无归属证明的旧目录保留"
+            .into(),
     )
-    .await?;
-    if output.code == Some(0) {
-        Ok(())
-    } else {
-        Err(if output.stderr.is_empty() {
-            "清理 KernSight package dump 失败".into()
-        } else {
-            output.stderr
-        })
-    }
 }
 
 async fn directory_bytes(serial: &str, path: &str) -> Result<u64, String> {

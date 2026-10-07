@@ -38,15 +38,15 @@
           <div><span>Root Status</span><strong :class="tone(details.rootStatus)">{{ details.rootStatus }}</strong></div>
           <div><span>SELinux</span><strong :class="tone(details.selinuxStatus)">{{ details.selinuxStatus }}</strong></div>
           <div><span>Bootloader</span><strong :class="tone(details.bootloaderStatus)">{{ details.bootloaderStatus }}</strong></div>
-          <div class="wide"><span>Build Number</span><code>{{ details.buildNumber }}</code></div>
+          <div class="wide"><span>Build Number</span><FullValue label="Build Number" :value="details.buildNumber" monospace /></div>
           <div><span>IP Address</span><strong class="accent">{{ details.ipAddress }}</strong></div>
-          <div><span>Architecture</span><strong>{{ details.architecture }}</strong></div>
+          <div><span>Architecture</span><FullValue label="Architecture" :value="details.architecture" monospace /></div>
           <div><span>Family</span><strong>{{ details.architectureFamily }}</strong></div>
-          <div><span>ABI List</span><strong>{{ details.abiList.join(', ') || '—' }}</strong></div>
+          <div class="wide"><span>ABI List</span><FullValue label="ABI List" :value="details.abiList.join(', ')" monospace /></div>
           <div><span>Security Patch</span><strong>{{ details.securityPatch }}</strong></div>
           <div><span>Brand</span><strong>{{ details.brand }}</strong></div>
           <div class="wide"><span>Frida Server</span><details class="summary-details"><summary :class="details.fridaServerVersion ? 'safe' : 'danger'">{{ details.fridaServerVersion || 'Not detected' }}</summary><p>{{ details.fridaServerVersion || '未在 /data/local/tmp/frida-server 检测到版本；可到 Frida Toolbox 自动部署。' }}</p></details></div>
-          <div class="wide"><span>Kernel</span><strong>{{ details.kernelVersion }}</strong></div>
+          <div class="wide"><span>Kernel</span><FullValue label="Kernel" :value="details.kernelVersion" monospace /></div>
         </div>
         <div v-else-if="iosDetails" class="spec-grid">
           <div><span>Device Name</span><strong>{{ iosDetails.deviceName }}</strong></div>
@@ -97,6 +97,7 @@
 
 <script setup lang="ts">
 import { computed, ref } from 'vue'
+import FullValue from '@/components/FullValue.vue'
 import type { DeviceDetails, DeviceSummary, InstalledAppInfo, IosDeviceDetails } from '@/types'
 
 function batteryIcon(level: number) {

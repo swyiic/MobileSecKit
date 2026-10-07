@@ -3,6 +3,9 @@ export interface ToolStatus {
   executable: string
   available: boolean
   version?: string
+  versionOutput?: string
+  versionOutputTruncated?: boolean
+  versionError?: string
   path?: string
   category: 'system' | 'optional'
   group: 'frida' | 'analyzer'

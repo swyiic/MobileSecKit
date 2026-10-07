@@ -14,7 +14,19 @@
       <div class="tool-status-grid">
         <div v-for="tool in fridaTools" :key="tool.executable" class="tool-status" :class="tool.category">
           <span class="tool-status-dot" :class="{ missing: !tool.available }"></span>
-          <div><strong>{{ tool.name }}</strong><small>{{ tool.available ? (tool.version || tool.path) : '未安装' }}</small></div>
+          <div class="tool-status-body">
+            <strong>{{ tool.name }}</strong>
+            <FullValue :label="`${tool.name} 版本`" :value="tool.available ? tool.version : null" :empty-text="tool.available ? '版本未知' : '未安装'" />
+            <details v-if="tool.available" class="tool-version-details">
+              <summary>完整版本输出与路径</summary>
+              <FullValue :label="`${tool.name} 版本输出`" :value="tool.versionOutput || tool.version" empty-text="未返回版本输出" monospace />
+              <p v-if="tool.version && !tool.versionOutput" class="tool-version-warning">未提供完整原始输出，此处仅显示版本摘要</p>
+              <p v-if="tool.versionOutputTruncated" class="tool-version-warning">版本输出超过 32 KiB，仅保留前 32 KiB</p>
+              <p v-if="tool.versionError" class="tool-version-warning">{{ tool.versionError }}</p>
+              <p class="tool-path-label">可执行文件路径</p>
+              <FullValue :label="`${tool.name} 路径`" :value="tool.path" monospace />
+            </details>
+          </div>
         </div>
       </div>
       <p v-if="!fridaTools.length" class="empty-inline">未检测到 Frida 相关工具；App Analyzer 的静态分析工具不在这里展示。</p>
@@ -104,6 +116,7 @@
 </template>
 
 <script setup lang="ts">
+import FullValue from '@/components/FullValue.vue'
 import { computed, ref, watch } from 'vue'
 import { appConfig, updateAppConfig } from '@/services/config'
 import { runtimeEvidenceCoverage } from '@/services/runtimeCoverage'
@@ -325,3 +338,18 @@ function submit() {
   emit('run', { process: selectedProcess.value, pid: selectedTarget.value?.pid, mode: mode.value, script: script.value, scriptPath: externalScriptPath.value || selectedScriptPath.value || undefined, durationSeconds: observationDuration.value, compatibilityProfile: props.device?.platform === 'ios' ? iosCompatibilityProfile.value : undefined, platform: devicePlatform.value })
 }
 </script>
+
+<style scoped>
+.environment-card .tool-status-grid { grid-template-columns:repeat(auto-fit,minmax(min(100%,220px),1fr)); align-items:start; }
+.environment-card .tool-status { align-items:flex-start; min-width:0; }
+.environment-card .tool-status-dot { margin-top:5px; }
+.tool-status-body { min-width:0; flex:1; }
+.tool-status-body > strong { white-space:normal; overflow-wrap:anywhere; margin-bottom:5px; }
+.tool-version-details { min-width:0; margin-top:7px; }
+.tool-version-details summary { color:var(--primary); font-size:10px; line-height:1.6; cursor:pointer; overflow-wrap:anywhere; }
+.tool-version-details[open] summary { margin-bottom:8px; }
+.tool-version-warning, .tool-path-label { color:var(--muted); font-size:10px; line-height:1.5; overflow-wrap:anywhere; }
+.tool-version-warning { color:var(--amber); }
+.environment-card .safety-note { overflow-wrap:anywhere; }
+@media(max-width:650px) { .environment-card .tool-status-grid { grid-template-columns:minmax(0,1fr); } }
+</style>

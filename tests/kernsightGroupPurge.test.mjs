@@ -1,0 +1,89 @@
+import assert from 'node:assert/strict'
+import test from 'node:test'
+import { readFileSync } from 'node:fs'
+import ts from 'typescript'
+const source = readFileSync(new URL('../src/services/kernsightGroupPurge.ts', import.meta.url), 'utf8')
+const code = ts.transpileModule(source, {compilerOptions:{target:ts.ScriptTarget.ES2022,module:ts.ModuleKind.ES2022}}).outputText
+const {canConfirmPurge, createPurgeRequestGate, purgePlanMatches, purgeTargetKey, bundleRemovedByPurge, purgeReportLabel} = await import(`data:text/javascript;base64,${Buffer.from(code).toString('base64')}`)
+const target = {parentId:'parent-a',serial:'serial-a',package:'org.example.fixture',importedRoots:['/local/one','/local/two']}
+const plan = {schema:'mobilee.group-purge-plan/v1',id:'plan-a',...target,createdUnixMs:1000,expiresUnixMs:301000,confirmationToken:'one-use-random-token',confirmationText:'永久清理 parent-a',localEntries:[],device:{status:'ready',entries:[],warnings:[]},warnings:[],localOnly:false}
+const confirm = (p=plan,t=target,ack=true,typed=p?.confirmationText,now=2000,busy=false)=>canConfirmPurge(p,t,ack,typed,now,busy)
+const report = {id:'plan-a',...target,state:'completed',localState:'completed',deviceState:'completed',removedLocalFiles:1,removedLocalAllocatedBytes:null,updatedUnixMs:2000,warnings:[],error:null,importedRoots:['/local/one']}
+const bundle = (root='/local/one',group=target)=>({root,package:group.package,sessionReport:{mobilee_capture_group:{id:group.parentId,serial:group.serial,package:group.package}}})
+test('fresh exact token and checkbox permit only the bound identity',()=>{
+ assert.equal(confirm(),true)
+ for(const field of ['parentId','serial','package']) {assert.equal(confirm(plan,{...target,[field]:'foreign'}),false);assert.equal(purgePlanMatches(plan,{...target,[field]:'foreign'}),false)}
+ assert.equal(confirm(plan,target,false),false)
+ for(const typed of ['', 'parent-a', '永久清理 parent-b',' 永久清理 parent-a','永久清理 parent-a '])assert.equal(confirm(plan,target,true,typed),false)
+ assert.equal(confirm(null),false);assert.equal(confirm(plan,null),false);assert.equal(confirm(plan,target,true,plan.confirmationText,2000,true),false)
+})
+test('expired, future and malformed timestamps fail closed at the exact boundary',()=>{
+ assert.equal(confirm(plan,target,true,plan.confirmationText,301000),false)
+ assert.equal(confirm(plan,target,true,plan.confirmationText,300999),true)
+ for(const p of [{...plan,createdUnixMs:3000},{...plan,expiresUnixMs:302000},{...plan,createdUnixMs:NaN},{...plan,expiresUnixMs:Infinity},{...plan,expiresUnixMs:900}])assert.equal(confirm(p),false)
+})
+test('offline or blocked paired plans cannot execute; local-only requires a separately generated plan',()=>{
+ for(const device of [null,{status:'offline'},{status:'blocked'}]) {
+  assert.equal(confirm({...plan,device}),false)
+  assert.equal(confirm({...plan,device,localOnly:true}),true)
+ }
+ assert.equal(confirm({...plan,device:{status:'not_required'}}),true)
+})
+test('cancel and newer target invalidate late previews; repeated execution is single-flight',()=>{
+ const gate=createPurgeRequestGate(); const first=gate.begin();assert.equal(gate.current(first),true)
+ gate.invalidate();assert.equal(gate.current(first),false)
+ const second=gate.begin();const third=gate.begin();assert.equal(gate.current(second),false);assert.equal(gate.current(third),true)
+ assert.equal(gate.startExecution(),true);assert.equal(gate.startExecution(),false);assert.equal(gate.executing(),true)
+ gate.invalidate();assert.equal(gate.startExecution(),false);gate.finishExecution();assert.equal(gate.startExecution(),true)
+})
+test('selection binding includes precise roots and retry identity, independent of ordering',()=>{
+ assert.equal(purgeTargetKey(target),purgeTargetKey({...target,importedRoots:[...target.importedRoots].reverse()}))
+ for(const t of [{...target,importedRoots:['/local/one']},{...target,retryPlanId:'another'}])assert.notEqual(purgeTargetKey(t),purgeTargetKey(target))
+})
+test('successful local cleanup removes only approved matching import copies',()=>{
+ assert.equal(bundleRemovedByPurge(bundle(),plan,report),true)
+ assert.equal(bundleRemovedByPurge(bundle('/local/two'),plan,report),false)
+ for(const field of ['parentId','serial','package'])assert.equal(bundleRemovedByPurge(bundle('/local/one',{...target,[field]:'other'}),plan,report),false)
+ assert.equal(bundleRemovedByPurge(bundle(),plan,{...report,parentId:'other'}),false)
+ assert.equal(bundleRemovedByPurge(bundle(),plan,{...report,serial:'other'}),false)
+ assert.equal(bundleRemovedByPurge(bundle(),plan,{...report,package:'other'}),false)
+ for(const localState of ['pending','failed','not_required'])assert.equal(bundleRemovedByPurge(bundle(),plan,{...report,localState}),false)
+})
+test('pending/failed/device-only/local-only receipts never claim paired completion or reclaimed bytes',()=>{
+ assert.match(purgeReportLabel(report),/本地与设备.*完成/)
+ assert.match(purgeReportLabel({...report,state:'partial',deviceState:'pending'}),/设备待清理/)
+ assert.match(purgeReportLabel({...report,state:'partial',localState:'failed'}),/本地待清理/)
+ for(const r of [{...report,state:'failed',localState:'failed',deviceState:'pending'},{...report,state:'prepared',localState:'pending',deviceState:'pending'}])assert.doesNotMatch(purgeReportLabel(r),/核验完成|已释放/)
+})
+test('frontend IPC keeps irreversible execution separate from preview, retry and recoverable trash',()=>{
+ const backend=readFileSync(new URL('../src/services/backend/monitoring.ts',import.meta.url),'utf8')
+ for(const name of ['prepare_kernsight_group_purge','execute_kernsight_group_purge','list_kernsight_group_purges','prepare_kernsight_group_purge_retry','trash_kernsight_group'])assert.ok(backend.includes(`'${name}'`))
+ assert.match(backend,/executeKernSightGroupPurge:[^\n]+\{ planId, confirmationToken \}/)
+ const vue=readFileSync(new URL('../src/components/KernSightGroupPurge.vue',import.meta.url),'utf8')
+ assert.match(vue,/if \(!canExecute.value \|\| !plan.value \|\| !gate.startExecution\(\)\) return/)
+ assert.match(vue,/!gate.current\(ticket\) \|\| !props.active/)
+ assert.match(vue,/不可恢复确认/)
+ assert.match(vue,/不是已释放空间/)
+ const app=readFileSync(new URL('../src/App.vue',import.meta.url),'utf8')
+ assert.match(app,/:active="activeTab === 'android-runtime'"/)
+})
+
+test('retry keeps readable confirmation text but execution passes only the new preview nonce',()=>{
+ const retry={...plan,confirmationToken:'fresh-retry-nonce'}
+ assert.equal(confirm(retry),true)
+ assert.equal(confirm(retry,target,true,plan.confirmationToken),false)
+ const vue=readFileSync(new URL('../src/components/KernSightGroupPurge.vue',import.meta.url),'utf8')
+ assert.match(vue,/executeKernSightGroupPurge\(approvedPlan.id, approvedPlan.confirmationToken\)/)
+ assert.doesNotMatch(vue,/executeKernSightGroupPurge\([^\n]+typedConfirmation/)
+ assert.match(vue,/plan.confirmationText/)
+})
+
+test('retry explicitly selects local-only scope and rejects a differently scoped returned plan',()=>{
+ const vue=readFileSync(new URL('../src/components/KernSightGroupPurge.vue',import.meta.url),'utf8')
+ assert.match(vue,/prepareKernSightGroupPurgeRetry\(target.retryPlanId, requestedLocalOnly\)/)
+ assert.match(vue,/!purgePlanMatches\(result, target\) \|\| result.localOnly !== requestedLocalOnly/)
+ const localMode=vue.indexOf('v-model="localOnly"')
+ assert.ok(localMode>vue.indexOf('</template>'))
+ const backend=readFileSync(new URL('../src/services/backend/monitoring.ts',import.meta.url),'utf8')
+ assert.match(backend,/prepareKernSightGroupPurgeRetry: \(planId: string, localOnly = false\)[^\n]+\{ planId, localOnly \}/)
+})

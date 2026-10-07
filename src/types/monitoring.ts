@@ -64,6 +64,13 @@ export interface KernSightAgentStatus {
 
 export interface KernSightOverview {
   agentVersion: string
+  agentBuildIdentity?: {
+    version: string
+    gitCommit: string | null
+    gitDirty: boolean | null
+    source: 'git' | 'override' | 'unknown'
+    binarySha256: string | null
+  } | null
   protocolMajor: number
   protocolMinor: number
   status: KernSightAgentStatus
@@ -456,4 +463,48 @@ export interface KernSightGroupStageResult {group:KernSightCaptureGroup;result:K
 export interface KernSightCaptureGroupTrash {
   schema: 'mobilee.capture-group-trash/v1'; group: KernSightCaptureGroup;
   trashedUnixMs: number; managed: boolean; trashed?: boolean; retainedSessionIds?: string[]; importedRoots: string[];
+}
+
+export interface KernSightGroupPurgeEntry {
+  path: string
+  kind: string
+  logicalBytes: number
+  allocatedBytes: number | null
+  files: number
+}
+export interface KernSightGroupPurgeDevice {
+  status: 'ready' | 'offline' | 'blocked' | 'not_required'
+  entries: KernSightGroupPurgeEntry[]
+  warnings: string[]
+}
+export interface KernSightGroupPurgePlan {
+  schema: string
+  id: string
+  parentId: string
+  serial: string
+  package: string
+  createdUnixMs: number
+  expiresUnixMs: number
+  confirmationToken: string
+  confirmationText: string
+  localEntries: KernSightGroupPurgeEntry[]
+  device: KernSightGroupPurgeDevice | null
+  warnings: string[]
+  localOnly: boolean
+}
+export interface KernSightGroupPurgeReport {
+  id: string
+  parentId: string
+  serial: string
+  package: string
+  importedRoots: string[]
+  retainedSessionIds: string[]
+  updatedUnixMs: number
+  state: string
+  localState: string
+  deviceState: string
+  removedLocalFiles: number
+  removedLocalAllocatedBytes: number | null
+  warnings: string[]
+  error: string | null
 }

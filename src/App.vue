@@ -63,6 +63,7 @@
       <!-- Keep KernSight mounted so device/session/report state survives menu switches. -->
       <AndroidRuntimeMonitorView
         v-show="activeTab === 'android-runtime'"
+        :active="activeTab === 'android-runtime'"
         :device="selectedDevice"
         :details="details"
         :installed-apps="fridaProcesses"

@@ -4,6 +4,9 @@ use std::sync::{Mutex, OnceLock};
 use tauri::Manager;
 
 mod diagnostics;
+pub mod purge;
+mod purge_device;
+mod purge_local;
 pub mod trash;
 
 const SCHEMA: &str = "mobilee.capture-group/v1";
@@ -463,8 +466,11 @@ fn load(root: &Path, id: Uuid) -> Result<Group, String> {
         return Err("主会话清单与文件身份冲突".into());
     }
     g.validate()?;
+    let before_recovery = serde_json::to_vec(&g).map_err(|e| e.to_string())?;
     g.recover(epoch());
-    save(root, &g)?;
+    if serde_json::to_vec(&g).map_err(|e| e.to_string())? != before_recovery {
+        save(root, &g)?;
+    }
     Ok(g)
 }
 pub fn read_import(root: &Path) -> Result<Option<Group>, String> {
@@ -609,7 +615,7 @@ pub fn list_kernsight_groups(
             .and_then(|s| s.to_str())
             .and_then(|s| Uuid::parse_str(s).ok())
         {
-            if trash::managed_is_trashed(&root, id)? {
+            if trash::managed_is_trashed(&root, id)? || purge::is_started(&root, id)? {
                 continue;
             }
             let g = load(&root, id)?;
@@ -2288,6 +2294,7 @@ pub(super) fn reserve_export_at(
     output: &Path,
 ) -> Result<Option<(u64, u64, u64, u64)>, String> {
     let _lock = IO_LOCK.lock().map_err(|e| e.to_string())?;
+    purge::ensure_not_purging(r, g.id)?;
     *g = load(r, g.id)?;
     let Some(b) = g.budget.as_mut() else {
         return Ok(None);
