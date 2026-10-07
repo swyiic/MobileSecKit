@@ -2487,3 +2487,6 @@ fn ensure_previous_shutdown(
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod approved_device_acceptance;
