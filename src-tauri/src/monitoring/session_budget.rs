@@ -133,6 +133,25 @@ pub fn charge(path: &Path, n: u64) -> io::Result<()> {
     }
     Ok(())
 }
+pub fn remaining_ms(path: &Path, fallback: u64) -> io::Result<u64> {
+    charge(path, 0)?;
+    let now = Instant::now();
+    let local = states()
+        .lock()
+        .map_err(|_| io::Error::other("budget lock"))?
+        .values()
+        .filter(|s| s.roots.iter().any(|r| path.starts_with(r)))
+        .map(|s| s.deadline.saturating_duration_since(now).as_millis() as u64)
+        .min()
+        .unwrap_or(fallback);
+    let ms =
+        super::session_deadline::remaining_ms(local.min(fallback)).map_err(io::Error::other)?;
+    if ms == 0 {
+        return Err(io::Error::other("time_budget_exhausted"));
+    }
+    Ok(ms)
+}
+
 pub fn record_failure(path: &Path, reason: &str) {
     if let Ok(mut all) = states().lock() {
         for s in all
@@ -157,6 +176,161 @@ pub fn write(path: impl AsRef<Path>, bytes: impl AsRef<[u8]>) -> io::Result<()> 
     result?;
     charge(path, 0)
 }
+/// Finite per-document limit, shared with the evidence importer. Parent quota still wins.
+pub const MAX_EVIDENCE_JSON_BYTES: u64 = 64 * 1024 * 1024;
+
+pub struct ReplayEnvelope {
+    bytes: u64,
+    events: usize,
+}
+impl Default for ReplayEnvelope {
+    fn default() -> Self {
+        Self {
+            bytes: 2,
+            events: 0,
+        }
+    }
+}
+impl ReplayEnvelope {
+    pub fn admit(&mut self, batch_bytes: u64, count: usize) -> io::Result<()> {
+        let additional = batch_bytes.saturating_sub(2) + u64::from(self.events > 0 && count > 0);
+        let bytes = self
+            .bytes
+            .checked_add(additional)
+            .ok_or_else(|| io::Error::other("replay byte overflow"))?;
+        let events = self
+            .events
+            .checked_add(count)
+            .ok_or_else(|| io::Error::other("replay count overflow"))?;
+        if bytes > MAX_EVIDENCE_JSON_BYTES || events > 100_000 {
+            return Err(io::Error::other(
+                "event replay exceeds 64MiB/100000 event bound; incomplete, not truncated success",
+            ));
+        }
+        self.bytes = bytes;
+        self.events = events;
+        Ok(())
+    }
+}
+
+struct JsonMeasure<'a> {
+    path: &'a Path,
+    bytes: u64,
+}
+impl Write for JsonMeasure<'_> {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        charge(self.path, 0)?;
+        self.bytes = self
+            .bytes
+            .checked_add(bytes.len() as u64)
+            .ok_or_else(|| io::Error::other("JSON size overflow"))?;
+        if self.bytes > MAX_EVIDENCE_JSON_BYTES {
+            record_failure(self.path, "evidence_json_limit_exceeded");
+            return Err(io::Error::other(
+                "evidence JSON exceeds 64MiB document bound",
+            ));
+        }
+        Ok(bytes.len())
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        charge(self.path, 0)
+    }
+}
+
+pub fn measure_json(path: &Path, value: &impl Serialize) -> io::Result<u64> {
+    let mut measure = JsonMeasure { path, bytes: 0 };
+    serde_json::to_writer(&mut measure, value).map_err(io::Error::other)?;
+    Ok(measure.bytes)
+}
+
+/// Encode without allocating a second complete JSON buffer. Admit the complete
+/// document before creating a file; publish only complete, synced bytes and never
+/// replace retained evidence. Failed temporary output stays charged to the parent.
+pub fn write_json(path: impl AsRef<Path>, value: &impl Serialize) -> io::Result<u64> {
+    let path = path.as_ref();
+    charge(path, 0)?;
+    if path.exists() {
+        return Err(io::Error::other("retained JSON target already exists"));
+    }
+    let required = measure_json(path, value)?;
+    let remaining = states()
+        .lock()
+        .map_err(|_| io::Error::other("budget lock"))?
+        .values()
+        .filter(|s| s.roots.iter().any(|r| path.starts_with(r)))
+        .map(|s| {
+            s.receipt
+                .limit_bytes
+                .saturating_sub(s.receipt.admitted_write_bytes)
+        })
+        .min()
+        .unwrap_or(MAX_EVIDENCE_JSON_BYTES);
+    if required > remaining {
+        record_failure(path, "output_budget_exhausted");
+        return Err(io::Error::other(format!(
+            "output_budget_exhausted: JSON requires {required} bytes, remaining {remaining} bytes"
+        )));
+    }
+    let temporary = path.with_extension(format!("json.pending-{}", uuid::Uuid::new_v4()));
+    let result = (|| {
+        let file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary)?;
+        let file = BudgetFile {
+            file,
+            path: temporary.clone(),
+        };
+        let mut writer = io::BufWriter::with_capacity(65536, file);
+        serde_json::to_writer(&mut writer, value).map_err(io::Error::other)?;
+        writer.flush()?;
+        writer.get_ref().sync_all()?;
+        charge(path, 0)?;
+        std::fs::hard_link(&temporary, path)?;
+        Ok(required)
+    })();
+    if result.is_err() {
+        record_failure(path, "evidence_json_write_failed");
+    }
+    let _ = std::fs::remove_file(&temporary);
+    result
+}
+
+/// Preserve small original provenance notes byte-for-byte without overwriting.
+pub fn write_new_bytes(path: impl AsRef<Path>, bytes: &[u8]) -> io::Result<()> {
+    let path = path.as_ref();
+    if bytes.len() > 32768 {
+        return Err(io::Error::other("provenance note exceeds 32KiB"));
+    }
+    charge(path, 0)?;
+    if path.exists() {
+        return Err(io::Error::other(
+            "retained provenance target already exists",
+        ));
+    }
+    let temporary = path.with_extension(format!("pending-{}", uuid::Uuid::new_v4()));
+    let result = (|| {
+        let file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary)?;
+        let mut file = BudgetFile {
+            file,
+            path: temporary.clone(),
+        };
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        charge(path, 0)?;
+        std::fs::hard_link(&temporary, path)?;
+        Ok(())
+    })();
+    if result.is_err() {
+        record_failure(path, "provenance_write_failed");
+    }
+    let _ = std::fs::remove_file(temporary);
+    result
+}
+
 pub struct BudgetFile {
     file: File,
     path: PathBuf,
@@ -691,6 +865,172 @@ mod deadline_tests {
         assert!(!root.join("late").exists());
         assert!(b.reserve("same".into(), "l0", 0).is_err());
         assert!(b.reserve("new".into(), "dump", 0).is_err());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod retained_json_tests {
+    use super::*;
+    fn root() -> PathBuf {
+        let p = std::env::temp_dir().join(format!("me-retained-json-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&p).unwrap();
+        p
+    }
+    #[test]
+    fn raw_events_over_twelve_mib_preserved_with_explicit_finite_budget() {
+        let root = root();
+        let value = serde_json::json!({"events":[{"payload":"x".repeat(13 * 1024 * 1024)}],"execution_complete":false});
+        let path = root.join("events.json");
+        let expected = measure_json(&path, &value).unwrap();
+        let guard = Guard::install(vec![root.clone()], expected, 30000).unwrap();
+        assert_eq!(write_json(&path, &value).unwrap(), expected);
+        assert_eq!(
+            serde_json::from_reader::<_, serde_json::Value>(File::open(&path).unwrap()).unwrap(),
+            value
+        );
+        assert_eq!(guard.receipt().admitted_write_bytes, expected);
+        assert!(!guard.receipt().partial);
+        drop(guard);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn insufficient_quota_reports_exact_required_bytes_and_publishes_nothing() {
+        let root = root();
+        let value = vec!["x".repeat(13 * 1024 * 1024)];
+        let path = root.join("events.json");
+        let required = measure_json(&path, &value).unwrap();
+        let guard = Guard::install(vec![root.clone()], 12 * 1024 * 1024, 30000).unwrap();
+        let error = write_json(&path, &value).unwrap_err().to_string();
+        assert!(error.contains(&format!("requires {required} bytes")));
+        assert!(!path.exists());
+        assert_eq!(guard.receipt().admitted_write_bytes, 0);
+        assert!(guard.receipt().partial);
+        assert_eq!(
+            guard.receipt().reason.as_deref(),
+            Some("output_budget_exhausted")
+        );
+        drop(guard);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn retained_target_is_never_overwritten() {
+        let root = root();
+        let path = root.join("events.json");
+        std::fs::write(&path, b"original").unwrap();
+        assert!(write_json(&path, &vec![1, 2]).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), b"original");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod offline_retained_acceptance {
+    use super::*;
+    #[tokio::test]
+    #[ignore = "requires explicitly selected existing local retained evidence; never accesses a device"]
+    async fn imports_existing_failed_parent_without_inventing_raw_events() {
+        let source = PathBuf::from(
+            std::env::var_os("ME_OFFLINE_RETAINED_ROOT").expect("explicit existing local source"),
+        );
+        let group: super::super::capture_groups::Group =
+            serde_json::from_reader(File::open(source.join("capture-group.json")).unwrap())
+                .unwrap();
+        group.validate().unwrap();
+        assert_eq!(group.state, "failed");
+        let bundle = super::super::import_kernsight_evidence_directory(
+            source.to_string_lossy().into_owned(),
+        )
+        .await
+        .unwrap();
+        let report = bundle.session_report.unwrap();
+        assert_eq!(report["mobilee_capture_group"]["state"], "failed");
+        assert_ne!(report["execution_complete"], true);
+        let mut copied_reports = 0;
+        let root =
+            std::env::temp_dir().join(format!("me-offline-retained-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let guard = Guard::install(vec![root.clone()], 12 * 1024 * 1024, 30000).unwrap();
+        for entry in std::fs::read_dir(source.join("sessions")).unwrap() {
+            let entry = entry.unwrap();
+            let relation: serde_json::Value = serde_json::from_reader(
+                File::open(entry.path().join("capture-relation.json")).unwrap(),
+            )
+            .unwrap();
+            let id = uuid::Uuid::parse_str(&entry.file_name().to_string_lossy()).unwrap();
+            super::super::capture_groups::verify_session_relation(&group, id, &relation).unwrap();
+            let value: serde_json::Value = serde_json::from_reader(
+                File::open(entry.path().join("session-report.json")).unwrap(),
+            )
+            .unwrap();
+            let destination = root.join(format!("{id}.json"));
+            write_json(&destination, &value).unwrap();
+            let copied: serde_json::Value =
+                serde_json::from_reader(File::open(destination).unwrap()).unwrap();
+            assert_eq!(copied, value);
+            // Missing raw events remain missing. A summary is not a replacement.
+            assert!(!entry.path().join("events.json").exists());
+            copied_reports += 1;
+        }
+        assert!(copied_reports > 0);
+        assert!(!guard.receipt().partial);
+        println!(
+            "offline_failed_parent={} preserved_reports={} raw_events_missing=true complete=false",
+            group.id, copied_reports
+        );
+        drop(guard);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod replay_envelope_tests {
+    use super::*;
+    #[test]
+    fn batch_delimiters_empty_batches_and_exact_byte_boundary() {
+        let mut envelope = ReplayEnvelope::default();
+        envelope.admit(2, 0).unwrap();
+        envelope.admit(MAX_EVIDENCE_JSON_BYTES - 3, 1).unwrap();
+        envelope.admit(4, 1).unwrap();
+        assert_eq!(envelope.bytes, MAX_EVIDENCE_JSON_BYTES);
+        envelope.admit(2, 0).unwrap();
+        assert!(envelope.admit(4, 1).is_err());
+    }
+    #[test]
+    fn event_count_limit_is_cumulative_and_failure_does_not_admit_batch() {
+        let mut envelope = ReplayEnvelope::default();
+        envelope.admit(2, 50_000).unwrap();
+        envelope.admit(2, 50_000).unwrap();
+        assert!(envelope.admit(2, 1).is_err());
+        assert_eq!(envelope.events, 100_000);
+    }
+    #[test]
+    fn replay_time_uses_scoped_guard_and_rejects_expired_deadline() {
+        let root = std::env::temp_dir().join(format!("me-replay-time-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let guard = Guard::install(vec![root.clone()], 1024, 20).unwrap();
+        assert!(remaining_ms(&root, 60000).unwrap() <= 20);
+        std::thread::sleep(Duration::from_millis(25));
+        assert!(remaining_ms(&root, 60000).is_err());
+        assert!(guard.receipt().partial);
+        drop(guard);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod provenance_bytes_tests {
+    use super::*;
+    #[test]
+    fn original_provenance_whitespace_is_retained_and_not_overwritten() {
+        let root = std::env::temp_dir().join(format!("me-provenance-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("capture-relation.json");
+        let bytes = b"{ \"parent\": \"original\" }\n";
+        write_new_bytes(&path, bytes).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        assert!(write_new_bytes(&path, b"{}").is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
         std::fs::remove_dir_all(root).unwrap();
     }
 }

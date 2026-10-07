@@ -2509,36 +2509,65 @@ async fn replay_session_events_scoped(
     session_id: Uuid,
     paths: Option<&runtime_paths::RuntimePaths>,
 ) -> Result<Vec<Event>, String> {
-    let mut connection = KernSightConnection::connect_scoped(serial, paths).await?;
-    let request_id = Uuid::new_v4();
-    connection
-        .send(&Message::ReplayBatches(ReplayBatches {
-            request_id,
-            session_id,
-            after_batch_sequence: None,
-        }))
-        .await?;
-    let mut events = Vec::new();
-    loop {
-        match connection.receive().await? {
-            Message::EventBatch(batch) if batch.session_id == session_id => {
-                events.extend(batch.events);
+    replay_session_events_bounded(serial, session_id, paths, None).await
+}
+async fn replay_session_events_bounded(
+    serial: &str,
+    session_id: Uuid,
+    paths: Option<&runtime_paths::RuntimePaths>,
+    evidence_root: Option<&Path>,
+) -> Result<Vec<Event>, String> {
+    let replay = async {
+        let mut connection = KernSightConnection::connect_scoped(serial, paths).await?;
+        let request_id = Uuid::new_v4();
+        connection
+            .send(&Message::ReplayBatches(ReplayBatches {
+                request_id,
+                session_id,
+                after_batch_sequence: None,
+            }))
+            .await?;
+        let mut events = Vec::new();
+        let mut envelope = session_budget::ReplayEnvelope::default();
+        loop {
+            match connection.receive().await? {
+                Message::EventBatch(batch) if batch.session_id == session_id => {
+                    if let Some(root) = evidence_root {
+                        let batch_bytes = session_budget::measure_json(root, &batch.events)
+                            .map_err(|e| format!("事件重放 JSON 超出有界输入：{e}"))?;
+                        envelope
+                            .admit(batch_bytes, batch.events.len())
+                            .map_err(|e| e.to_string())?;
+                    }
+                    events.extend(batch.events);
+                }
+                Message::ReplayComplete(complete)
+                    if complete.request_id == request_id && complete.session_id == session_id =>
+                {
+                    break;
+                }
+                Message::Ack(ack) if !ack.accepted => {
+                    return Err(ack
+                        .detail
+                        .unwrap_or_else(|| "KernSight 拒绝事件重放".into()));
+                }
+                message => return Err(format!("KernSight 事件流响应不正确：{message:?}")),
             }
-            Message::ReplayComplete(complete)
-                if complete.request_id == request_id && complete.session_id == session_id =>
-            {
-                break;
-            }
-            Message::Ack(ack) if !ack.accepted => {
-                return Err(ack
-                    .detail
-                    .unwrap_or_else(|| "KernSight 拒绝事件重放".into()));
-            }
-            message => return Err(format!("KernSight 事件流响应不正确：{message:?}")),
         }
+        connection.close().await?;
+        Ok(events)
+    };
+    if let Some(root) = evidence_root {
+        let ms = session_budget::remaining_ms(root, 60000).map_err(|e| e.to_string())?;
+        timeout(Duration::from_millis(ms), replay)
+            .await
+            .map_err(|_| {
+                session_budget::record_failure(root, "time_budget_exhausted");
+                "有界事件回放期限耗尽；未截断为成功".to_owned()
+            })?
+    } else {
+        replay.await
     }
-    connection.close().await?;
-    Ok(events)
 }
 
 fn compact_session_report_for_ui(report: &mut SessionReport) {
@@ -3951,11 +3980,15 @@ async fn append_device_sessions_to_package_evidence(
         return Ok(());
     };
     group.validate()?;
-    session_budget::write(
-        evidence_root.join("capture-group.json"),
-        serde_json::to_vec_pretty(group).map_err(|e| e.to_string())?,
-    )
-    .map_err(|e| e.to_string())?;
+    if evidence_root.join("capture-group.json").exists()
+        || evidence_root.join("session-report.json").exists()
+        || evidence_root.join("session-index.json").exists()
+        || evidence_root.join("sessions").exists()
+    {
+        return Err("Session 证据目标已有保留记录；请选新的导入目录，拒绝覆盖".into());
+    }
+    session_budget::write_json(evidence_root.join("capture-group.json"), group)
+        .map_err(|e| e.to_string())?;
     let paths = runtime_paths_from_group(Some(group))?;
     let selected_ids = group.session_ids();
     let sessions_root = evidence_root.join("sessions");
@@ -3993,7 +4026,14 @@ async fn append_device_sessions_to_package_evidence(
                 continue;
             }
         };
-        let events = match replay_session_events_scoped(serial, session_id, paths.as_ref()).await {
+        let events = match replay_session_events_bounded(
+            serial,
+            session_id,
+            paths.as_ref(),
+            Some(evidence_root),
+        )
+        .await
+        {
             Ok(events) => events,
             Err(error) => {
                 failures.push(serde_json::json!({
@@ -4034,22 +4074,17 @@ async fn append_device_sessions_to_package_evidence(
         let session_dir = sessions_root.join(session_id.to_string());
         std::fs::create_dir_all(&session_dir)
             .map_err(|error| format!("无法创建 Session {session_id} 目录：{error}"))?;
-        session_budget::write(session_dir.join("capture-relation.json"), &relation_text)
-            .map_err(|e| format!("子 session 原始关联落盘失败：{e}"))?;
+        session_budget::write_new_bytes(
+            session_dir.join("capture-relation.json"),
+            relation_text.as_bytes(),
+        )
+        .map_err(|e| format!("子 session 原始关联落盘失败：{e}"))?;
         let report_path = session_dir.join("session-report.json");
         let events_path = session_dir.join("events.json");
-        session_budget::write(
-            &report_path,
-            serde_json::to_vec_pretty(&report)
-                .map_err(|error| format!("无法编码 Session {session_id} 报告：{error}"))?,
-        )
-        .map_err(|error| format!("无法保存 Session {session_id} 报告：{error}"))?;
-        session_budget::write(
-            &events_path,
-            serde_json::to_vec(&events)
-                .map_err(|error| format!("无法编码 Session {session_id} 事件：{error}"))?,
-        )
-        .map_err(|error| format!("无法保存 Session {session_id} 事件：{error}"))?;
+        session_budget::write_json(&report_path, &report)
+            .map_err(|error| format!("无法保存 Session {session_id} 报告：{error}"))?;
+        session_budget::write_json(&events_path, &events)
+            .map_err(|error| format!("无法保存 Session {session_id} 事件：{error}"))?;
         included_ids.push(session_id.to_string());
         for event in &events {
             aggregate.record(event);
