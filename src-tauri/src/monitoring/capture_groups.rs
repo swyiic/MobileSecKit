@@ -446,6 +446,11 @@ fn save(root: &Path, g: &Group) -> Result<(), String> {
             .create_new(true)
             .open(&temp)
             .map_err(|e| e.to_string())?;
+        // Opt-in physical acceptance audit; normal production builds are unchanged.
+        #[cfg(test)]
+        if std::env::var("ME_APPROVED_USB_79").as_deref() == Ok("single-parent-300s4GiB") {
+            session_budget::charge(&temp, encoded.len() as u64).map_err(|e| e.to_string())?;
+        }
         f.write_all(&encoded).map_err(|e| e.to_string())?;
         f.sync_all().map_err(|e| e.to_string())?;
         std::fs::rename(&temp, path(root, g.id)).map_err(|e| e.to_string())?;
@@ -2811,3 +2816,6 @@ mod missing_child_report_tests {
         std::fs::remove_dir_all(root).unwrap();
     }
 }
+
+#[cfg(test)]
+mod approved_usb_dependency_acceptance;
