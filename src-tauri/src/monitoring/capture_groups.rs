@@ -586,9 +586,10 @@ fn begin_group_at(
         cancel_requested: false,
         unified: !startup_replay,
         state: "planned".into(),
-        budget: Some(session_budget::Contract::new(
+        budget: Some(session_budget::Contract::new_planned(
             request.session_budget.clone().unwrap_or_default(),
             now_millis(),
+            startup_replay,
         )?),
         base,
         stages,
@@ -1650,11 +1651,12 @@ pub fn get_local_kernsight_child_report(
         "session-report.json",
     ] {
         current = current.join(component);
-        if std::fs::symlink_metadata(&current)
-            .map_err(|e| e.to_string())?
-            .file_type()
-            .is_symlink()
-        {
+        let metadata = std::fs::symlink_metadata(&current).map_err(|e| {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                format!("主会话引用子 Session {session_id}，但本地未收到原始子报告；事件与覆盖未知。查看主会话导入缺失记录。")
+            } else {e.to_string()}
+        })?;
+        if metadata.file_type().is_symlink() {
             return Err("子证据含符号链接，拒绝读取".into());
         }
     }
@@ -2777,3 +2779,35 @@ fn ensure_previous_shutdown(
 
 #[cfg(test)]
 mod approved_device_acceptance;
+
+#[cfg(test)]
+mod missing_child_report_tests {
+    use super::*;
+    #[test]
+    fn referenced_missing_child_remains_unknown_with_original_parent_reference() {
+        let root = std::env::temp_dir().join(format!("missing-child-{}", Uuid::new_v4()));
+        std::fs::create_dir(&root).unwrap();
+        let mut g = tests::group();
+        let relation = g.start("l0", epoch()).unwrap();
+        let child = Uuid::new_v4();
+        g.finish(&relation, Some(child), None, None).unwrap();
+        std::fs::write(
+            root.join("capture-group.json"),
+            serde_json::to_vec(&g).unwrap(),
+        )
+        .unwrap();
+        let error =
+            get_local_kernsight_child_report(root.to_string_lossy().into_owned(), g.id, child)
+                .unwrap_err();
+        assert!(error.contains("未收到原始子报告") && error.contains("覆盖未知"));
+        assert!(g.session_ids().contains(&child));
+        assert!(get_local_kernsight_child_report(
+            root.to_string_lossy().into_owned(),
+            Uuid::new_v4(),
+            child
+        )
+        .unwrap_err()
+        .contains("不属于"));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+}

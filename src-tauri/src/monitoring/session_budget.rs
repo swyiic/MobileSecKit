@@ -431,6 +431,9 @@ pub struct Contract {
     pub reservations: Vec<Reservation>,
     #[serde(default = "manager_reserve")]
     pub manager_reserve_bytes: u64,
+    /// Only newly created automatic parents preallocate later work. Legacy receipts stay unchanged.
+    #[serde(default)]
+    pub planned_allocation: bool,
 }
 fn manager_reserve() -> u64 {
     2 * 1024 * 1024
@@ -448,6 +451,22 @@ impl Contract {
             || self.reservations.len() > 1024
         {
             return Err("预算合同未知/无效".into());
+        }
+        if self.planned_allocation {
+            for (kind, expected) in [
+                ("transfer", self.limits.total_bytes / 4),
+                ("archive", self.limits.total_bytes / 8),
+                ("import", self.limits.total_bytes * 3 / 16),
+            ] {
+                let slots = self
+                    .reservations
+                    .iter()
+                    .filter(|r| r.kind == kind)
+                    .collect::<Vec<_>>();
+                if slots.len() != 1 || slots[0].reserved_bytes != expected {
+                    return Err("事前导出预留缺失或额度改变".into());
+                }
+            }
         }
         let mut ids = std::collections::BTreeSet::new();
         let mut sum = self.manager_reserve_bytes;
@@ -500,7 +519,54 @@ impl Contract {
             )),
             reservations: vec![],
             manager_reserve_bytes: manager_reserve(),
+            planned_allocation: false,
         })
+    }
+    /// Reserve later work before any producer starts, without extending the parent.
+    pub fn new_planned(limits: Limits, now: u64, separate_linker: bool) -> Result<Self, String> {
+        let mut contract = Self::new(limits, now)?;
+        let total = contract.limits.total_bytes;
+        let mut holds = vec![
+            ("transfer", total / 4),
+            ("archive", total / 8),
+            ("import", total * 3 / 16),
+        ];
+        if separate_linker {
+            holds.push(("linker", total / 16));
+        }
+        let held = holds.iter().try_fold(0u64, |sum, (kind, bytes)| {
+            let minimum = if *kind == "linker" { 131072 } else { 65536 };
+            if *bytes < minimum {
+                return Err("新父会话后续阶段/终态预留不可行".to_owned());
+            }
+            sum.checked_add(*bytes)
+                .ok_or_else(|| "计划额度溢出".to_owned())
+        })?;
+        // Separate l0/l1/dump or unified/dump need at least one producer block
+        // and its terminal reserve each. Reject infeasible plans before capture.
+        let active_minimum = if separate_linker {
+            4 * 131072
+        } else {
+            2 * 131072
+        };
+        if held
+            .checked_add(active_minimum)
+            .is_none_or(|n| n > contract.remaining())
+        {
+            return Err("新父会话预算不足以同时保留采集、后续导出和终态；未启动".into());
+        }
+        for (kind, bytes) in holds {
+            contract.reservations.push(Reservation {
+                id: format!("planned:{kind}"),
+                kind: kind.into(),
+                reserved_bytes: bytes,
+                charged_bytes: None,
+                status: "planned".into(),
+            });
+        }
+        contract.planned_allocation = true;
+        contract.validate()?;
+        Ok(contract)
     }
     pub fn remaining(&self) -> u64 {
         self.limits
@@ -524,7 +590,25 @@ impl Contract {
                 self.deadline_unix_ms.saturating_sub(now).min(monotonic_ms),
             ));
         }
+        if self.planned_allocation {
+            if let Some(slot) = self
+                .reservations
+                .iter_mut()
+                .find(|r| r.kind == kind && r.status == "planned")
+            {
+                slot.id = id;
+                slot.status = "reserved".into();
+                return Ok((
+                    slot.reserved_bytes,
+                    (self.deadline_unix_ms - now).min(monotonic_ms),
+                ));
+            }
+            if matches!(kind, "transfer" | "archive" | "import" | "linker") {
+                return Err("事前预留已使用；不重复增加后续额度".into());
+            }
+        }
         let quota = match kind {
+            "dump" if self.planned_allocation => self.remaining(),
             "l0" | "l1" | "linker" | "unified" | "dump" => self.remaining() / 2,
             "transfer" => self.limits.total_bytes / 4,
             "archive" => self.limits.total_bytes / 8,
@@ -1042,5 +1126,125 @@ mod provenance_bytes_tests {
         assert!(write_new_bytes(&path, b"{}").is_err());
         assert_eq!(std::fs::read(&path).unwrap(), bytes);
         std::fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod planned_allocation_tests {
+    use super::*;
+    #[test]
+    fn downstream_slots_are_owned_before_capture_and_transferred_without_double_charge() {
+        let mut b = Contract::new_planned(Limits::default(), 1, true).unwrap();
+        let total = b.limits.total_bytes;
+        assert_eq!(b.remaining(), total - manager_reserve() - total * 10 / 16);
+        let before = b.remaining();
+        let linker = b.reserve("linker-attempt".into(), "linker", 2).unwrap();
+        assert_eq!(linker.0, total / 16);
+        assert_eq!(b.remaining(), before);
+        assert_eq!(
+            b.reserve("linker-attempt".into(), "linker", 2).unwrap(),
+            linker
+        );
+        assert!(b.reserve("another-linker".into(), "linker", 2).is_err());
+        for (kind, expected) in [
+            ("transfer", total / 4),
+            ("archive", total / 8),
+            ("import", total * 3 / 16),
+        ] {
+            assert_eq!(
+                b.reserve(format!("export:{kind}"), kind, 2).unwrap().0,
+                expected
+            );
+            assert_eq!(b.remaining(), before);
+        }
+        let l0 = b.reserve("l0".into(), "l0", 2).unwrap().0;
+        assert_eq!(l0, before / 2);
+        b.settle(
+            "l0",
+            &serde_json::json!({"admitted_write_bytes":1000,"partial":false}),
+        )
+        .unwrap();
+        let l1 = b.reserve("l1".into(), "l1", 2).unwrap().0;
+        assert!(l1 > 131072);
+        b.settle(
+            "l1",
+            &serde_json::json!({"admitted_write_bytes":2000,"partial":false}),
+        )
+        .unwrap();
+        let available = b.remaining();
+        assert_eq!(b.reserve("dump".into(), "dump", 2).unwrap().0, available);
+        assert_eq!(b.remaining(), 0);
+        b.validate().unwrap();
+        assert!(b.reserve("late".into(), "dump", 300001).is_err());
+    }
+    #[test]
+    fn unified_plan_does_not_hold_a_second_linker_and_small_infeasible_plan_is_rejected() {
+        let b = Contract::new_planned(Limits::default(), 1, false).unwrap();
+        assert!(!b.reservations.iter().any(|r| r.kind == "linker"));
+        assert_eq!(
+            b.remaining(),
+            b.limits.total_bytes - manager_reserve() - b.limits.total_bytes * 9 / 16
+        );
+        for separate in [false, true] {
+            assert!(Contract::new_planned(
+                Limits {
+                    total_bytes: 4 * 1024 * 1024,
+                    max_seconds: 30
+                },
+                1,
+                separate
+            )
+            .is_err());
+        }
+    }
+    #[test]
+    fn minimum_sequential_plan_survives_full_l0_and_l1_reservations() {
+        let limits = Limits {
+            total_bytes: 6990501,
+            max_seconds: 30,
+        };
+        assert!(Contract::new_planned(
+            Limits {
+                total_bytes: 6990500,
+                max_seconds: 30
+            },
+            1,
+            true
+        )
+        .is_err());
+        let mut b = Contract::new_planned(limits, 1, true).unwrap();
+        assert_eq!(b.remaining(), 4 * 131072);
+        for kind in ["l0", "l1"] {
+            let quota = b.reserve(kind.into(), kind, 2).unwrap().0;
+            assert!(quota >= 131072);
+            b.settle(
+                kind,
+                &serde_json::json!({"admitted_write_bytes":quota - 65536,"partial":true}),
+            )
+            .unwrap();
+        }
+        assert_eq!(b.reserve("dump".into(), "dump", 2).unwrap().0, 131072);
+        // Later slots remain available even when all active reservations are full.
+        assert!(b.reserve("linker".into(), "linker", 2).unwrap().0 >= 131072);
+        for kind in ["transfer", "archive", "import"] {
+            assert!(b.reserve(format!("export:{kind}"), kind, 2).unwrap().0 >= 65536);
+        }
+        b.validate().unwrap();
+    }
+    #[test]
+    fn legacy_contracts_keep_original_policy_and_retired_tokens_are_not_recreated() {
+        let b = Contract::new(Limits::default(), 1).unwrap();
+        let mut value = serde_json::to_value(&b).unwrap();
+        value.as_object_mut().unwrap().remove("plannedAllocation");
+        value["deadlineToken"] = serde_json::Value::Null;
+        let mut restored: Contract = serde_json::from_value(value).unwrap();
+        assert!(!restored.planned_allocation);
+        assert!(restored.reserve("retired".into(), "dump", 2).is_err());
+        let mut live = b;
+        let before = live.remaining();
+        assert_eq!(
+            live.reserve("legacy-dump".into(), "dump", 2).unwrap().0,
+            before / 2
+        );
     }
 }

@@ -1,5 +1,7 @@
 //! v2 archives store full content once and keep every logical evidence path.
 //! v1 import remains supported by the caller; no ZIP header alias tricks.
+pub(super) const REFERENCE_METADATA_LIMIT: u64 = 24 * 1024 * 1024;
+
 use super::*;
 use serde_json::json;
 const SCHEMA: &str = "mobilee.kernsight-evidence/v2";
@@ -153,6 +155,14 @@ fn write_scoped(root: &Path, output: &Path, offline_retained: bool) -> Result<()
                 == "partial";
     let coverage = json!({"status":if partial {"partial"} else {"unknown"},"scope":"all retained paths only; missing producer/transport bytes are not in this archive","complete_collection":false,"hash_verification_scope":"every archived object and path reference; not process or application coverage"});
     let manifest = serde_json::json!({"schemaVersion":SCHEMA,"package":package,"dumpId":report["dump_id"],"fileCount":refs.len(),"uncompressedBytes":refs.iter().map(|r|r.bytes).sum::<u64>(),"objectCount":objects.len(),"objectBytes":objects.values().map(|(_,n)|n).sum::<u64>(),"storageRepresentation":"full-sha256-objects-and-path-references/v1","references":refs,"outputLimits":limits,"coverage":coverage});
+    let metadata_bytes =
+        session_budget::measure_json(output, &manifest).map_err(|e| e.to_string())?;
+    if metadata_bytes > REFERENCE_METADATA_LIMIT {
+        return Err(
+            "archive reference metadata exceeds finite reserve; original tree retained".into(),
+        );
+    }
+
     let bytes = serde_json::to_vec(&manifest).map_err(|e| e.to_string())?;
     if bytes.len() > 64 * 1024 * 1024 {
         return Err("引用清单超过64MiB，未丢弃来源路径".into());

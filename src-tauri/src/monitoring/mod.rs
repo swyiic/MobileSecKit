@@ -3567,6 +3567,85 @@ async fn pull_kernsight_package_evidence_scoped(
     )
     .await
 }
+struct RetainedTransferPlan {
+    rows: Vec<Value>,
+    omitted: Vec<Value>,
+    unique_bytes: u64,
+}
+fn retained_path_priority(path: &str) -> u8 {
+    if path == "dump-report.json" {
+        0
+    } else if path == "capture-relation.json" || path == "budget-receipt.json" {
+        1
+    } else if path.starts_with("runtime/") {
+        2
+    } else if path.starts_with("code-evidence/") {
+        3
+    } else if path.starts_with("code-objects/") {
+        4
+    } else if path.starts_with("apk-dex/") || path.starts_with("readable-dex/") {
+        5
+    } else if path.starts_with("lib/") || path.starts_with("oat/") || path.starts_with("apk/") {
+        9
+    } else {
+        6
+    }
+}
+fn retained_transfer_plan(
+    rows: &[Value],
+    maximum: Option<u64>,
+) -> Result<RetainedTransferPlan, String> {
+    let mut groups: BTreeMap<(String, u64), Vec<Value>> = BTreeMap::new();
+    for row in rows {
+        let path = row["path"].as_str().ok_or("missing transfer path")?;
+        validate_evidence_relative_path(path)?;
+        let key = (
+            row["sha256"]
+                .as_str()
+                .ok_or("missing transfer hash")?
+                .to_owned(),
+            row["bytes"].as_u64().ok_or("missing transfer length")?,
+        );
+        groups.entry(key).or_default().push(row.clone());
+    }
+    let mut groups = groups.into_iter().collect::<Vec<_>>();
+    groups.sort_by_key(|(key, rows)| {
+        (
+            rows.iter()
+                .map(|r| retained_path_priority(r["path"].as_str().unwrap()))
+                .min()
+                .unwrap_or(9),
+            key.clone(),
+        )
+    });
+    let mut plan = RetainedTransferPlan {
+        rows: vec![],
+        omitted: vec![],
+        unique_bytes: 0,
+    };
+    for ((hash, bytes), mut aliases) in groups {
+        if maximum.is_some_and(|limit| bytes > limit.saturating_sub(plan.unique_bytes)) {
+            plan.omitted.extend(aliases.into_iter().map(|r|serde_json::json!({"path":r["path"],"bytes":bytes,"sha256":hash,"status":"not_received_quota; retained_at_source"})));
+        } else {
+            plan.unique_bytes = plan
+                .unique_bytes
+                .checked_add(bytes)
+                .ok_or("transfer plan overflow")?;
+            aliases.sort_by_key(|r| {
+                (
+                    retained_path_priority(r["path"].as_str().unwrap()),
+                    r["path"].as_str().unwrap().to_owned(),
+                )
+            });
+            plan.rows.extend(aliases);
+        }
+    }
+    if !plan.rows.iter().any(|r| r["path"] == "dump-report.json") {
+        return Err("read-only quota cannot retain original report".into());
+    }
+    Ok(plan)
+}
+
 async fn pull_kernsight_package_evidence_with_objects(
     serial: String,
     package: String,
@@ -3574,6 +3653,26 @@ async fn pull_kernsight_package_evidence_with_objects(
     remote_override: Option<String>,
     paths: Option<&runtime_paths::RuntimePaths>,
     known_objects: BTreeMap<(String, u64), PathBuf>,
+) -> Result<KernSightLocalEvidenceBundle, String> {
+    pull_kernsight_package_evidence_with_plan(
+        serial,
+        package,
+        destination,
+        remote_override,
+        paths,
+        known_objects,
+        None,
+    )
+    .await
+}
+async fn pull_kernsight_package_evidence_with_plan(
+    serial: String,
+    package: String,
+    destination: String,
+    remote_override: Option<String>,
+    paths: Option<&runtime_paths::RuntimePaths>,
+    known_objects: BTreeMap<(String, u64), PathBuf>,
+    maximum_unique_bytes: Option<u64>,
 ) -> Result<KernSightLocalEvidenceBundle, String> {
     validate_serial(&serial)?;
     validate_package(&package)?;
@@ -3685,8 +3784,49 @@ async fn pull_kernsight_package_evidence_with_objects(
         if logical > MAX_EVIDENCE_ARCHIVE_BYTES || note["logical_bytes"].as_u64() != Some(logical) {
             return Err("清单总量不可信".into());
         }
+        // Object member names are fixed SHA256 paths. Bound ZIP local/central headers
+        // and descriptors before choosing payloads; aliases conservatively count too.
+        let selected_payload_limit = maximum_unique_bytes
+            .map(|limit| limit.saturating_sub((rows.len() as u64).saturating_mul(300)));
+        let plan = retained_transfer_plan(rows, selected_payload_limit)?;
+        std::fs::create_dir_all(&local_root).map_err(|e| e.to_string())?;
+        if maximum_unique_bytes.is_some() {
+            let manifest = format!("retained-transfer-plan-{}.json", Uuid::new_v4());
+            let partial_path =
+                local_root.join(format!("transport-partial-{}.json", Uuid::new_v4()));
+            let manifest_value = serde_json::json!({
+                "schema":"mobilee.retained-readonly-transfer-plan/v1","sourceRoot":remote,
+                "maximumUniqueBytes":maximum_unique_bytes,"selectedUniqueBytes":plan.unique_bytes,
+                "plannedPaths":plan.rows.iter().map(|r|r["path"].clone()).collect::<Vec<_>>(),
+                "omitted":plan.omitted
+            });
+            let partial_value = serde_json::json!({
+                "schema":"mobilee.retained-readonly-transfer/v1","complete":false,
+                "scope":"existing retained files only; original capture state and deadline unchanged",
+                "planManifest":manifest,"plannedPathCount":plan.rows.len(),"omittedPathCount":plan.omitted.len(),
+                "reason":"explicit read-only intake quota; plan is not proof of receipt; omitted source bytes remain on device; no replacement content"
+            });
+            let manifest_bytes =
+                session_budget::measure_json(&local_root.join(&manifest), &manifest_value)
+                    .map_err(|e| e.to_string())?;
+            let note_bytes = if plan.omitted.is_empty() {
+                0
+            } else {
+                session_budget::measure_json(&partial_path, &partial_value)
+                    .map_err(|e| e.to_string())?
+            };
+            if manifest_bytes > TRANSFER_MANIFEST_RESERVE.saturating_sub(note_bytes) {
+                return Err("transfer plan metadata exceeds finite reserve; no payload transferred; original source retained".into());
+            }
+            session_budget::write_json(local_root.join(&manifest), &manifest_value)
+                .map_err(|e| e.to_string())?;
+            if !plan.omitted.is_empty() {
+                session_budget::write_json(partial_path, &partial_value)
+                    .map_err(|e| e.to_string())?;
+            }
+        }
         let mut verified_transfer_objects = known_objects;
-        for row in rows {
+        for row in &plan.rows {
             let rel = row["path"].as_str().unwrap();
             let content_key = (
                 row["sha256"].as_str().unwrap().to_owned(),
@@ -3846,12 +3986,19 @@ async fn pull_kernsight_package_archive_at(
         })
         .transpose()
         .map_err(|e| e.to_string())?;
-    let bundle = pull_kernsight_package_evidence_scoped(
+    // Leave a finite allowance for the parent-bound session replay and metadata.
+    // Selection is planned before payload transfer; the guard still charges actual writes.
+    let payload_limit = allocations
+        .as_ref()
+        .map(|a| planned_transfer_payload_limit(a.0, a.1, a.2));
+    let bundle = pull_kernsight_package_evidence_with_plan(
         serial.clone(),
         package.clone(),
         staging.to_string_lossy().into_owned(),
         remote,
         runtime_paths_from_group(group.as_ref())?.as_ref(),
+        BTreeMap::new(),
+        payload_limit,
     )
     .await;
     let bundle = match bundle {
@@ -3969,6 +4116,30 @@ async fn pull_kernsight_package_archive_at(
     import_kernsight_evidence_directory(bundle.root).await
 }
 
+const RETAINED_SESSION_JSON_LIMIT: u64 = 64 * 1024 * 1024;
+const RETAINED_SESSION_METADATA_RESERVE: u64 = 16 * 1024 * 1024;
+const TRANSFER_MANIFEST_RESERVE: u64 = 4 * 1024 * 1024;
+fn planned_transfer_payload_limit(transfer: u64, archive: u64, import: u64) -> u64 {
+    transfer
+        .min(archive)
+        .min(import)
+        .saturating_sub(RETAINED_SESSION_JSON_LIMIT)
+        .saturating_sub(TRANSFER_MANIFEST_RESERVE)
+        .saturating_sub(archive_objects::REFERENCE_METADATA_LIMIT)
+        .saturating_sub(1024 * 1024)
+}
+fn retain_session_document_bytes(used: &mut u64, bytes: u64, limit: u64) -> Result<(), String> {
+    if bytes > limit.saturating_sub(*used) {
+        return Err(
+            "retained session JSON quota exhausted; complete source remains on device".into(),
+        );
+    }
+    *used = used
+        .checked_add(bytes)
+        .ok_or("retained session JSON byte overflow")?;
+    Ok(())
+}
+
 async fn append_device_sessions_to_package_evidence(
     serial: &str,
     package: &str,
@@ -3987,10 +4158,22 @@ async fn append_device_sessions_to_package_evidence(
     {
         return Err("Session 证据目标已有保留记录；请选新的导入目录，拒绝覆盖".into());
     }
+    let group_bytes =
+        session_budget::measure_json(&evidence_root.join("capture-group.json"), group)
+            .map_err(|e| e.to_string())?;
+    let mut retained_session_bytes = 0;
+    retain_session_document_bytes(
+        &mut retained_session_bytes,
+        group_bytes,
+        RETAINED_SESSION_JSON_LIMIT - RETAINED_SESSION_METADATA_RESERVE,
+    )?;
     session_budget::write_json(evidence_root.join("capture-group.json"), group)
         .map_err(|e| e.to_string())?;
     let paths = runtime_paths_from_group(Some(group))?;
     let selected_ids = group.session_ids();
+    if selected_ids.len() > 16 {
+        return Err("parent references more than16 source sessions; finite intake did not replay; original parent references preserved".into());
+    }
     let sessions_root = evidence_root.join("sessions");
     std::fs::create_dir_all(&sessions_root)
         .map_err(|error| format!("无法创建 Session 证据目录：{error}"))?;
@@ -4072,6 +4255,23 @@ async fn append_device_sessions_to_package_evidence(
             failures.push(serde_json::json!({"sessionId":session_id,"error":"父会话引用的子 session 尚无匹配包身份事件；保留父引用，未猜归属"}));
         }
         let session_dir = sessions_root.join(session_id.to_string());
+        let report_bytes =
+            session_budget::measure_json(&session_dir.join("session-report.json"), &report)
+                .map_err(|e| e.to_string())?;
+        let event_bytes = session_budget::measure_json(&session_dir.join("events.json"), &events)
+            .map_err(|e| e.to_string())?;
+        let document_bytes = report_bytes
+            .checked_add(event_bytes)
+            .and_then(|n| n.checked_add(relation_text.len() as u64))
+            .ok_or("retained session JSON byte overflow")?;
+        if let Err(error) = retain_session_document_bytes(
+            &mut retained_session_bytes,
+            document_bytes,
+            RETAINED_SESSION_JSON_LIMIT - RETAINED_SESSION_METADATA_RESERVE,
+        ) {
+            failures.push(serde_json::json!({"sessionId":session_id,"error":error,"sourceStatus":"complete original spool remains at source; no partial JSON written"}));
+            continue;
+        }
         std::fs::create_dir_all(&session_dir)
             .map_err(|error| format!("无法创建 Session {session_id} 目录：{error}"))?;
         session_budget::write_new_bytes(
@@ -4126,12 +4326,6 @@ async fn append_device_sessions_to_package_evidence(
             serde_json::json!(failures),
         );
     }
-    session_budget::write(
-        evidence_root.join("session-report.json"),
-        serde_json::to_vec_pretty(&aggregate_value)
-            .map_err(|error| format!("无法编码汇总 Session 报告：{error}"))?,
-    )
-    .map_err(|error| format!("无法保存汇总 Session 报告：{error}"))?;
     let index = serde_json::json!({
         "schemaVersion": "mobilee.kernsight-package-sessions/v1",
         "package": package,
@@ -4141,22 +4335,37 @@ async fn append_device_sessions_to_package_evidence(
         "failures": failures,
         "scope": "仅本主会话明确引用的子 session/attempt；不按包名混入其他轮次",
     });
-    session_budget::write(
-        evidence_root.join("session-index.json"),
-        serde_json::to_vec_pretty(&index)
-            .map_err(|error| format!("无法编码 Session 索引：{error}"))?,
-    )
-    .map_err(|error| format!("无法保存 Session 索引：{error}"))?;
-    session_budget::write(
-        evidence_root.join("capture.txt"),
-        format!(
-            "package={package}\nincluded_sessions={}\nmatched_sessions={}\nfailed_sessions={}\n",
-            included_ids.len(),
-            matched_ids.len(),
-            failures.len()
-        ),
-    )
-    .map_err(|error| format!("无法保存采集摘要：{error}"))?;
+    aggregate_value["mobilee_retained_session_json_limit"] =
+        serde_json::json!(RETAINED_SESSION_JSON_LIMIT);
+    aggregate_value["mobilee_retained_session_group_and_child_bytes"] =
+        serde_json::json!(retained_session_bytes);
+    let capture_text = format!(
+        "package={package}\nincluded_sessions={}\nmatched_sessions={}\nfailed_sessions={}\n",
+        included_ids.len(),
+        matched_ids.len(),
+        failures.len(),
+    );
+    let aggregate_bytes =
+        session_budget::measure_json(&evidence_root.join("session-report.json"), &aggregate_value)
+            .map_err(|e| e.to_string())?;
+    let index_bytes =
+        session_budget::measure_json(&evidence_root.join("session-index.json"), &index)
+            .map_err(|e| e.to_string())?;
+    let metadata_bytes = aggregate_bytes
+        .checked_add(index_bytes)
+        .and_then(|n| n.checked_add(capture_text.len() as u64))
+        .ok_or("retained session metadata byte overflow")?;
+    retain_session_document_bytes(
+        &mut retained_session_bytes,
+        metadata_bytes,
+        RETAINED_SESSION_JSON_LIMIT,
+    )?;
+    session_budget::write_json(evidence_root.join("session-report.json"), &aggregate_value)
+        .map_err(|e| format!("无法保存汇总 Session 报告：{e}"))?;
+    session_budget::write_json(evidence_root.join("session-index.json"), &index)
+        .map_err(|e| format!("无法保存 Session 索引：{e}"))?;
+    session_budget::write_new_bytes(evidence_root.join("capture.txt"), capture_text.as_bytes())
+        .map_err(|e| format!("无法保存采集摘要：{e}"))?;
     Ok(())
 }
 
@@ -5212,6 +5421,95 @@ mod bounded_local_preview_tests {
         assert_eq!(result.bytes, 3);
         assert!(!result.truncated);
         assert_eq!(result.content, "YWJj");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod retained_transfer_plan_tests {
+    use super::*;
+    fn row(path: &str, hash: u8, bytes: u64) -> Value {
+        serde_json::json!({"path":path,"sha256":format!("{hash:064x}"),"bytes":bytes})
+    }
+    #[test]
+    fn transfer_plan_reserves_sessions_and_respects_smallest_later_phase() {
+        let limit =
+            planned_transfer_payload_limit(512 * 1024 * 1024, 256 * 1024 * 1024, 384 * 1024 * 1024);
+        assert_eq!(limit, 163 * 1024 * 1024);
+        assert_eq!(planned_transfer_payload_limit(1, 2, 3), 0);
+        let mut used = 1;
+        retain_session_document_bytes(&mut used, 9, 10).unwrap();
+        assert_eq!(used, 10);
+        assert!(retain_session_document_bytes(&mut used, 1, 10).is_err());
+        assert_eq!(used, 10);
+    }
+    #[test]
+    fn whole_content_aliases_share_quota_and_original_report_is_required() {
+        let rows = vec![
+            row("lib/big.so", 3, 100),
+            row("dump-report.json", 1, 10),
+            row("code-objects/a", 2, 50),
+            row("apk-dex/a.dex", 2, 50),
+            row("readable-dex/a.dex", 2, 50),
+        ];
+        let plan = retained_transfer_plan(&rows, Some(60)).unwrap();
+        assert_eq!(plan.unique_bytes, 60);
+        assert_eq!(plan.rows.len(), 4);
+        assert_eq!(plan.omitted.len(), 1);
+        assert_eq!(plan.omitted[0]["path"], "lib/big.so");
+        assert!(retained_transfer_plan(&rows, Some(9)).is_err());
+        let full = retained_transfer_plan(&rows, None).unwrap();
+        assert_eq!(full.unique_bytes, 160);
+        assert!(full.omitted.is_empty());
+    }
+    #[test]
+    fn priorities_preserve_runtime_before_static_and_never_truncate_a_group() {
+        let rows = vec![
+            row("dump-report.json", 1, 1),
+            row("runtime/current", 2, 20),
+            row("code-objects/large", 3, 50),
+            row("lib/small.so", 4, 5),
+        ];
+        let plan = retained_transfer_plan(&rows, Some(26)).unwrap();
+        assert_eq!(plan.unique_bytes, 26);
+        assert!(plan.rows.iter().any(|r| r["path"] == "runtime/current"));
+        assert!(plan
+            .omitted
+            .iter()
+            .any(|r| r["path"] == "code-objects/large"));
+    }
+    #[tokio::test]
+    async fn large_plan_manifest_with_small_partial_note_imports_without_rewriting_source_report() {
+        let root = std::env::temp_dir().join(format!("retained-plan-import-{}", Uuid::new_v4()));
+        std::fs::create_dir(&root).unwrap();
+        let original=br#"{"schema_version":"mobilee.kernsight-package-dump/v2","package":"org.example.fixture","collection_status":"partial","artifacts":[]}"#;
+        session_budget::write_new_bytes(root.join("dump-report.json"), original).unwrap();
+        let omitted = (0..2000)
+            .map(|n| row(&format!("lib/omitted-{n:06}.so"), 2, 999))
+            .collect::<Vec<_>>();
+        session_budget::write_json(
+            root.join("retained-transfer-plan-test.json"),
+            &serde_json::json!({"omitted":omitted}),
+        )
+        .unwrap();
+        assert!(
+            std::fs::metadata(root.join("retained-transfer-plan-test.json"))
+                .unwrap()
+                .len()
+                > 65536
+        );
+        session_budget::write_json(root.join("transport-partial-test.json"),&serde_json::json!({"complete":false,"planManifest":"retained-transfer-plan-test.json","omittedPathCount":2000,"reason":"quota; original source preserved"})).unwrap();
+        let bundle = import_kernsight_evidence_directory(root.to_string_lossy().into_owned())
+            .await
+            .unwrap();
+        assert_eq!(
+            bundle.dump_report["mobilee_transport_status"]["complete"],
+            false
+        );
+        assert_eq!(
+            std::fs::read(root.join("dump-report.json")).unwrap(),
+            original
+        );
         std::fs::remove_dir_all(root).unwrap();
     }
 }
