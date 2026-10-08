@@ -4091,22 +4091,34 @@ async fn pull_kernsight_package_archive_at(
         ),
     )
     .await;
-    if session_result.is_err() {
-        if group.is_none() {
-            let _ = std::fs::remove_dir_all(&staging);
+    let session_error = match session_result {
+        Err(_) => Some("关联会话处理超过120秒".to_owned()),
+        Ok(Err(error)) => Some(error),
+        Ok(Ok(())) => None,
+    };
+    if let Some(error) = session_error {
+        if let (Some(g), Some(guard)) = (group.as_mut(), transfer_guard.as_ref()) {
+            let mut note = serde_json::to_value(guard.receipt()).map_err(|e| e.to_string())?;
+            note["partial"] = serde_json::json!(true);
+            capture_groups::settle_export_at(
+                group_root.as_deref().ok_or("parent 根缺失")?,
+                g,
+                &output,
+                "transfer",
+                &note,
+            )?;
+            capture_groups::release_unstarted_export_at(
+                group_root.as_deref().ok_or("parent 根缺失")?,
+                g,
+                &output,
+                &["archive", "import"],
+            )?;
+            retain_transport_partial(Path::new(&bundle.root), &package, g, &note, &error)?;
         }
         let _ = std::fs::remove_file(&partial);
         return Err(format!(
-            "包文件已拉取，但关联会话处理超过 120 秒；未生成不完整证据包"
-        ));
-    }
-    if let Err(error) = session_result.expect("timeout result already checked") {
-        if group.is_none() {
-            let _ = std::fs::remove_dir_all(&staging);
-        }
-        let _ = std::fs::remove_file(&partial);
-        return Err(format!(
-            "包文件已拉取，但无法读取手机端关联会话；未生成不完整证据包：{error}"
+            "包文件已保留，关联会话未完成：{error}；可按本地目录导入：{}",
+            bundle.root
         ));
     }
     if let Some(g) = transfer_guard.as_ref() {
@@ -4147,18 +4159,102 @@ async fn pull_kernsight_package_archive_at(
         }
     }
     if let Err(error) = archive_result {
-        if group.is_none() {
-            let _ = std::fs::remove_dir_all(&staging);
+        if let Some(g) = group.as_mut() {
+            capture_groups::release_unstarted_export_at(
+                group_root.as_deref().ok_or("parent 根缺失")?,
+                g,
+                &output,
+                &["import"],
+            )?;
         }
         let _ = std::fs::remove_file(&partial);
         return Err(format!("{error}；已保存源目录仍可导入：{}", bundle.root));
     }
-    archive_objects::share_fresh_pull(Path::new(&bundle.root), &output)
-        .map_err(|e| format!("v2 归档已保留，fresh 缓存共享未确认：{e}"))?;
+    if let Err(error) = archive_objects::share_fresh_pull(Path::new(&bundle.root), &output) {
+        if let Some(g) = group.as_mut() {
+            capture_groups::release_unstarted_export_at(
+                group_root.as_deref().ok_or("parent 根缺失")?,
+                g,
+                &output,
+                &["import"],
+            )?;
+        }
+        return Err(format!(
+            "v2 归档和源目录已保留，fresh 缓存共享未确认：{error}"
+        ));
+    }
     // The directory already contains the bytes represented by the newly written
     // archive. Re-index it in place instead of immediately extracting the archive
     // into a second multi-gigabyte cache.
-    import_kernsight_evidence_directory(bundle.root).await
+    let import_guard = if let (Some(g), Some((_, _, import_cap, _))) = (group.as_ref(), allocations)
+    {
+        let remaining = g
+            .budget
+            .as_ref()
+            .ok_or("parent预算缺失")?
+            .deadline()?
+            .remaining_ms();
+        match remaining {
+            Ok(ms) => match session_budget::Guard::install(
+                vec![PathBuf::from(&bundle.root)],
+                import_cap.saturating_sub(65536),
+                ms,
+            ) {
+                Ok(guard) => Some(guard),
+                Err(error) => {
+                    capture_groups::release_unstarted_export_at(
+                        group_root.as_deref().ok_or("parent 根缺失")?,
+                        group.as_mut().ok_or("parent缺失")?,
+                        &output,
+                        &["import"],
+                    )?;
+                    return Err(format!("导入未启动，源目录和归档保留：{error}"));
+                }
+            },
+            Err(error) => {
+                capture_groups::release_unstarted_export_at(
+                    group_root.as_deref().ok_or("parent 根缺失")?,
+                    group.as_mut().ok_or("parent缺失")?,
+                    &output,
+                    &["import"],
+                )?;
+                return Err(format!(
+                    "{error}；归档和源目录保留，未启动导入：{}",
+                    bundle.root
+                ));
+            }
+        }
+    } else {
+        None
+    };
+    let mut result = import_kernsight_evidence_directory(bundle.root).await;
+    if let Some(g) = group.as_ref() {
+        if let Err(error) = g
+            .budget
+            .as_ref()
+            .ok_or("parent预算缺失")?
+            .deadline()?
+            .check()
+        {
+            result = Err(format!(
+                "{error}；导入处理跨过原父期限，保留已写入结果，拒绝完整成功"
+            ));
+        }
+    }
+    if let (Some(g), Some(guard)) = (group.as_mut(), import_guard.as_ref()) {
+        let mut note = serde_json::to_value(guard.receipt()).map_err(|e| e.to_string())?;
+        if result.is_err() {
+            note["partial"] = serde_json::json!(true);
+        }
+        capture_groups::settle_export_at(
+            group_root.as_deref().ok_or("parent 根缺失")?,
+            g,
+            &output,
+            "import",
+            &note,
+        )?;
+    }
+    result
 }
 
 const RETAINED_SESSION_JSON_LIMIT: u64 = 64 * 1024 * 1024;

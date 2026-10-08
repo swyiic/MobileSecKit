@@ -1379,6 +1379,63 @@ mod tests {
     }
 
     #[test]
+    fn expired_export_settlement_does_not_restart_parent_or_invent_archive_usage() {
+        let mut g = quota_partial_group();
+        let root = std::env::temp_dir().join(format!("me-expired-settle-{}", Uuid::new_v4()));
+        save(&root, &g).unwrap();
+        let output = root.join("fixture.mee");
+        reserve_export_at(&root, &mut g, &output).unwrap();
+        let token = g.budget.as_ref().unwrap().deadline_token;
+        g.budget.as_ref().unwrap().deadline().unwrap().cancel();
+        settle_export_at(
+            &root,
+            &mut g,
+            &output,
+            "archive",
+            &serde_json::json!({"admitted_write_bytes":113497,"partial":true}),
+        )
+        .unwrap();
+        release_unstarted_export_at(&root, &mut g, &output, &["import"]).unwrap();
+        assert_eq!(g.budget.as_ref().unwrap().deadline_token, token);
+        assert!(g
+            .budget
+            .as_ref()
+            .unwrap()
+            .deadline()
+            .unwrap()
+            .check()
+            .is_err());
+        let budget = g.budget.as_ref().unwrap();
+        let archive = budget
+            .reservations
+            .iter()
+            .find(|r| r.kind == "archive")
+            .unwrap();
+        assert_eq!(archive.charged_bytes, Some(113497 + 65536));
+        assert_eq!(archive.status, "partial");
+        assert_eq!(
+            budget
+                .reservations
+                .iter()
+                .find(|r| r.kind == "import")
+                .unwrap()
+                .status,
+            "not_started"
+        );
+        assert_eq!(
+            budget
+                .reservations
+                .iter()
+                .find(|r| r.kind == "transfer")
+                .unwrap()
+                .charged_bytes,
+            None
+        );
+        assert_eq!(g.state, "partial");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn failed_transfer_releases_only_unstarted_export_phases() {
         let mut g = quota_partial_group();
         let root = std::env::temp_dir().join(format!("me-export-release-{}", Uuid::new_v4()));
