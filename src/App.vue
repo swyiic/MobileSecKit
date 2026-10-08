@@ -140,6 +140,7 @@ import FridaToolboxView from '@/views/FridaToolboxView.vue'
 import SettingsDrawer from '@/components/SettingsDrawer.vue'
 import { useDeviceManager } from '@/composables/useDeviceManager'
 import { useFridaToolbox } from '@/composables/useFridaToolbox'
+import { applyDocumentTheme, applyNativeTheme, resolvedTheme, storedTheme } from '@/services/theme'
 import { backend, readableError } from '@/services/backend'
 import { appConfig, saveAppConfigNow } from '@/services/config'
 import type {
@@ -194,8 +195,13 @@ const analysisRunning = ref(false)
 const environmentChecking = ref(true)
 const error = ref('')
 const showSettings = ref(false)
-const sidebarCollapsed = ref(localStorage.getItem('mobilee.sidebarCollapsed') === 'true')
-const theme = ref<'dark' | 'light'>(localStorage.getItem('mobilee.theme') === 'light' ? 'light' : 'dark')
+function storedSidebarCollapsed() { try { return localStorage.getItem('mobilee.sidebarCollapsed') === 'true' } catch { return false } }
+const sidebarCollapsed = ref(storedSidebarCollapsed())
+const theme = ref(resolvedTheme())
+let userThemeSelected = Boolean(storedTheme())
+const systemTheme = window.matchMedia('(prefers-color-scheme: dark)')
+function updateSystemTheme() { if (!userThemeSelected && !storedTheme()) theme.value = resolvedTheme() }
+systemTheme.addEventListener('change', updateSystemTheme)
 let connectionTimer: ReturnType<typeof setInterval> | undefined
 
 function openAiReview(taskId = 'attack-surface') {
@@ -359,11 +365,13 @@ async function pushToDevice(localPath: string) {
 }
 
 function applyTheme() {
-  document.documentElement.dataset.theme = theme.value
+  applyDocumentTheme(theme.value)
 }
 
 function toggleTheme() {
+  userThemeSelected = true
   theme.value = theme.value === 'dark' ? 'light' : 'dark'
+  try { localStorage.setItem('mobilee.theme', theme.value) } catch { /* current view still switches */ }
 }
 
 async function refreshEnvironment(recordHistory = true) {
@@ -509,13 +517,14 @@ watch(toolDirectory, async (directory) => {
   }
 })
 
-watch(sidebarCollapsed, value => localStorage.setItem('mobilee.sidebarCollapsed', String(value)))
+watch(sidebarCollapsed, value => { try { localStorage.setItem('mobilee.sidebarCollapsed', String(value)) } catch { /* sidebar remains usable without persistence */ } })
 watch(theme, value => {
-  localStorage.setItem('mobilee.theme', value)
   applyTheme()
+  void applyNativeTheme(value).catch(error => console.warn('Window theme could not be applied', error))
 })
 
 onBeforeUnmount(() => {
+  systemTheme.removeEventListener('change', updateSystemTheme)
   if (connectionTimer) clearInterval(connectionTimer)
   void saveAppConfigNow().catch(() => {})
 })

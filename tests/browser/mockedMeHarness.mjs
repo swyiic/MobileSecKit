@@ -5,7 +5,7 @@ import { fileURLToPath } from 'node:url';
 // Cloud-only UI harness. All Tauri calls are mocked; no device commands execute.
 // Vite and Chromium run together. External network requests are blocked.
 // Optional ME_PLAYWRIGHT_MODULE and ME_CHROMIUM_PATH select an existing local browser installation.
-export async function launchMe({url = 'http://127.0.0.1:1420', fixtures = {}, handler, root = fileURLToPath(new URL('../../', import.meta.url)), serve = true} = {}) {
+export async function launchMe({url = 'http://127.0.0.1:1420', fixtures = {}, handler, root = fileURLToPath(new URL('../../', import.meta.url)), serve = true, setupPage} = {}) {
   let server;
   if (serve) {
     const {createServer}=await import(pathToFileURL(`${root}/node_modules/vite/dist/node/index.js`).href);
@@ -21,7 +21,7 @@ export async function launchMe({url = 'http://127.0.0.1:1420', fixtures = {}, ha
     return ['localhost','127.0.0.1'].includes(hostname) ? route.continue() : route.abort();
   });
   const defaults = {
-    load_app_config:{}, save_app_config:'mock-config', configure_host_environment:'mock-configured',
+    apply_main_window_theme:null, load_app_config:{}, save_app_config:'mock-config', configure_host_environment:'mock-configured',
     list_devices:[], inspect_environment:{hostOs:'linux',hostArch:'x86_64',tools:[],deviceFridaReachable:false,deviceFridaRequiresDeveloperImage:false},
     list_kernsight_groups:[], list_kernsight_group_trash:[], list_ai_task_templates:[],
     list_frida_scripts:[], list_frida_processes:[], list_processes:[], list_installed_apps:[],
@@ -41,6 +41,7 @@ export async function launchMe({url = 'http://127.0.0.1:1420', fixtures = {}, ha
     let nextCallback=1;
     const callbacks = new Map();
     window.__meMockCallbacks = callbacks;
+    window.isTauri = true;
     window.__TAURI_INTERNALS__ = {
       invoke:(command,args={})=>window.__meMockInvoke(command,args),
       transformCallback:(callback,once=false)=>{
@@ -54,6 +55,7 @@ export async function launchMe({url = 'http://127.0.0.1:1420', fixtures = {}, ha
     };
     window.__TAURI_EVENT_PLUGIN_INTERNALS__={unregisterListener:()=>{}};
   });
+  if (setupPage) await setupPage(page);
   await page.goto(url,{waitUntil:'networkidle'});
   const close = async () => {await browser.close(); if(server) await server.close();};
   return {browser,page,calls,errors,close};

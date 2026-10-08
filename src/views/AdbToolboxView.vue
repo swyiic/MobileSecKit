@@ -217,9 +217,12 @@ const toolSections: { id: ToolSection; label: string; hint: string; icon: string
   { id: 'traffic', label: '流量实验', hint: 'eBPF 镜像、代理与证书', icon: 'lan' },
   { id: 'console', label: '终端与日志', hint: 'Shell 和操作记录', icon: 'terminal' },
 ]
-const savedToolSection = localStorage.getItem('mobilee.adb.toolSection') as ToolSection | null
+// This view is mounted at startup even when inactive; storage refusal must not abort the app.
+function readToolPreference(key: string): string | null { try { return localStorage.getItem(key) } catch { return null } }
+function writeToolPreference(key: string, value: string) { try { localStorage.setItem(key, value) } catch { /* current controls remain usable */ } }
+const savedToolSection = readToolPreference('mobilee.adb.toolSection') as ToolSection | null
 const toolSection = ref<ToolSection>(toolSections.some(item => item.id === savedToolSection) ? savedToolSection! : 'inspect')
-watch(toolSection, value => localStorage.setItem('mobilee.adb.toolSection', value), { flush: 'sync' })
+watch(toolSection, value => writeToolPreference('mobilee.adb.toolSection', value), { flush: 'sync' })
 const latestHistory = computed(() => props.history[0])
 const emit = defineEmits<{
   run: [payload: { action: AdbAction; argument?: string }]
@@ -256,26 +259,26 @@ const quickActions: { action: AdbAction; label: string; hint: string; icon: stri
   { action: 'selinux_enforcing', label: 'SELinux On', hint: '恢复 Enforcing', icon: 'lock' },
 ]
 function persistentRef(key: string, fallback: string): Ref<string> {
-  const value = ref(localStorage.getItem(key) || fallback)
-  watch(value, current => localStorage.setItem(key, current), { flush: 'sync' })
+  const value = ref(readToolPreference(key) || fallback)
+  watch(value, current => writeToolPreference(key, current), { flush: 'sync' })
   return value
 }
 
-const savedAction = localStorage.getItem('mobilee.adb.action') as AdbAction | null
+const savedAction = readToolPreference('mobilee.adb.action') as AdbAction | null
 const selectedAction = ref<AdbAction>(presets.some((item) => item.value === savedAction) ? savedAction! : 'logcat')
-watch(selectedAction, value => localStorage.setItem('mobilee.adb.action', value), { flush: 'sync' })
+watch(selectedAction, value => writeToolPreference('mobilee.adb.action', value), { flush: 'sync' })
 const argument = ref('')
 const shellCommand = ref('')
 const proxyHost = ref('192.168.3.100')
 const proxyPort = ref(8888)
 const mirrorPackage = persistentRef('mobilee.adb.mirrorPackage', '')
 const mirrorHost = persistentRef('mobilee.adb.mirrorHost', '192.168.3.9')
-const mirrorPort = ref(Number(localStorage.getItem('mobilee.adb.mirrorPort') || '8080'))
-watch(mirrorPort, value => localStorage.setItem('mobilee.adb.mirrorPort', String(value)), { flush: 'sync' })
-const mirrorViaAdb = ref(localStorage.getItem('mobilee.adb.mirrorViaAdb') === '1')
-watch(mirrorViaAdb, value => localStorage.setItem('mobilee.adb.mirrorViaAdb', value ? '1' : '0'), { flush: 'sync' })
-const mirrorLaunch = ref(localStorage.getItem('mobilee.adb.mirrorLaunch') === '1')
-watch(mirrorLaunch, value => localStorage.setItem('mobilee.adb.mirrorLaunch', value ? '1' : '0'), { flush: 'sync' })
+const mirrorPort = ref(Number(readToolPreference('mobilee.adb.mirrorPort') || '8080'))
+watch(mirrorPort, value => writeToolPreference('mobilee.adb.mirrorPort', String(value)), { flush: 'sync' })
+const mirrorViaAdb = ref(readToolPreference('mobilee.adb.mirrorViaAdb') === '1')
+watch(mirrorViaAdb, value => writeToolPreference('mobilee.adb.mirrorViaAdb', value ? '1' : '0'), { flush: 'sync' })
+const mirrorLaunch = ref(readToolPreference('mobilee.adb.mirrorLaunch') === '1')
+watch(mirrorLaunch, value => writeToolPreference('mobilee.adb.mirrorLaunch', value ? '1' : '0'), { flush: 'sync' })
 const mirrorRunning = ref(false)
 const mirrorCleanupPending = ref(false)
 const mirrorStatusDetail = ref('')

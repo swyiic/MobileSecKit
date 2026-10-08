@@ -82,7 +82,7 @@ onBeforeUnmount(() => { revision++; clearTimeout(hideTimer); clearTimeout(feedba
 .full-value-mono .full-value-text, .full-value-mono pre { font-family:ui-monospace,SFMono-Regular,Menlo,monospace; }
 .full-value-feedback { display:block; margin-top:3px; font-size:10px; line-height:1.5; color:var(--muted); overflow-wrap:anywhere; }
 .full-value-feedback[role='alert'] { color:var(--amber); }
-.full-value-preview { position:fixed; z-index:10000; box-sizing:border-box; overflow:auto; padding:10px 12px; border:1px solid var(--line-strong); border-radius:8px; background:var(--panel, #141b27); color:var(--text); box-shadow:0 8px 28px #0004; }
+.full-value-preview { position:fixed; z-index:10000; box-sizing:border-box; overflow:auto; padding:10px 12px; border:1px solid var(--line-strong); border-radius:8px; background:var(--surface); color:var(--text); box-shadow:0 8px 28px #0004; }
 .full-value-preview small { display:block; color:var(--muted); font-size:10px; line-height:1.5; }
 .full-value-preview pre { margin:6px 0 0; font-size:11px; line-height:1.6; white-space:pre-wrap; overflow-wrap:anywhere; user-select:text; }
 </style>

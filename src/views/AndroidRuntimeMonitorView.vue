@@ -196,8 +196,6 @@
       <p v-if="!localOwnershipConfirmed" class="ks-trash-message" role="status">本地主会话归属尚未确认，暂不显示旧会话删除入口；可重试“刷新本地记录”。</p>
       <p v-if="trashMessage" class="ks-trash-message" role="status">{{ trashMessage }}</p>
       <p v-if="purgeMessage" class="ks-trash-message" role="status">{{ purgeMessage }}</p>
-      <p v-if="purgeLoadError" class="ks-trash-message" role="alert">{{ purgeLoadError }} <button class="ghost-button" @click="loadPurgeReports">重试读取清理记录</button></p>
-      <KernSightPurgeHistory :reports="purgeReports" :busy="purgeBusy || purgeExecuting" @retry="openPurgeRetry" @refresh="loadPurgeReports" />
       <details v-if="trashedCaptureGroups.length" class="ks-group-trash">
         <summary>主会话回收站 · {{ trashedCaptureGroups.length }}</summary>
         <p>这里只移除会话列表记录，可恢复。原始证据、导入目录与设备文件保留，不释放磁盘空间。</p>
@@ -502,7 +500,6 @@ import { memoryCounterLabel, memoryEvidenceLabel } from '../services/kernsightMe
 import KernSightDexIndex from '@/components/KernSightDexIndex.vue'
 import KernSightCaptureDiagnostics from '@/components/KernSightCaptureDiagnostics.vue'
 import KernSightGroupPurge from '@/components/KernSightGroupPurge.vue'
-import KernSightPurgeHistory from '@/components/KernSightPurgeHistory.vue'
 import { bundleRemovedByPurge, purgeReportLabel, type PurgeTarget } from '@/services/kernsightGroupPurge'
 import { verifiedDexObjectCount, indexedElfModuleCount, indexedDexCount, runtimeDexClassMatches, elfLoadCoverageLabel, codeEvidenceLabel, allocatedEvidenceLabel, ownershipEvidenceEntries, codeNoiseLayers, archiveCoverageLabel, dexScanSummary, dexScanSummaryForObject, fileScanLabel } from '../services/kernsightCodeEvidence'
 import { buildAutoCaptureStages, captureTimeAllocation, captureCodeOnlyChoice, startupEvidenceLabel, qualifiedSourceLabel, type AutoStageReceipt } from '@/services/kernsightCapturePlan'
@@ -1604,11 +1601,6 @@ function openPurgePreview(group: KernSightCaptureGroup) {
   pendingTrashGroup.value = ''
   const importedRoots = importedCaptureGroups.value.filter(item => item.group.id === group.id && item.group.serial === group.serial && item.group.package === group.package).map(item => item.bundle.root)
   purgeTarget.value = { parentId: group.id, serial: group.serial, package: group.package, importedRoots: [...new Set(importedRoots)] }
-  purgeMessage.value = ''
-}
-function openPurgeRetry(report: KernSightGroupPurgeReport) {
-  if (!props.active || purgeBusy.value || purgeExecuting.value || report.state === 'running') return
-  purgeTarget.value = { parentId: report.parentId, serial: report.serial, package: report.package, importedRoots: report.importedRoots, retryPlanId: report.id }
   purgeMessage.value = ''
 }
 async function loadPurgeReports() {

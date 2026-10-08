@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::OnceLock;
-use tauri::Emitter;
+use tauri::{Emitter, Manager};
 use tokio::{
     process::Command,
     sync::Mutex,
@@ -11,6 +11,42 @@ use tokio::{
 mod advanced;
 mod config;
 mod monitoring;
+
+#[derive(Default)]
+struct MainWindowReveal(std::sync::atomic::AtomicBool);
+
+fn main_window_theme_style(theme: &str) -> Result<(tauri::Theme, tauri::window::Color), String> {
+    match theme {
+        "light" => Ok((
+            tauri::Theme::Light,
+            tauri::window::Color(245, 247, 250, 255),
+        )),
+        "dark" => Ok((tauri::Theme::Dark, tauri::window::Color(9, 11, 15, 255))),
+        _ => Err("Unknown window theme".into()),
+    }
+}
+
+/// Theme updates never re-show a window the operator has hidden.
+#[tauri::command]
+fn apply_main_window_theme(
+    app: tauri::AppHandle,
+    state: tauri::State<'_, MainWindowReveal>,
+    theme: &str,
+) -> Result<(), String> {
+    let (theme, color) = main_window_theme_style(theme)?;
+    let window = app
+        .get_webview_window("main")
+        .ok_or("Main window unavailable")?;
+    let first = !state.0.swap(true, std::sync::atomic::Ordering::SeqCst);
+    let styled = window
+        .set_background_color(Some(color))
+        .and_then(|()| window.set_theme(Some(theme)));
+    let shown = if first { window.show() } else { Ok(()) };
+    if first && shown.is_err() {
+        state.0.store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+    styled.and(shown).map_err(|error| error.to_string())
+}
 
 pub(crate) const ADB_TIMEOUT: Duration = Duration::from_secs(20);
 const ADB_INSTALL_TIMEOUT: Duration = Duration::from_secs(300);
@@ -1043,7 +1079,9 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
         .manage(monitoring::MirrorSessionState::default())
+        .manage(MainWindowReveal::default())
         .invoke_handler(tauri::generate_handler![
+            apply_main_window_theme,
             list_devices,
             get_ios_device_details,
             get_device_details,
@@ -1133,6 +1171,21 @@ pub fn run() {
             monitoring::cleanup_kernsight_package_dump,
         ])
         .setup(|app| {
+            // A broken frontend must not leave the native window permanently hidden.
+            let fallback_app = app.handle().clone();
+            tauri::async_runtime::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+                if fallback_app.state::<MainWindowReveal>().0.load(std::sync::atomic::Ordering::SeqCst) { return; }
+                let Some(window) = fallback_app.get_webview_window("main") else { return; };
+                // Prefer the synchronous head theme even if Vue/configuration failed.
+                let _ = window.eval("(() => { const theme = document.documentElement.dataset.theme; if ((theme === 'light' || theme === 'dark') && window.__TAURI_INTERNALS__) window.__TAURI_INTERNALS__.invoke('apply_main_window_theme', { theme }).catch(() => {}); })()");
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                if fallback_app.state::<MainWindowReveal>().0.swap(true, std::sync::atomic::Ordering::SeqCst) { return; }
+                let name = if window.theme().ok() == Some(tauri::Theme::Dark) { "dark" } else { "light" };
+                if let Ok((_, color)) = main_window_theme_style(name) { let _ = window.set_background_color(Some(color)); }
+                if let Err(error) = window.show() { fallback_app.state::<MainWindowReveal>().0.store(false, std::sync::atomic::Ordering::SeqCst);
+                    eprintln!("Main window fallback reveal failed: {error}"); }
+            });
             // Operator path used to open one local evidence directory in this window.
             if let Ok(path) = std::env::var("ME_IMPORT_DIR") {
                 let app = app.handle().clone();
@@ -1196,5 +1249,21 @@ mod tests {
             "{}",
             output.stdout
         );
+    }
+}
+
+#[cfg(test)]
+mod startup_theme_tests {
+    #[test]
+    fn main_window_theme_accepts_only_explicit_supported_palettes() {
+        let (theme, color) = super::main_window_theme_style("light").unwrap();
+        assert_eq!(theme, tauri::Theme::Light);
+        assert_eq!(color, tauri::window::Color(245, 247, 250, 255));
+        let (theme, color) = super::main_window_theme_style("dark").unwrap();
+        assert_eq!(theme, tauri::Theme::Dark);
+        assert_eq!(color, tauri::window::Color(9, 11, 15, 255));
+        for value in ["", "system", "LIGHT", "invalid"] {
+            assert!(super::main_window_theme_style(value).is_err());
+        }
     }
 }

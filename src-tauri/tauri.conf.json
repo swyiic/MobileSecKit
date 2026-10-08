@@ -15,12 +15,13 @@
         "title": "ME",
         "width": 1000,
         "height": 1020,
-        "decorations": true, 
+        "decorations": true,
         "transparent": false,
         "resizable": true,
         "center": true,
         "minWidth": 800,
-        "minHeight": 600
+        "minHeight": 600,
+        "visible": false
       }
     ],
     "security": {
@@ -30,7 +31,9 @@
   "bundle": {
     "active": true,
     "targets": "all",
-    "resources": ["rules/*.json"],
+    "resources": [
+      "rules/*.json"
+    ],
     "macOS": {
       "signingIdentity": "-"
     },

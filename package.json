@@ -15,7 +15,8 @@
     "test:kernsight-plan": "node --test tests/kernsightCapturePlan.test.mjs",
     "test:kernsight-evidence": "node --test tests/kernsightCapturePlan.test.mjs tests/kernsightCaptureGroups.test.mjs tests/kernsightMemoryEvidence.test.mjs tests/kernsightCodeEvidence.test.mjs tests/kernsightWorkspaceState.test.mjs tests/kernsightCaptureRunner.test.mjs tests/kernsightCaptureDiagnostics.test.mjs tests/kernsightGroupPurge.test.mjs tests/kernsightPurgeHistory.test.mjs",
     "test:kernsight-purge": "node --test tests/kernsightGroupPurge.test.mjs tests/kernsightPurgeHistory.test.mjs",
-    "test:kernsight-purge-browser": "node tests/browser/kernsightGroupPurge.browser.mjs"
+    "test:kernsight-purge-browser": "node tests/browser/kernsightGroupPurge.browser.mjs",
+    "test:theme-browser": "node tests/browser/theme.browser.mjs"
   },
   "dependencies": {
     "@tauri-apps/api": "2.9.1",

@@ -2,9 +2,25 @@
 <html lang="zh-CN">
   <head>
     <meta charset="UTF-8" />
+    <meta name="theme-color" content="#f5f7fa" />
+    <script>
+      // Resolve before styles/modules or configuration IPC can delay the first frame.
+      (() => {
+        let saved = null
+        try { saved = localStorage.getItem('mobilee.theme') } catch { /* restricted storage follows system */ }
+        const theme = saved === 'light' || saved === 'dark' ? saved : (matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light')
+        document.documentElement.dataset.theme = theme
+        document.documentElement.style.colorScheme = theme
+        document.querySelector('meta[name="theme-color"]')?.setAttribute('content', theme === 'dark' ? '#090b0f' : '#f5f7fa')
+      })()
+    </script>
+    <style>
+      :root { color-scheme: light; --startup-bg: #f5f7fa; background: var(--startup-bg); }
+      :root[data-theme='dark'] { color-scheme: dark; --startup-bg: #090b0f; }
+      html, body, #app { min-height: 100%; margin: 0; background: var(--startup-bg); }
+    </style>
     <link href="https://fonts.googleapis.com/css2?family=Material+Symbols+Outlined:wght,FILL@100..700,0..1&display=swap" rel="stylesheet"/>
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <meta name="theme-color" content="#090b0f" />
     <meta name="description" content="Android 与 iOS 移动应用安全测试工具箱" />
     <title>ME</title>
   </head>

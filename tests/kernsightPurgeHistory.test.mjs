@@ -19,3 +19,13 @@ test('running records cannot hide and retained preference count is bounded',()=>
  assert.equal(updateHiddenPurgeKeys(Array.from({length:1100},(_,i)=>'key'+i),report,true).length,1024)
  assert.equal(updateHiddenPurgeKeys([purgeHistoryKey(report)],report,true).length,1)
 })
+
+test('session page omits historical purge entry while keeping normal groups and explicit cleanup preview',()=>{
+ const view=readFileSync(new URL('../src/views/AndroidRuntimeMonitorView.vue',import.meta.url),'utf8')
+ assert.doesNotMatch(view,/KernSightPurgeHistory|openPurgeRetry|重试读取清理记录/)
+ assert.match(view,/KernSightGroupPurge v-if="purgeTarget"/)
+ assert.match(view,/visibleCaptureGroups/)
+ assert.match(view,/legacyDeviceSessions/)
+ assert.match(view,/attempts/)
+ assert.match(view,/listKernSightGroupPurges/)
+})
