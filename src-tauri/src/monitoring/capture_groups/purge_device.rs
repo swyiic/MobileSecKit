@@ -19,6 +19,9 @@ const STAT_FORMAT: &str = "%f:%d:%i:%h:%s:%b:%Y:%Z";
 pub struct DeviceSnapshot {
     pub parent_id: Uuid,
     pub serial: String,
+    /// Resolved transport only; original manifest serial and fingerprint remain unchanged.
+    #[serde(default)]
+    transport_serial: Option<String>,
     /// SHA-256 of ADB serial, hardware serial properties and OS build fingerprint.
     pub fingerprint: String,
     pub logical_bytes: u64,
@@ -27,6 +30,9 @@ pub struct DeviceSnapshot {
     pub preserved: Vec<String>,
     group: Group,
     identity_evidence: String,
+    /// Independent current status proof; never rewrites the historical parent receipt.
+    #[serde(default)]
+    terminal_proofs: BTreeMap<Uuid, Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -105,7 +111,7 @@ fn clean_path(path: &str) -> bool {
         && path.split('/').all(|c| c != "." && c != "..")
         && path
             .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b"/._-".contains(&b))
+            .all(|b| b.is_ascii_alphanumeric() || b"/._-+".contains(&b))
 }
 fn runtime_root(group: &Group) -> Result<String, String> {
     if let Some(paths) = runtime_paths_from_group(Some(group))? {
@@ -186,6 +192,46 @@ fn canonical_checks(path: &str, allow_absent_leaf: bool) -> Result<String, Strin
     }
     Ok(script)
 }
+pub(super) fn original_lifecycle(group: &Group, relation: &Relation) -> Result<Value, String> {
+    let attempt = group
+        .stages
+        .iter()
+        .flat_map(|s| &s.attempts)
+        .find(|a| a.relation == *relation)
+        .ok_or("原 controller 身份缺失")?;
+    if let Some(note) = &attempt.remote_lifecycle {
+        validate_remote_lifecycle(note, relation)?;
+        return Ok(note.clone());
+    }
+    // Older no-session loader failures retained the complete stderr in error,
+    // but omitted remoteLifecycle. Recover only an exact bounded original
+    // relation/token here; it cannot authorize cleanup without a fresh closed
+    // capture-control status and carries no inferred payload/spool scope.
+    if attempt.session_id.is_some() || attempt.remote_artifact_root.is_some() {
+        return Err("有 payload 的原远端退出证据缺失，不能重建清理资格".into());
+    }
+    let mut found: Option<Value> = None;
+    for line in attempt.error.as_deref().unwrap_or("").lines() {
+        if line.len() > MAX_REMOTE_CONTROL_BYTES {
+            continue;
+        }
+        let Ok(note) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        if note["schema"] != "kernsight.capture-lifecycle/v1" {
+            continue;
+        }
+        validate_remote_lifecycle(&note, relation)?;
+        if found
+            .as_ref()
+            .is_some_and(|before| before["token"] != note["token"])
+        {
+            return Err("原留存 stderr 有冲突 controller token，清理已阻止".into());
+        }
+        found = Some(note);
+    }
+    found.ok_or("原远端 token/relation 证据缺失，不能重建清理资格".into())
+}
 fn expected_roots(group: &Group) -> Result<Vec<DeviceRoot>, String> {
     group.validate()?;
     if matches!(group.state.as_str(), "running" | "unknown") {
@@ -208,16 +254,36 @@ fn expected_roots(group: &Group) -> Result<Vec<DeviceRoot>, String> {
             } else {
                 &attempt.relation
             };
-            let lifecycle = attempt
-                .remote_lifecycle
-                .as_ref()
-                .ok_or("设备终态缺少证据，清理已阻止")?;
-            validate_remote_lifecycle(lifecycle, relation)?;
-            if !remote_terminal_confirmed(lifecycle) {
-                return Err("设备 producer 返回/退出未知，清理已阻止".into());
+            let not_started = attempt.session_id.is_none()
+                && attempt.remote_artifact_root.is_none()
+                && group.budget.as_ref().is_some_and(|budget| {
+                    budget.reservations.iter().any(|r| {
+                        r.id == attempt.relation.attempt_id.to_string() && r.status == "not_started"
+                    })
+                });
+            if not_started {
+                continue;
             }
+            let lifecycle = original_lifecycle(group, relation)?;
+            validate_remote_lifecycle(&lifecycle, relation)?;
             if attempt.session_id.is_none() && attempt.remote_artifact_root.is_none() {
-                return Err("attempt 缺少可验证设备文件身份，未按目录名猜测清理范围".into());
+                let path = format!(
+                    "{base}/captures/{}/{}/{}/control",
+                    relation.parent_id, relation.stage_id, relation.attempt_id
+                );
+                roots.entry(path.clone()).or_insert_with(|| DeviceRoot {
+                    path,
+                    kind: "controlOnly".into(),
+                    logical_bytes: 0,
+                    allocated_bytes: Some(0),
+                    files: 0,
+                    relation: relation.clone(),
+                    session_id: None,
+                    evidence: BTreeMap::new(),
+                    entries: vec![],
+                    absent: false,
+                });
+                continue;
             }
             if let Some(session_id) = attempt.session_id {
                 let path = format!("{base}/spool/{session_id}");
@@ -282,24 +348,22 @@ fn transport_offline(text: &str) -> bool {
 }
 
 async fn adb(serial: &str, script: String) -> Result<crate::RawOutput, String> {
-    // No auto-discovery/reconnect to a different serial and no global selection.
-    // Preserve the distinct offline classification only for recognized transport errors.
+    let (timeout, operation) = if script.starts_with("# me-purge:inventory\n") {
+        (Duration::from_secs(120), "会话文件清单与完整 SHA-256 核对")
+    } else {
+        (Duration::from_secs(30), "会话设备身份/终态核对")
+    };
     let command = format!("su -c {}", crate::shell_quote(&script));
-    crate::run_device_adb_with_timeout(
-        serial,
-        &["shell", &command],
-        Duration::from_secs(30),
-        "会话设备清理",
-    )
-    .await
-    .map_err(|error| {
-        let lower = error.to_ascii_lowercase();
-        if transport_offline(&lower) {
-            format!("device_offline: {error}")
-        } else {
-            error
-        }
-    })
+    crate::run_device_adb_with_timeout(serial, &["shell", &command], timeout, operation)
+        .await
+        .map_err(|error| {
+            let lower = error.to_ascii_lowercase();
+            if transport_offline(&lower) {
+                format!("device_offline: {error}")
+            } else {
+                error
+            }
+        })
 }
 fn checked_output(output: crate::RawOutput, limit: usize) -> Result<String, String> {
     if output.code == Some(81) {
@@ -330,7 +394,7 @@ fn checked_output(output: crate::RawOutput, limit: usize) -> Result<String, Stri
 fn identity_script() -> String {
     "# me-purge:identity\nprintf 'MEIDENTITY'; for key in ro.serialno ro.boot.serialno ro.build.fingerprint; do printf '|'; getprop \"$key\" | tr -d '\\r\\n' | base64 | tr -d '\\r\\n'; done; printf '\\n'".into()
 }
-fn parse_identity(serial: &str, text: &str) -> Result<String, String> {
+fn identity_values(text: &str) -> Result<Vec<String>, String> {
     let fields = text.trim().split('|').collect::<Vec<_>>();
     if fields.len() != 4 || fields[0] != "MEIDENTITY" {
         return Err("设备稳定身份不可读".into());
@@ -352,8 +416,64 @@ fn parse_identity(serial: &str, text: &str) -> Result<String, String> {
     {
         return Err("硬件序列号/构建指纹缺失，不能确认配对手机".into());
     }
+    Ok(values)
+}
+fn parse_identity(serial: &str, text: &str) -> Result<String, String> {
+    let values = identity_values(text)?;
     let bytes = serde_json::to_vec(&(serial, &values)).map_err(|e| e.to_string())?;
     Ok(format!("{:x}", Sha256::digest(bytes)))
+}
+fn wireless_hardware_serial(serial: &str) -> Option<&str> {
+    let body = serial
+        .strip_prefix("adb-")?
+        .strip_suffix("._adb-tls-connect._tcp")?;
+    let (hardware, nonce) = body.rsplit_once('-')?;
+    (!hardware.is_empty()
+        && !nonce.is_empty()
+        && hardware.bytes().all(|b| b.is_ascii_alphanumeric())
+        && nonce.bytes().all(|b| b.is_ascii_alphanumeric()))
+    .then_some(hardware)
+}
+fn valid_transport(original: &str, transport: &str, evidence: &str) -> Result<(), String> {
+    let values = identity_values(evidence)?;
+    if original == transport {
+        return Ok(());
+    }
+    let hardware =
+        wireless_hardware_serial(original).ok_or("旧设备地址缺少可信硬件 serial；请连接原设备")?;
+    if transport != hardware
+        || values[0] != hardware
+        || (!values[1].is_empty() && values[1] != hardware)
+    {
+        return Err("USB 与旧无线会话硬件 serial 不一致；未改清理范围".into());
+    }
+    Ok(())
+}
+async fn resolve_transport(original: &str) -> Result<String, String> {
+    let Some(hardware) = wireless_hardware_serial(original) else {
+        return Ok(original.into());
+    };
+    let output = crate::run_adb(&["devices".into(), "-l".into()]).await?;
+    let devices = checked_output(output, 64 * 1024)?;
+    let online = |serial: &str| {
+        devices.lines().any(|line| {
+            let mut fields = line.split_whitespace();
+            fields.next() == Some(serial) && fields.next() == Some("device")
+        })
+    };
+    if online(original) {
+        return Ok(original.into());
+    }
+    // Only the hardware serial encoded by Android's TLS service name is eligible.
+    // Never pick the first device, an IP endpoint, or an unrelated connected phone.
+    if !online(hardware) {
+        return Err(format!(
+            "device_offline: 原无线地址离线，原硬件 USB {hardware} 未连接"
+        ));
+    }
+    let evidence = checked_output(adb(hardware, identity_script()).await?, 8192)?;
+    valid_transport(original, hardware, &evidence)?;
+    Ok(hardware.into())
 }
 fn lifecycle_script(group: &Group, relation: &Relation) -> Result<String, String> {
     let base = runtime_root(group)?;
@@ -374,11 +494,12 @@ async fn check_lifecycles<F, Fut>(
     group: &Group,
     roots: &[DeviceRoot],
     rpc: &mut F,
-) -> Result<(), String>
+) -> Result<BTreeMap<Uuid, Value>, String>
 where
     F: FnMut(String) -> Fut,
     Fut: Future<Output = Result<crate::RawOutput, String>>,
 {
+    let mut proofs = BTreeMap::new();
     let mut seen = BTreeSet::new();
     for root in roots {
         if !seen.insert(root.relation.attempt_id) {
@@ -392,24 +513,19 @@ where
         if !remote_terminal_confirmed(&note) {
             return Err("设备正在运行或终态未知，清理已阻止".into());
         }
-        let original = group
-            .stages
-            .iter()
-            .flat_map(|s| &s.attempts)
-            .find(|a| a.relation == root.relation)
-            .and_then(|a| a.remote_lifecycle.as_ref())
-            .ok_or("设备 controller 身份证据缺失")?;
+        let original = original_lifecycle(group, &root.relation)?;
         if note["token"] != original["token"] {
             return Err("设备生命周期 token 已变化，清理已阻止".into());
         }
+        proofs.insert(root.relation.attempt_id, note);
     }
-    Ok(())
+    Ok(proofs)
 }
 fn inventory_script(path: &str) -> Result<String, String> {
     let q = crate::shell_quote(path);
-    // find never follows links. The path is encoded independently of its bytes,
-    // so newlines/tabs cannot inject a second inventory record. A terminal marker
-    // and bounded head make truncation/error a hard failure, never an empty tree.
+    // All untrusted paths remain argv values. Validate the allowlisted ASCII
+    // alphabet before emitting a delimiter-based batch wire format. Three
+    // batched scans retain full SHA and before/after identity comparisons.
     Ok(format!(
         r#"# me-purge:inventory
 {mount_guard}
@@ -417,8 +533,11 @@ fn inventory_script(path: &str) -> Result<String, String> {
 if [ ! -e {q} ]; then printf 'MEABSENT\n'; exit 0; fi
 [ -d {q} ] || exit 73
 (
-find {q} -xdev -exec sh -c 'for p do s=$(stat -c "{stat}" "$p") || exit 74; h="-"; if [ -f "$p" ] && [ ! -L "$p" ]; then h=$(sha256sum "$p") || exit 74; h=${{h%% *}}; fi; [ "$s" = "$(stat -c "{stat}" "$p")" ] || exit 74; n=$(printf "%s" "$p" | base64 | tr -d "\r\n") || exit 74; printf "MEENTRY|%s|%s|%s\n" "$n" "$s" "$h"; done' sh {{}} +
-s=$?; printf 'MEEND|%s\n' "$s"
+LC_ALL=C; export LC_ALL
+find {q} -xdev -exec sh -c 'for p do case "$p" in *[!a-zA-Z0-9/._+-]*|*//*|*/../*|*/./*) exit 74;; esac; done; stat -c "MEBEFORE|%n|{stat}" "$@"' sh {{}} + || exit 74
+find {q} -xdev -type f -exec sha256sum {{}} + || exit 74
+find {q} -xdev -exec sh -c 'for p do case "$p" in *[!a-zA-Z0-9/._+-]*|*//*|*/../*|*/./*) exit 74;; esac; done; stat -c "MEAFTER|%n|{stat}" "$@"' sh {{}} + || exit 74
+printf 'MEEND|0\n'
 ) | head -c {bound}
 "#,
         checks = canonical_checks(path, true)?,
@@ -427,12 +546,74 @@ s=$?; printf 'MEEND|%s\n' "$s"
         bound = MAX_WIRE + 1
     ))
 }
+fn parse_batch_inventory(path: &str, text: &str) -> Result<Option<Vec<Entry>>, String> {
+    let mut before = BTreeMap::new();
+    let mut after = BTreeMap::new();
+    let mut hashes = BTreeMap::new();
+    for line in text.lines().filter(|line| *line != "MEEND|0") {
+        if let Some(record) = line
+            .strip_prefix("MEBEFORE|")
+            .or_else(|| line.strip_prefix("MEAFTER|"))
+        {
+            let (name, stamp) = record.split_once('|').ok_or("批量 stat 格式未知")?;
+            if !clean_path(name) || !(name == path || name.starts_with(&format!("{path}/"))) {
+                return Err("批量 stat 路径越界/格式未知".into());
+            }
+            let entries = if line.starts_with("MEBEFORE|") {
+                &mut before
+            } else {
+                &mut after
+            };
+            if entries.len() >= MAX_ENTRIES
+                || entries
+                    .insert(name.to_string(), stamp.to_string())
+                    .is_some()
+            {
+                return Err("批量 stat 超限或重复路径".into());
+            }
+        } else {
+            let (hash, name) = line.split_once("  ").ok_or("批量 SHA 格式未知")?;
+            if !clean_path(name)
+                || hashes.len() >= MAX_ENTRIES
+                || hashes.insert(name.to_string(), hash.to_string()).is_some()
+            {
+                return Err("批量 SHA 超限/重复/非规范路径".into());
+            }
+        }
+    }
+    if before.is_empty() || before != after {
+        return Err("设备清单在完整 SHA 核对期间改变".into());
+    }
+    let mut legacy = String::new();
+    for (name, stamp) in &before {
+        let mode = stamp.split(':').next().ok_or("批量 stat 类型缺失")?;
+        let regular =
+            u32::from_str_radix(mode, 16).map_err(|_| "批量 stat 类型未知")? & 0xf000 == 0x8000;
+        let hash = if regular {
+            hashes.remove(name).ok_or("批量 SHA 缺失")?
+        } else {
+            "-".into()
+        };
+        legacy.push_str(&format!(
+            "MEENTRY|{}|{stamp}|{hash}\n",
+            STANDARD.encode(name)
+        ));
+    }
+    if !hashes.is_empty() {
+        return Err("批量 SHA 包含未核验文件".into());
+    }
+    legacy.push_str("MEEND|0\n");
+    parse_inventory(path, &legacy)
+}
 fn parse_inventory(path: &str, text: &str) -> Result<Option<Vec<Entry>>, String> {
     if text.trim() == "MEABSENT" {
         return Ok(None);
     }
     if text.len() > MAX_WIRE || !text.trim_end().ends_with("MEEND|0") {
         return Err("设备目录清单不完整/超限，清理已阻止".into());
+    }
+    if text.starts_with("MEBEFORE|") {
+        return parse_batch_inventory(path, text);
     }
     let mut entries = BTreeMap::new();
     for line in text.lines().filter(|line| *line != "MEEND|0") {
@@ -582,6 +763,7 @@ fn snapshot(
     fingerprint: String,
     identity_evidence: String,
     roots: Vec<DeviceRoot>,
+    terminal_proofs: BTreeMap<Uuid, Value>,
 ) -> Result<DeviceSnapshot, String> {
     let logical_bytes = roots.iter().try_fold(0u64, |n, r| {
         n.checked_add(r.logical_bytes).ok_or("设备总字节溢出")
@@ -594,6 +776,12 @@ fn snapshot(
         "原始安装 APK、App 私有目录、共享 CAS、生命周期 control 记录及空目录不在清理范围".into(),
     ];
     for root in &roots {
+        if root.kind == "controlOnly" {
+            preserved.push(format!(
+                "无 session/payload 身份，已核对退出并保留 control：{}",
+                root.path
+            ));
+        }
         for entry in root.entries.iter().filter(|e| e.preserve && !e.directory()) {
             preserved.push(format!("保留共享/归属元数据：{}", entry.path));
         }
@@ -601,6 +789,7 @@ fn snapshot(
     Ok(DeviceSnapshot {
         parent_id: group.id,
         serial: group.serial.clone(),
+        transport_serial: None,
         fingerprint,
         logical_bytes,
         allocated_bytes,
@@ -608,13 +797,18 @@ fn snapshot(
         preserved,
         group: group.clone(),
         identity_evidence,
+        terminal_proofs,
     })
 }
 
 /// Read-only preview. The caller retains this complete snapshot server-side and
 /// binds confirmation to it; never execute a client-supplied file list.
 pub async fn inspect(group: &Group) -> Result<DeviceSnapshot, String> {
-    inspect_with(group, |script| adb(&group.serial, script)).await
+    let transport = resolve_transport(&group.serial).await?;
+    let mut snapshot = inspect_with(group, |script| adb(&transport, script)).await?;
+    valid_transport(&group.serial, &transport, &snapshot.identity_evidence)?;
+    snapshot.transport_serial = Some(transport);
+    Ok(snapshot)
 }
 async fn inspect_with<F, Fut>(group: &Group, mut rpc: F) -> Result<DeviceSnapshot, String>
 where
@@ -624,8 +818,11 @@ where
     let mut roots = expected_roots(group)?;
     let identity_evidence = checked_output(rpc(identity_script()).await?, 8192)?;
     let fingerprint = parse_identity(&group.serial, &identity_evidence)?;
-    check_lifecycles(group, &roots, &mut rpc).await?;
+    let terminal_proofs = check_lifecycles(group, &roots, &mut rpc).await?;
     for root in &mut roots {
+        if root.kind == "controlOnly" {
+            continue;
+        }
         let text = checked_output(rpc(inventory_script(&root.path)?).await?, MAX_WIRE)?;
         let Some(entries) = parse_inventory(&root.path, &text)? else {
             root.absent = true;
@@ -678,7 +875,13 @@ where
         }
         summarize(root)?;
     }
-    snapshot(group, fingerprint, identity_evidence, roots)
+    snapshot(
+        group,
+        fingerprint,
+        identity_evidence,
+        roots,
+        terminal_proofs,
+    )
 }
 fn shared_namespace(root: &str, path: &str) -> bool {
     path.strip_prefix(&format!("{root}/")).is_some_and(|p| {
@@ -691,7 +894,11 @@ fn shared_namespace(root: &str, path: &str) -> bool {
 /// files, changed identity, changed owner evidence, or lifecycle uncertainty fail
 /// closed; an offline retry can never grow its deletion scope automatically.
 pub async fn inspect_remaining(original: &DeviceSnapshot) -> Result<DeviceSnapshot, String> {
-    remaining_with(original, |script| adb(&original.serial, script)).await
+    let transport = resolve_transport(&original.serial).await?;
+    let mut snapshot = remaining_with(original, |script| adb(&transport, script)).await?;
+    valid_transport(&original.serial, &transport, &snapshot.identity_evidence)?;
+    snapshot.transport_serial = Some(transport);
+    Ok(snapshot)
 }
 async fn remaining_with<F, Fut>(
     original: &DeviceSnapshot,
@@ -709,9 +916,12 @@ where
     if fingerprint != original.fingerprint {
         return Err("配对手机稳定指纹已变化，清理已阻止".into());
     }
-    check_lifecycles(&original.group, &original.roots, &mut rpc).await?;
+    let terminal_proofs = check_lifecycles(&original.group, &original.roots, &mut rpc).await?;
     let mut roots = original.roots.clone();
     for root in &mut roots {
+        if root.kind == "controlOnly" {
+            continue;
+        }
         let text = checked_output(rpc(inventory_script(&root.path)?).await?, MAX_WIRE)?;
         let current = parse_inventory(&root.path, &text)?.unwrap_or_default();
         let old: BTreeMap<_, _> = root.entries.iter().map(|e| (e.path.as_str(), e)).collect();
@@ -754,6 +964,7 @@ where
         fingerprint,
         original.identity_evidence.clone(),
         roots,
+        terminal_proofs,
     )
 }
 pub(super) fn preview_entries(snapshot: &DeviceSnapshot) -> Vec<super::purge_local::Entry> {
@@ -781,24 +992,39 @@ pub(super) fn matches_group(snapshot: &DeviceSnapshot, group: &Group) -> bool {
         && serde_json::to_value(&snapshot.group).ok() == serde_json::to_value(group).ok()
 }
 
-fn validate_snapshot(snapshot: &DeviceSnapshot) -> Result<(), String> {
+pub(super) fn validate_snapshot(snapshot: &DeviceSnapshot) -> Result<(), String> {
     if snapshot.parent_id != snapshot.group.id || snapshot.serial != snapshot.group.serial {
         return Err("设备快照与主会话身份冲突".into());
     }
     if parse_identity(&snapshot.serial, &snapshot.identity_evidence)? != snapshot.fingerprint {
         return Err("设备快照稳定身份冲突".into());
     }
+    if let Some(transport) = &snapshot.transport_serial {
+        valid_transport(&snapshot.serial, transport, &snapshot.identity_evidence)?;
+    }
     let expected = expected_roots(&snapshot.group)?;
     if expected.len() != snapshot.roots.len() {
         return Err("设备快照范围冲突".into());
     }
     for (expected, root) in expected.iter().zip(&snapshot.roots) {
+        let original = original_lifecycle(&snapshot.group, &root.relation)?;
+        if let Some(proof) = snapshot.terminal_proofs.get(&root.relation.attempt_id) {
+            validate_remote_lifecycle(proof, &root.relation)?;
+            if !remote_terminal_confirmed(proof) || proof["token"] != original["token"] {
+                return Err("独立退出证明未绑定原 token/已退出终态".into());
+            }
+        } else if !remote_terminal_confirmed(&original) {
+            return Err("旧退出状态未知且缺独立已封存证明".into());
+        }
         if expected.path != root.path
             || expected.kind != root.kind
             || expected.relation != root.relation
             || expected.session_id != root.session_id
         {
             return Err("设备快照路径/关系冲突".into());
+        }
+        if root.kind == "controlOnly" && (!root.entries.is_empty() || !root.evidence.is_empty()) {
+            return Err("无 payload 的 control-only 快照不能携带删除范围".into());
         }
         if root.entries.len() > MAX_ENTRIES {
             return Err("设备快照超限".into());
@@ -857,7 +1083,8 @@ fn remove_script(
 /// Called only after explicit confirmation of a server-retained preview. Known
 /// partial results are returned, so failures remain visible and retryable.
 pub async fn execute(original: &DeviceSnapshot) -> Result<DeviceOutcome, String> {
-    execute_with(original, |script| adb(&original.serial, script)).await
+    let transport = resolve_transport(&original.serial).await?;
+    execute_with(original, |script| adb(&transport, script)).await
 }
 async fn execute_with<F, Fut>(
     original: &DeviceSnapshot,
@@ -950,6 +1177,266 @@ mod tests {
     use std::cell::RefCell;
     use std::rc::Rc;
 
+    #[test]
+    fn wireless_reconnect_requires_exact_read_hardware_identity() {
+        let original = "adb-phone123-abc123._adb-tls-connect._tcp";
+        let identity = format!(
+            "MEIDENTITY|{}|{}|{}",
+            STANDARD.encode("phone123"),
+            STANDARD.encode("phone123"),
+            STANDARD.encode("test/build")
+        );
+        valid_transport(original, "phone123", &identity).unwrap();
+        assert!(valid_transport(original, "otherphone", &identity).is_err());
+        assert!(valid_transport(
+            original,
+            "phone123",
+            &identity.replace(&STANDARD.encode("phone123"), &STANDARD.encode("otherphone"))
+        )
+        .is_err());
+        assert!(valid_transport("192.168.0.2:5555", "phone123", &identity).is_err());
+        assert!(valid_transport(
+            "adb-phone123-abc123._adb-tls-connect._tcp.extra",
+            "phone123",
+            &identity
+        )
+        .is_err());
+    }
+    #[test]
+    fn batch_inventory_requires_complete_matching_stamps_and_hashes() {
+        let path = "/data/local/tmp/fixture";
+        let directory = "41c0:1:1:2:4096:8:1:1";
+        let file = "8180:1:2:1:3:8:1:1";
+        let hash = "a".repeat(64);
+        let wire = format!("MEBEFORE|{path}|{directory}\nMEBEFORE|{path}/payload|{file}\n{hash}  {path}/payload\nMEAFTER|{path}|{directory}\nMEAFTER|{path}/payload|{file}\nMEEND|0\n");
+        assert_eq!(parse_inventory(path, &wire).unwrap().unwrap().len(), 2);
+        assert!(parse_inventory(
+            path,
+            &wire.replace(&format!("{hash}  {path}/payload\n"), "")
+        )
+        .is_err());
+        assert!(parse_inventory(
+            path,
+            &wire.replace(
+                &format!("MEAFTER|{path}/payload|{file}"),
+                &format!("MEAFTER|{path}/payload|8180:1:3:1:3:8:1:1")
+            )
+        )
+        .is_err());
+        assert!(parse_inventory(
+            path,
+            &wire.replace(
+                &format!("{hash}  {path}/payload"),
+                &format!("{hash}  /data/local/tmp/foreign/payload")
+            )
+        )
+        .is_err());
+        assert!(parse_inventory(path, &wire.replace("MEEND|0\n", "")).is_err());
+    }
+    #[tokio::test]
+    async fn failed_before_session_checks_terminal_control_without_guessing_spool_or_deleting() {
+        let mut group = terminal();
+        group.stages[0].attempts[0].session_id = None;
+        group.stages[0].attempts[0].state = "failed".into();
+        group.state = "failed".into();
+        let lifecycle = group.stages[0].attempts[0]
+            .remote_lifecycle
+            .clone()
+            .unwrap();
+        let mut calls = Vec::new();
+        let snapshot = inspect_with(&group, |script| {
+            calls.push(script.clone());
+            std::future::ready(Ok(output(if script.starts_with("# me-purge:identity") {
+                identity()
+            } else {
+                lifecycle.to_string()
+            })))
+        })
+        .await
+        .unwrap();
+        assert!(preview_entries(&snapshot).is_empty());
+        assert!(snapshot
+            .roots
+            .iter()
+            .all(|root| root.kind == "controlOnly" && root.entries.is_empty()));
+        assert_eq!(calls.len(), 2);
+        assert!(calls
+            .iter()
+            .all(|script| !script.contains("sha256sum") && !script.contains("rm --")));
+        let before = serde_json::to_value(&snapshot).unwrap();
+        validate_snapshot(&snapshot).unwrap();
+        assert_eq!(before, serde_json::to_value(&snapshot).unwrap());
+    }
+    #[tokio::test]
+    #[ignore = "explicit read-only physical device integration, never executes purge"]
+    async fn physical_readonly_preview_retains_complete_hashes() {
+        let source = std::env::var("ME_PURGE_READONLY_GROUP_PATH").expect("explicit group path");
+        let report = std::env::var("ME_PURGE_READONLY_REPORT_PATH").expect("explicit output path");
+        let group: Group =
+            serde_json::from_str(&read_bounded_text(Path::new(&source), 1024 * 1024).unwrap())
+                .unwrap();
+        let started = std::time::Instant::now();
+        let mut command_id = 0;
+        let snapshot = inspect_with(&group, |script| {
+            command_id += 1;
+            let output_root = Path::new(&report).parent().unwrap().to_owned();
+            let serial = group.serial.clone();
+            let id = command_id;
+            async move {
+                std::fs::write(output_root.join(format!("batch-{id}.script")), &script).unwrap();
+                let response = adb(&serial, script).await;
+                if let Ok(output) = &response {
+                    std::fs::write(
+                        output_root.join(format!("batch-{id}.stdout")),
+                        &output.stdout,
+                    )
+                    .unwrap();
+                    std::fs::write(
+                        output_root.join(format!("batch-{id}.stderr")),
+                        &output.stderr,
+                    )
+                    .unwrap();
+                }
+                response
+            }
+        })
+        .await
+        .unwrap();
+        validate_snapshot(&snapshot).unwrap();
+        let summary = serde_json::json!({"elapsedSeconds":started.elapsed().as_secs_f64(),"snapshot":snapshot});
+        std::fs::write(report, serde_json::to_vec_pretty(&summary).unwrap()).unwrap();
+        assert!(snapshot
+            .roots
+            .iter()
+            .flat_map(|r| &r.entries)
+            .filter(|e| !e.directory())
+            .all(|e| e.sha256.is_some()));
+    }
+
+    #[tokio::test]
+    async fn fresh_terminal_proof_is_separate_and_rechecks_same_token_without_rewriting_history() {
+        let mut group = terminal();
+        group.stages[0].attempts[0].session_id = None;
+        group.stages[0].attempts[0]
+            .remote_lifecycle
+            .as_mut()
+            .unwrap()["agent_exited_confirmed"] = Value::Bool(false);
+        let historical = serde_json::to_value(&group).unwrap();
+        let mut closed = group.stages[0].attempts[0]
+            .remote_lifecycle
+            .clone()
+            .unwrap();
+        closed["agent_exited_confirmed"] = Value::Bool(true);
+        let snapshot = inspect_with(&group, |script| {
+            std::future::ready(Ok(output(if script.starts_with("# me-purge:identity") {
+                identity()
+            } else {
+                closed.to_string()
+            })))
+        })
+        .await
+        .unwrap();
+        validate_snapshot(&snapshot).unwrap();
+        assert_eq!(historical, serde_json::to_value(&group).unwrap());
+        assert_eq!(snapshot.terminal_proofs.len(), 1);
+        let mut corrupt = snapshot.clone();
+        corrupt.terminal_proofs.values_mut().next().unwrap()["token"] =
+            serde_json::json!(Uuid::new_v4());
+        assert!(validate_snapshot(&corrupt).is_err());
+        let mut foreign = closed.clone();
+        foreign["token"] = serde_json::json!(Uuid::new_v4());
+        assert!(
+            remaining_with(&snapshot, |script| std::future::ready(Ok(output(
+                if script.starts_with("# me-purge:identity") {
+                    identity()
+                } else {
+                    foreign.to_string()
+                }
+            ))))
+            .await
+            .is_err()
+        );
+        let mut live = closed;
+        live["agent_exited_confirmed"] = Value::Bool(false);
+        assert!(
+            remaining_with(&snapshot, |script| std::future::ready(Ok(output(
+                if script.starts_with("# me-purge:identity") {
+                    identity()
+                } else {
+                    live.to_string()
+                }
+            ))))
+            .await
+            .is_err()
+        );
+    }
+    #[tokio::test]
+    async fn execution_rechecks_fresh_proof_and_token_or_live_change_prevents_every_unlink() {
+        for changed_token in [true, false] {
+            let mut mock = Mock::new();
+            let closed = mock.group.stages[0].attempts[0]
+                .remote_lifecycle
+                .clone()
+                .unwrap();
+            mock.group.stages[0].attempts[0]
+                .remote_lifecycle
+                .as_mut()
+                .unwrap()["agent_exited_confirmed"] = Value::Bool(false);
+            let group = mock.group.clone();
+            let snapshot = inspect_with(&group, |script| {
+                std::future::ready(if script.starts_with("# me-purge:lifecycle") {
+                    Ok(output(closed.to_string()))
+                } else {
+                    mock.call(script)
+                })
+            })
+            .await
+            .unwrap();
+            let mut changed = closed;
+            if changed_token {
+                changed["token"] = serde_json::json!(Uuid::new_v4());
+            } else {
+                changed["agent_exited_confirmed"] = Value::Bool(false);
+            }
+            let result = execute_with(&snapshot, |script| {
+                std::future::ready(if script.starts_with("# me-purge:lifecycle") {
+                    Ok(output(changed.to_string()))
+                } else {
+                    mock.call(script)
+                })
+            })
+            .await;
+            assert!(result.is_err());
+            assert!(mock.removed.is_empty());
+            assert!(mock
+                .calls
+                .iter()
+                .all(|script| !script.starts_with("# me-purge:remove")));
+        }
+    }
+    #[test]
+    fn retained_no_session_stderr_recovers_only_exact_unambiguous_original_token() {
+        let mut group = terminal();
+        group.stages[0].attempts[0].session_id = None;
+        let relation = group.stages[0].attempts[0].relation.clone();
+        let mut original = group.stages[0].attempts[0].remote_lifecycle.take().unwrap();
+        original["agent_exited_confirmed"] = Value::Bool(false);
+        group.stages[0].attempts[0].error =
+            Some(format!("retained error\n{original}\nError: load BPF"));
+        assert_eq!(original_lifecycle(&group, &relation).unwrap(), original);
+        let before = serde_json::to_value(&group).unwrap();
+        assert!(super::super::purge_local::ensure_purge_candidate(&group).is_ok());
+        assert!(super::super::purge_local::ensure_inactive(&group).is_err());
+        assert_eq!(before, serde_json::to_value(&group).unwrap());
+        let mut foreign = original;
+        foreign["token"] = serde_json::json!(Uuid::new_v4());
+        group.stages[0].attempts[0]
+            .error
+            .as_mut()
+            .unwrap()
+            .push_str(&format!("\n{foreign}"));
+        assert!(original_lifecycle(&group, &relation).is_err());
+    }
     fn terminal() -> Group {
         let mut group = super::super::tests::group();
         let relation = group.start("l0", epoch()).unwrap();

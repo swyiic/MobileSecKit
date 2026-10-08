@@ -43,16 +43,32 @@ pub(super) struct Snapshot {
     pub warnings: Vec<String>,
 }
 
+pub(super) fn read_group_candidate(p: &Path) -> Result<Group, String> {
+    read_group_at(p, false)
+}
 pub(super) fn read_group(p: &Path) -> Result<Group, String> {
+    read_group_at(p, true)
+}
+fn read_group_at(p: &Path, strict: bool) -> Result<Group, String> {
     safe_path(p)?;
     let value: Group = serde_json::from_str(&read_bounded_text(p, 1024 * 1024)?)
         .map_err(|e| format!("主会话清单无效：{e}"))?;
     value.validate()?;
-    ensure_inactive(&value)?;
+    if strict {
+        ensure_inactive(&value)?;
+    } else {
+        ensure_purge_candidate(&value)?;
+    }
     Ok(value)
 }
 
+pub(super) fn ensure_purge_candidate(g: &Group) -> Result<(), String> {
+    ensure_inactive_at(g, false)
+}
 pub(super) fn ensure_inactive(g: &Group) -> Result<(), String> {
+    ensure_inactive_at(g, true)
+}
+fn ensure_inactive_at(g: &Group, strict: bool) -> Result<(), String> {
     if !["planned", "succeeded", "failed", "partial", "cancelled"].contains(&g.state.as_str()) {
         return Err("主会话正在运行或状态未知；未清理".into());
     }
@@ -69,7 +85,27 @@ pub(super) fn ensure_inactive(g: &Group) -> Result<(), String> {
                     .iter()
                     .any(|r| r.id == a.relation.attempt_id.to_string() && r.status == "not_started")
             });
-        if !never_started
+        if !never_started && !strict {
+            let relation = if g.unified && a.relation.stage_key != "dump" {
+                &g.stages[0]
+                    .attempts
+                    .get((a.relation.attempt - 1) as usize)
+                    .ok_or("统一 controller 证据缺失")?
+                    .relation
+            } else {
+                &a.relation
+            };
+            let note = purge_device::original_lifecycle(g, relation)?;
+            validate_remote_lifecycle(&note, relation)?;
+            if note["collection_returned"] != true
+                || note["cleanup"] != "producer_scope_returned"
+                || note["target_pause"] != "forbidden"
+            {
+                return Err("原 producer 返回/清理状态未知，不能重建清理资格".into());
+            }
+        }
+        if strict
+            && !never_started
             && !a
                 .remote_lifecycle
                 .as_ref()
@@ -322,7 +358,26 @@ fn walk(root: &Path, dir: &Path, out: &mut Vec<PathBuf>) -> Result<(), String> {
 }
 
 pub(super) fn inspect(root: &Path, g: &Group, sources: &[String]) -> Result<Snapshot, String> {
-    ensure_inactive(g)?;
+    inspect_at(root, g, sources, true)
+}
+pub(super) fn inspect_candidate(
+    root: &Path,
+    g: &Group,
+    sources: &[String],
+) -> Result<Snapshot, String> {
+    inspect_at(root, g, sources, false)
+}
+fn inspect_at(
+    root: &Path,
+    g: &Group,
+    sources: &[String],
+    strict: bool,
+) -> Result<Snapshot, String> {
+    if strict {
+        ensure_inactive(g)?;
+    } else {
+        ensure_purge_candidate(g)?;
+    }
     if sources.len() > 128 {
         return Err("选中的导入目录过多".into());
     }
@@ -330,7 +385,11 @@ pub(super) fn inspect(root: &Path, g: &Group, sources: &[String]) -> Result<Snap
     let mut known = BTreeSet::new();
     let managed = path(root, g.id);
     if managed.try_exists().map_err(|e| e.to_string())? {
-        let current = read_group(&managed)?;
+        let current = if strict {
+            read_group(&managed)?
+        } else {
+            read_group_candidate(&managed)?
+        };
         if !identity_matches(&current, g) {
             return Err("本地主会话身份冲突".into());
         }
@@ -383,7 +442,11 @@ pub(super) fn inspect(root: &Path, g: &Group, sources: &[String]) -> Result<Snap
             return Err("选中的导入目录相互重叠".into());
         }
         reject_nested_mounts(&source)?;
-        let imported = read_group(&source.join("capture-group.json"))?;
+        let imported = if strict {
+            read_group(&source.join("capture-group.json"))?
+        } else {
+            read_group_candidate(&source.join("capture-group.json"))?
+        };
         if !identity_matches(&imported, g) {
             return Err("导入来源不属于所选父会话/设备".into());
         }
@@ -459,7 +522,11 @@ pub(super) fn inspect(root: &Path, g: &Group, sources: &[String]) -> Result<Snap
         if retained > 0 {
             return Err(format!("来源 {} 含 {retained} 个非支持证据文件（APK 原件、私有数据或未知文件）；保留整个来源，请取消该目录选择后重试", source.display()));
         }
-        let after = read_group(&source.join("capture-group.json"))?;
+        let after = if strict {
+            read_group(&source.join("capture-group.json"))?
+        } else {
+            read_group_candidate(&source.join("capture-group.json"))?
+        };
         if serde_json::to_value(&after).map_err(|e| e.to_string())?
             != serde_json::to_value(&imported).map_err(|e| e.to_string())?
         {

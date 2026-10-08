@@ -4,7 +4,7 @@ import { readFileSync } from 'node:fs'
 import ts from 'typescript'
 const source = readFileSync(new URL('../src/services/kernsightGroupPurge.ts', import.meta.url), 'utf8')
 const code = ts.transpileModule(source, {compilerOptions:{target:ts.ScriptTarget.ES2022,module:ts.ModuleKind.ES2022}}).outputText
-const {canConfirmPurge, createPurgeRequestGate, purgePlanMatches, purgeTargetKey, bundleRemovedByPurge, purgeReportLabel} = await import(`data:text/javascript;base64,${Buffer.from(code).toString('base64')}`)
+const {purgeConfirmationBlockReason, canConfirmPurge, createPurgeRequestGate, purgePlanMatches, purgeTargetKey, bundleRemovedByPurge, purgeReportLabel} = await import(`data:text/javascript;base64,${Buffer.from(code).toString('base64')}`)
 const target = {parentId:'parent-a',serial:'serial-a',package:'org.example.fixture',importedRoots:['/local/one','/local/two']}
 const plan = {schema:'mobilee.group-purge-plan/v1',id:'plan-a',...target,createdUnixMs:1000,expiresUnixMs:301000,confirmationToken:'one-use-random-token',confirmationText:'永久清理 parent-a',localEntries:[],device:{status:'ready',entries:[],warnings:[]},warnings:[],localOnly:false}
 const confirm = (p=plan,t=target,now=2000,busy=false)=>canConfirmPurge(p,t,now,busy)
@@ -90,4 +90,19 @@ test('one paired yes/no confirmation automatically selects all known roots and n
  assert.match(vue,/failedPlanId.value = approvedPlan.id/)
  assert.match(vue,/failedPlanId.value = report.id/)
  assert.match(vue,/const retryPlanId = failedPlanId.value \|\| target.retryPlanId/)
+})
+
+test('every safety denial has a nearby reason without granting confirmation',()=>{
+ const state={active:true,busy:false,preparing:false,executing:false}
+ const why=(p=plan,t=target,time=2000,s=state)=>purgeConfirmationBlockReason(p,t,time,s)
+ assert.equal(why(),'')
+ assert.match(why(null),/尚无/)
+ assert.match(why(plan,target,2000,{...state,active:false}),/未激活/)
+ assert.match(why(plan,target,2000,{...state,busy:true}),/尚未结束/)
+ assert.match(why(plan,target,2000,{...state,preparing:true}),/2 分钟/)
+ assert.match(why(plan,target,2000,{...state,executing:true}),/正在执行/)
+ for(const p of [{...plan,confirmationToken:''},{...plan,parentId:'foreign'},{...plan,expiresUnixMs:NaN},{...plan,createdUnixMs:3000},{...plan,expiresUnixMs:1999},{...plan,device:{status:'offline',warnings:['fixture reason']}}]) {
+  assert.equal(confirm(p),false);assert.ok(why(p).length)
+ }
+ assert.match(why({...plan,device:{status:'blocked',warnings:['device inspect timeout']}}),/device inspect timeout/)
 })

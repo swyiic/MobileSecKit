@@ -247,14 +247,33 @@ fn chosen_group(root: &Path, id: Uuid, sources: &[String]) -> Result<Group, Stri
     let g = if p.try_exists().map_err(|e| e.to_string())? {
         raw_group(&p)?
     } else if let Some(source) = sources.first() {
-        local::read_group(&Path::new(source).join("capture-group.json"))?
+        local::read_group_candidate(&Path::new(source).join("capture-group.json"))?
     } else {
-        return Err("找不到原父会话清单；已有清理请从清理记录重新预览".into());
+        let journals = list_journals(root)?
+            .into_iter()
+            .filter(|j| j.group.id == id)
+            .collect::<Vec<_>>();
+        let first = journals
+            .first()
+            .ok_or("找不到原父会话或经核验清理日志；未按目录猜测范围")?;
+        let encoded = serde_json::to_value(&first.group).map_err(|e| e.to_string())?;
+        if journals
+            .iter()
+            .any(|j| serde_json::to_value(&j.group).ok().as_ref() != Some(&encoded))
+        {
+            return Err("同父会话清理日志身份/配置不一致；未重建范围".into());
+        }
+        if journals.iter().any(|j| j.report.state != "completed") {
+            return Err(
+                "原父清单已移除，未完成清理必须沿原日志的剩余范围重试；不能扩大范围".into(),
+            );
+        }
+        first.group.clone()
     };
     if g.id != id {
         return Err("父会话文件与所选身份冲突".into());
     }
-    local::ensure_inactive(&g)?;
+    local::ensure_purge_candidate(&g)?;
     Ok(g)
 }
 fn check_shared_ownership(root: &Path, g: &Group, sources: &[String]) -> Result<(), String> {
@@ -310,11 +329,16 @@ fn check_shared_ownership(root: &Path, g: &Group, sources: &[String]) -> Result<
     Ok(())
 }
 fn needs_device(g: &Group) -> bool {
-    !g.session_ids().is_empty()
-        || g.stages
-            .iter()
-            .flat_map(|s| &s.attempts)
-            .any(|a| a.remote_artifact_root.is_some())
+    g.stages.iter().flat_map(|s| &s.attempts).any(|a| {
+        a.session_id.is_some()
+            || a.remote_artifact_root.is_some()
+            || !g.budget.as_ref().is_some_and(|budget| {
+                budget
+                    .reservations
+                    .iter()
+                    .any(|r| r.id == a.relation.attempt_id.to_string() && r.status == "not_started")
+            })
+    })
 }
 fn device_preview(snapshot: &purge_device::DeviceSnapshot) -> DevicePreview {
     DevicePreview {
@@ -388,7 +412,11 @@ async fn prepare_at(
         local::safe_path(&root)?;
         ensure_no_other_started(&root, parent_id, None)?;
         let g = chosen_group(&root, parent_id, &imported_roots)?;
-        let local = local::inspect(&root, &g, &imported_roots)?;
+        let local = if local_only {
+            local::inspect(&root, &g, &imported_roots)?
+        } else {
+            local::inspect_candidate(&root, &g, &imported_roots)?
+        };
         check_shared_ownership(&root, &g, &local.imported_roots)?;
         (g, local)
     };
@@ -516,7 +544,11 @@ pub async fn prepare_kernsight_group_purge_retry(
     if !j.started || j.report.state == "completed" {
         return Err("此清理记录无需重试".into());
     }
-    local::ensure_inactive(&j.group)?;
+    if local_only {
+        local::ensure_inactive(&j.group)?;
+    } else {
+        local::ensure_purge_candidate(&j.group)?;
+    }
     local::verify(&j.local)?;
     if local_only && j.report.device_state != "completed" && j.report.device_state != "not_required"
     {
@@ -585,7 +617,17 @@ async fn execute_at(root: PathBuf, id: Uuid, confirmation: &str) -> Result<Repor
             return Err("手机未连接或归属/终态未确认；未执行配对清理".into());
         }
         ensure_no_other_started(&root, j.group.id, Some(id))?;
-        local::ensure_inactive(&j.group)?;
+        if j.plan.local_only {
+            local::ensure_inactive(&j.group)?;
+        } else {
+            local::ensure_purge_candidate(&j.group)?;
+            if needs_device(&j.group)
+                && j.report.device_state != "completed"
+                && j.report.device_state != "not_required"
+            {
+                purge_device::validate_snapshot(j.device.as_ref().ok_or("缺独立已封存手机证明")?)?;
+            }
+        }
         local::verify(&j.local)?;
         check_shared_ownership(&root, &j.group, &j.local.imported_roots)?;
         j.started = true;
@@ -831,6 +873,104 @@ mod tests {
                 .unwrap_err()
                 .contains("旧版直接删除已停用")
         );
+    }
+    #[test]
+    fn failed_before_session_still_needs_device_terminal_verification() {
+        let f = Fixture::new();
+        let mut group = terminal(&f);
+        group.stages[0].attempts[0].session_id = None;
+        assert!(needs_device(&group));
+        group.budget = Some(
+            session_budget::Contract::new(session_budget::Limits::default(), now_millis()).unwrap(),
+        );
+        group
+            .budget
+            .as_mut()
+            .unwrap()
+            .reservations
+            .push(session_budget::Reservation {
+                id: group.stages[0].attempts[0].relation.attempt_id.to_string(),
+                kind: "l0".into(),
+                reserved_bytes: 0,
+                charged_bytes: Some(0),
+                status: "not_started".into(),
+            });
+        assert!(!needs_device(&group));
+    }
+    #[tokio::test]
+    async fn missing_parent_after_completed_scope_is_idempotent_from_exact_journal() {
+        let f = Fixture::new();
+        let group = f.group();
+        let first = prepare_at(f.0.clone(), group.id, vec![], true)
+            .await
+            .unwrap();
+        execute_at(f.0.clone(), first.id, &first.confirmation_token)
+            .await
+            .unwrap();
+        assert!(!path(&f.0, group.id).exists());
+        let again = prepare_at(f.0.clone(), group.id, vec![], false)
+            .await
+            .unwrap();
+        assert!(again.local_entries.is_empty());
+        assert_eq!(again.device.status, "not_required");
+        assert_ne!(again.confirmation_token, first.confirmation_token);
+    }
+    #[tokio::test]
+    #[ignore = "explicit read-only phone preparation in a shadow metadata root; never execute"]
+    async fn physical_readonly_shadow_prepare_uses_fresh_terminal_proof() {
+        use sha2::{Digest, Sha256};
+        let original =
+            PathBuf::from(std::env::var("ME_PURGE_ORIGINAL_ROOT").expect("original root"));
+        let shadow = PathBuf::from(std::env::var("ME_PURGE_SHADOW_ROOT").expect("new shadow root"));
+        let parent =
+            Uuid::parse_str(&std::env::var("ME_PURGE_PARENT_ID").expect("parent")).unwrap();
+        let output = PathBuf::from(std::env::var("ME_PURGE_PLAN_REPORT").expect("report"));
+        assert!(!shadow.exists());
+        assert!(!shadow.starts_with(&original) && !original.starts_with(&shadow));
+        fs::create_dir_all(&shadow).unwrap();
+        let mut originals = BTreeMap::new();
+        // Copy every existing ownership reference. Journal path strings are
+        // adapted only in the shadow so their managed-file scope remains exact.
+        for directory in ["", "trash", "purges"] {
+            let source = original.join(directory);
+            if !source.exists() {
+                continue;
+            }
+            let dest = shadow.join(directory);
+            fs::create_dir_all(&dest).unwrap();
+            for entry in fs::read_dir(source).unwrap() {
+                let path = entry.unwrap().path();
+                if path.extension().and_then(|v| v.to_str()) != Some("json") {
+                    continue;
+                }
+                assert!(fs::symlink_metadata(&path).unwrap().is_file());
+                let bytes = fs::read(&path).unwrap();
+                originals.insert(path.clone(), format!("{:x}", Sha256::digest(&bytes)));
+                let copy = if directory == "purges" {
+                    String::from_utf8(bytes)
+                        .unwrap()
+                        .replace(original.to_str().unwrap(), shadow.to_str().unwrap())
+                        .into_bytes()
+                } else {
+                    bytes
+                };
+                fs::write(dest.join(path.file_name().unwrap()), copy).unwrap();
+            }
+        }
+        let started = std::time::Instant::now();
+        let plan = prepare_at(shadow.clone(), parent, vec![], false)
+            .await
+            .unwrap();
+        assert_eq!(plan.device.status, "ready");
+        let journal = read_journal(&shadow, plan.id).unwrap();
+        purge_device::validate_snapshot(journal.device.as_ref().unwrap()).unwrap();
+        for (path, before) in &originals {
+            assert_eq!(
+                *before,
+                format!("{:x}", Sha256::digest(fs::read(path).unwrap()))
+            );
+        }
+        fs::write(output,serde_json::to_vec_pretty(&serde_json::json!({"elapsedSeconds":started.elapsed().as_secs_f64(),"originalMetadataFilesUnchanged":originals.len(),"shadowRoot":shadow,"plan":plan,"deviceSnapshot":journal.device,"executed":false})).unwrap()).unwrap();
     }
     fn terminal(f: &Fixture) -> Group {
         let mut g = f.group();

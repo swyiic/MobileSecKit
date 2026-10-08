@@ -1,0 +1,7 @@
+<!doctype html><html><head><title>Purge confirmation mocked fixture</title></head><body><div id="app"></div><script type="module">
+import { createApp, reactive, h } from 'vue'
+import Purge from '../../src/components/KernSightGroupPurge.vue'
+const state = reactive({ active: true, busy: false, target: { parentId: 'fixture-parent', serial: 'fixture-serial', package: 'fixture.package', importedRoots: [] }, completed: [], closed: 0 })
+window.__purgeState = state
+createApp({ render: () => h(Purge, { target: state.target, active: state.active, busy: state.busy, onComplete: (report) => state.completed.push(report), onClose: () => state.closed++ }) }).mount('#app')
+</script></body></html>

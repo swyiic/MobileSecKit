@@ -3,9 +3,9 @@
     <header><div><h3 id="ks-purge-title">{{ target.retryPlanId ? '重新预览未完成的永久清理' : '永久清理主会话' }}</h3><p id="ks-purge-warning">删除后无法恢复，不进入回收站。系统自动核验会话归属、活跃依赖与手机配对。</p></div></header>
     <dl class="ks-purge-identity"><dt>父会话 ID</dt><dd>{{ target.parentId }}</dd><dt>设备序列号</dt><dd>{{ target.serial }}</dd><dt>目标包</dt><dd>{{ target.package }}</dd></dl>
     <p class="ks-purge-warning">是否永久删除此主会话在本机和配对手机上的所属证据？删除无法恢复，不进入回收站。系统自动核对范围；共享文件与其他会话不纳入删除。</p>
-    <div class="ks-purge-confirm"><button class="ghost-button danger-button" :disabled="!canExecute" @click="execute">{{ executing ? '正在清理并核验…' : '是，永久删除本地与手机' }}</button><button class="ghost-button" :disabled="executing" @click="close">否</button></div>
-    <p v-if="preparing" role="status">正在自动核对会话归属、活动任务及手机路径…</p>
-    <button v-if="!preparing && !executing && (!plan || expired || !deviceReady)" class="ghost-button" :disabled="busy" @click="prepare">重新核对并重试</button>
+    <div class="ks-purge-confirm"><button class="ghost-button danger-button" :disabled="!canExecute" :title="blockedReason || '确认永久删除该会话本地与手机所属证据'" aria-describedby="ks-purge-block-reason" @click="execute">{{ executing ? '正在清理并核验…' : preparing ? '正在核对，完成后可确认' : '是，永久删除本地与手机' }}</button><button class="ghost-button" :disabled="executing" @click="close">否</button></div>
+    <p v-if="blockedReason" id="ks-purge-block-reason" class="ks-purge-error" role="status" data-testid="purge-block-reason">{{ blockedReason }}</p>
+    <button class="ghost-button" :disabled="preparing || executing || busy || !active" @click="prepare">{{ preparing ? '正在核对…' : '重新核对并重试' }}</button>
     <div v-if="error" class="ks-purge-error" role="alert"><p>{{ error }}</p><details><summary>可复制错误详情</summary><textarea readonly :value="error" aria-label="清理错误详情" /></details></div>
     <div v-if="plan" class="ks-purge-preview" data-testid="purge-preview">
       <p>预览时间 {{ formatTime(plan.createdUnixMs) }} · 失效时间 {{ formatTime(plan.expiresUnixMs) }}（5 分钟内有效）</p>
@@ -26,7 +26,7 @@
 <script setup lang="ts">
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, shallowRef, watch } from 'vue'
 import { monitoringBackend, readableError } from '@/services/backend'
-import { canConfirmPurge, createPurgeRequestGate, purgePlanMatches, purgeTargetKey, type PurgeTarget } from '@/services/kernsightGroupPurge'
+import { canConfirmPurge, createPurgeRequestGate, purgePlanMatches, purgeTargetKey, purgeConfirmationBlockReason, type PurgeTarget } from '@/services/kernsightGroupPurge'
 import type { KernSightGroupPurgeEntry, KernSightGroupPurgePlan, KernSightGroupPurgeReport } from '@/types/monitoring'
 const props = defineProps<{ target: PurgeTarget; busy: boolean; active: boolean }>()
 const emit = defineEmits<{ close: []; uncertain: []; executing: [value: boolean]; complete: [report: KernSightGroupPurgeReport, plan: KernSightGroupPurgePlan] }>()
@@ -42,6 +42,7 @@ const gate = createPurgeRequestGate()
 const clock = setInterval(() => { now.value = Date.now() }, 250)
 const expired = computed(() => Boolean(plan.value && now.value >= plan.value.expiresUnixMs))
 const deviceReady = computed(() => ['ready', 'not_required'].includes(plan.value?.device?.status || ''))
+const blockedReason = computed(() => purgeConfirmationBlockReason(plan.value, props.target, now.value, { active: props.active, busy: props.busy, preparing: preparing.value, executing: executing.value }))
 const canExecute = computed(() => props.active && canConfirmPurge(plan.value, props.target, now.value, props.busy || preparing.value || executing.value))
 const warnings = computed(() => [...new Set([...(plan.value?.warnings || []), ...(plan.value?.device?.warnings || [])])])
 const deviceLabel = computed(() => ({ ready: '范围已核验', offline: '离线 / 不可达', blocked: '范围核验被阻止', not_required: '无待清理路径' })[plan.value?.device?.status || 'offline'])
@@ -60,8 +61,17 @@ watch(() => purgeTargetKey(props.target), () => {
   failedPlanId.value = ''
   void nextTick(prepare)
 }, { immediate: true, flush: 'sync' })
-watch(() => props.busy, busy => { if (busy && !executing.value) close() }, { flush: 'sync' })
-watch(() => props.active, active => { if (!active && !executing.value) close() }, { flush: 'sync' })
+watch(() => [props.active, props.busy] as const, ([active, busy]) => {
+  if (executing.value) return
+  if (!active || busy) {
+    // Invalidate an in-flight preview without silently dismissing its confirmation.
+    gate.invalidate()
+    plan.value = null
+    preparing.value = false
+  } else if (!plan.value) {
+    void nextTick(prepare)
+  }
+}, { flush: 'sync' })
 
 async function prepare() {
   if (!props.active || props.busy || preparing.value || executing.value) return
