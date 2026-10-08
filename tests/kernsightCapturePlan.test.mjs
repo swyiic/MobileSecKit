@@ -212,3 +212,19 @@ test('insufficient time never silently shortens persisted windows', () => {
   for (const total of [NaN,Infinity,29,3601,300.1]) assert.throws(()=>captureTimeAllocation({l0:5,l1:30,linker:10},total,true))
   for (const l0 of [0,301,1.5,NaN]) assert.throws(()=>captureTimeAllocation({l0,l1:30,linker:10},300,true))
 })
+
+
+test('new600s closeout profile retains90s observation with bounded archive and import', () => {
+  for (const [separate, transfer] of [[true,145],[false,165]]) {
+    const plan = captureTimeAllocation({l0:15,l1:90,linker:15},600,separate)
+    assert.equal(plan.valid,true)
+    assert.equal(plan.longPlan,true)
+    assert.equal(plan.transferSeconds,transfer)
+    assert.equal(plan.finalSeconds,245)
+    assert.equal(plan.archiveSeconds,120)
+    assert.equal(plan.importSeconds,120)
+    assert.equal(plan.dumpSeconds,55)
+  }
+  assert.equal(captureTimeAllocation({l0:15,l1:90,linker:15},300,true).valid,false)
+  assert.equal(captureTimeAllocation({l0:15,l1:90,linker:15},599,true).finalSeconds,140)
+})

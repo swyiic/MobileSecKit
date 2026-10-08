@@ -176,15 +176,36 @@ fn write_scoped(root: &Path, output: &Path, offline_retained: bool) -> Result<()
     if temporary.exists() {
         return Err("归档临时输出已存在，保留旧证据，请用新输出路径".into());
     }
+    // Select Stored for partial evidence only when the full unique content and
+    // conservative ZIP write overhead fit a known remaining quota. Coverage and
+    // per-write enforcement remain independent of this representation choice.
+    let remaining = _guard.as_ref().map(|guard| {
+        let receipt = guard.receipt();
+        receipt
+            .limit_bytes
+            .saturating_sub(receipt.admitted_write_bytes)
+    });
+    let object_bytes = objects
+        .values()
+        .try_fold(0u64, |sum, (_, n)| sum.checked_add(*n));
+    let names = std::iter::once("manifest.json".len() as u64).chain(
+        objects
+            .keys()
+            .map(|hash| ("objects/".len() + hash.len() + ".bin".len()) as u64),
+    );
+    let stored_bound = object_bytes.and_then(|n| stored_write_bound(n, bytes.len() as u64, names));
+    let stored_fits = remaining
+        .zip(stored_bound)
+        .is_some_and(|(quota, bound)| bound <= quota);
     let result = (|| {
         let mut writer = ZipWriter::new(
             session_budget::BudgetFile::create(&temporary).map_err(|e| e.to_string())?,
         );
         let options = SimpleFileOptions::default()
-            .compression_method(if partial {
-                zip::CompressionMethod::Deflated
-            } else {
+            .compression_method(if !partial || stored_fits {
                 zip::CompressionMethod::Stored
+            } else {
+                zip::CompressionMethod::Deflated
             })
             .unix_permissions(0o600);
         writer
@@ -999,5 +1020,187 @@ mod cache_budget_tests {
         std::fs::remove_dir_all(first.parent().unwrap()).unwrap();
         std::fs::remove_dir_all(source).unwrap();
         std::fs::remove_file(output).unwrap();
+    }
+}
+
+// SimpleFileOptions below has no comments/custom extras. Include local/central
+// headers, both filename copies, ZIP64/trailer and seek-back header rewrites.
+// This is a charged-write bound; the BudgetFile still enforces actual writes.
+fn stored_write_bound(
+    object_bytes: u64,
+    manifest_bytes: u64,
+    names: impl Iterator<Item = u64>,
+) -> Option<u64> {
+    let mut bound = object_bytes
+        .checked_add(manifest_bytes)?
+        .checked_add(128 * 1024)?;
+    for name_bytes in names {
+        bound = bound.checked_add(1024u64.checked_add(name_bytes.checked_mul(2)?)?)?;
+    }
+    Some(bound)
+}
+
+#[cfg(test)]
+mod adaptive_stored_tests {
+    use super::*;
+    #[test]
+    fn charged_bound_and_overflow_fail_closed() {
+        assert_eq!(
+            stored_write_bound(100, 20, [13, 76].into_iter()),
+            Some(100 + 20 + 131072 + 2 * 1024 + 2 * (13 + 76))
+        );
+        assert!(stored_write_bound(u64::MAX, 1, [13].into_iter()).is_none());
+        assert!(stored_write_bound(1, 1, [u64::MAX].into_iter()).is_none());
+    }
+    #[test]
+    fn unique_objects_fit_and_small_or_unknown_quota_deflates_without_upgrading_coverage() {
+        for (cap, method) in [
+            (Some(2 * 1024 * 1024), zip::CompressionMethod::Stored),
+            (Some(256 * 1024), zip::CompressionMethod::Deflated),
+            (None, zip::CompressionMethod::Deflated),
+        ] {
+            let base = std::env::temp_dir().join(format!("me-adaptive-stored-{}", Uuid::new_v4()));
+            let root = base.join("input");
+            std::fs::create_dir_all(&root).unwrap();
+            std::fs::write(root.join("dump-report.json"),br#"{"package":"org.example.fixture","collection_status":"partial","artifacts":[]}"#).unwrap();
+            let payload = vec![0u8; 1024 * 1024];
+            std::fs::write(root.join("payload.code"), &payload).unwrap();
+            std::fs::write(root.join("alias.code"), &payload).unwrap();
+            if let Some(cap) = cap {
+                std::fs::write(
+                    root.join("archive-output-limits.json"),
+                    serde_json::to_vec(
+                        &json!({"archive_bytes":cap,"import_bytes":1048576,"max_ms":10000}),
+                    )
+                    .unwrap(),
+                )
+                .unwrap();
+            }
+            let output = base.join("fixture.mee");
+            write(&root, &output).unwrap();
+            let mut zip = ZipArchive::new(File::open(&output).unwrap()).unwrap();
+            for index in 0..zip.len() {
+                assert_eq!(zip.by_index(index).unwrap().compression(), method);
+            }
+            let mut text = String::new();
+            zip.by_name("manifest.json")
+                .unwrap()
+                .read_to_string(&mut text)
+                .unwrap();
+            let manifest: Value = serde_json::from_str(&text).unwrap();
+            assert_eq!(manifest["coverage"]["status"], "partial");
+            assert_eq!(manifest["coverage"]["complete_collection"], false);
+            let refs = manifest["references"].as_array().unwrap();
+            let payload_refs: Vec<_> = refs
+                .iter()
+                .filter(|r| r["path"] == "payload.code" || r["path"] == "alias.code")
+                .collect();
+            assert_eq!(payload_refs.len(), 2);
+            assert_eq!(payload_refs[0]["sha256"], payload_refs[1]["sha256"]);
+            for row in refs {
+                let name = format!("objects/{}.bin", row["sha256"].as_str().unwrap());
+                let mut content = Vec::new();
+                zip.by_name(&name)
+                    .unwrap()
+                    .read_to_end(&mut content)
+                    .unwrap();
+                assert_eq!(content.len() as u64, row["bytes"].as_u64().unwrap());
+                assert_eq!(
+                    format!("{:x}", Sha256::digest(&content)),
+                    row["sha256"].as_str().unwrap()
+                );
+            }
+            if let Some(cap) = cap {
+                let receipt: Value = serde_json::from_str(
+                    &std::fs::read_to_string(format!("{}.budget.json", output.display())).unwrap(),
+                )
+                .unwrap();
+                assert_eq!(receipt["partial"], false);
+                let unique = refs
+                    .iter()
+                    .map(|row| {
+                        (
+                            row["sha256"].as_str().unwrap(),
+                            row["bytes"].as_u64().unwrap(),
+                        )
+                    })
+                    .collect::<BTreeMap<_, _>>();
+                let bound = stored_write_bound(
+                    unique.values().sum(),
+                    text.len() as u64,
+                    std::iter::once("manifest.json".len() as u64).chain(
+                        unique
+                            .keys()
+                            .map(|hash| ("objects/".len() + hash.len() + ".bin".len()) as u64),
+                    ),
+                )
+                .unwrap();
+                assert_eq!(
+                    bound <= cap - 65536,
+                    method == zip::CompressionMethod::Stored
+                );
+                if method == zip::CompressionMethod::Stored {
+                    assert!(receipt["admitted_write_bytes"].as_u64().unwrap() <= bound);
+                }
+                assert!(receipt["admitted_write_bytes"].as_u64().unwrap() <= cap - 65536);
+            }
+            assert_eq!(std::fs::read(root.join("payload.code")).unwrap(), payload);
+            drop(zip);
+            std::fs::remove_dir_all(base).unwrap();
+        }
+    }
+}
+
+#[cfg(test)]
+mod retained_closeout_acceptance {
+    use super::*;
+    #[tokio::test]
+    #[ignore = "requires explicit independent cloned retained inputs and fresh output; never accesses device or renews old parent"]
+    async fn bounded_real_retained_archive_share_and_production_import() {
+        let root = PathBuf::from(
+            std::env::var("ME_RETAINED_CLOSEOUT_ROOT").expect("explicit isolated clone"),
+        );
+        let out =
+            PathBuf::from(std::env::var("ME_RETAINED_CLOSEOUT_OUTPUT").expect("fresh output"));
+        assert!(root.is_absolute() && out.is_absolute() && !out.exists());
+        std::fs::create_dir_all(&out).unwrap();
+        let source_group = std::fs::read(root.join("capture-group.json")).unwrap();
+        let started = std::time::Instant::now();
+        let archive = out.join("retained.mee");
+        let share_guard =
+            session_budget::Guard::install(vec![root.clone()], 65536, 120000).unwrap();
+        write(&root, &archive).unwrap();
+        share_fresh_pull(&root, &archive).unwrap();
+        session_budget::charge(&root.join("capture-group.json"), 0).unwrap();
+        let archive_elapsed_ms = started.elapsed().as_millis();
+        let share_receipt = share_guard.receipt();
+        drop(share_guard);
+        let import_start = std::time::Instant::now();
+        let import_guard =
+            session_budget::Guard::install(vec![root.clone()], 768 * 1024 * 1024, 120000).unwrap();
+        let bundle = import_kernsight_evidence_directory(root.to_string_lossy().into_owned())
+            .await
+            .unwrap();
+        session_budget::charge(&root.join("capture-group.json"), 0).unwrap();
+        assert_eq!(
+            std::fs::read(root.join("capture-group.json")).unwrap(),
+            source_group
+        );
+        let import_elapsed_ms = import_start.elapsed().as_millis();
+        let receipt = import_guard.receipt();
+        drop(import_guard);
+        let archive_receipt: Value = serde_json::from_slice(
+            &std::fs::read(format!("{}.budget.json", archive.display())).unwrap(),
+        )
+        .unwrap();
+        let report = json!({"scope":"independent offline cloned retained inputs; not old-parent resume or physical capture", "archive_share_ms":archive_elapsed_ms,"archive_receipt":archive_receipt,"share_receipt":share_receipt,"import_ms":import_elapsed_ms,"import_receipt":receipt,"package":bundle.package,"original_parent_bytes_unchanged":true,"device_operations":false,"ack_sent":false});
+        std::fs::write(
+            out.join("verification.json"),
+            serde_json::to_vec_pretty(&report).unwrap(),
+        )
+        .unwrap();
+        assert!(archive_elapsed_ms < 120000 && import_elapsed_ms < 120000);
+        assert_ne!(archive_receipt["partial"], true);
+        assert!(!receipt.partial);
     }
 }

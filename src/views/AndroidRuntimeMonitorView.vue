@@ -110,6 +110,7 @@
         <label v-if="captureForm.plan === 'auto'"><span>L0+L1 观察窗（秒）</span><input v-model.number="captureForm.autoL1Seconds" :disabled="captureRunning" type="number" min="1" max="300" /></label>
         <label v-if="captureForm.plan === 'auto'"><span>Linker（秒）</span><input v-model.number="captureForm.autoLinkerSeconds" :disabled="captureRunning" type="number" min="1" max="300" /></label>
         <p v-if="captureForm.plan === 'auto'" class="ks-form-help wide">默认观察 120 秒，另计启动与快照耗时。L1 阶段请操作目标 App；阶段执行结束不代表动态代码覆盖完整。</p>
+        <p v-if="captureForm.plan === 'auto'" class="ks-form-help wide" role="status">写入预算 {{ captureForm.totalBudgetMiB }} MiB · 总期限 {{ captureForm.maxSessionSeconds }} 秒。{{ autoTimeAllocation?.valid ? '通过时间准入；预算是有限预留，不保证完整覆盖。' : '时间不足或无效，禁止启动；请在高级设置调整新任务期限，90秒观察建议600秒。' }}<span v-if="autoTimeAllocation && !autoTimeAllocation.longPlan"> 当前短期限的最终处理预留较少，建议600秒保留收尾时间。</span></p>
       </div>
       <div class="ks-sensor-switches">
         <label><input v-model="captureForm.files" :disabled="captureRunning" type="checkbox" />File open</label>
@@ -123,9 +124,9 @@
         <label v-if="captureForm.plan === 'auto'"><span>累计输出写入预算（MiB）</span><input v-model.number="captureForm.totalBudgetMiB" type="number" min="4" max="16384" :disabled="captureRunning" /></label>
         <label v-if="captureForm.plan === 'auto'"><span>总期限（秒）</span><input v-model.number="captureForm.maxSessionSeconds" type="number" min="30" max="3600" :disabled="captureRunning" /></label>
         <div v-if="captureForm.plan === 'auto'" class="wide ks-time-allocation" role="status">
-          <template v-if="autoTimeAllocation"><strong>时间分配：{{ autoTimeAllocation.producer.map(phase => `${phase.key} ${phase.seconds}s`).join(' · ') }} · Dump 55s · 传输 {{ Math.max(0, autoTimeAllocation.transferSeconds) }}s · 最终 140s</strong><small>最终预留：归档 60s、导入 75s、终态 5s。每个采集启动预留 10s；传输至少 30s。{{ autoTimeAllocation.valid ? '满足时间准入；不保证所有阶段完成。' : `总期限不足，至少需要 ${autoTimeAllocation.minimumSeconds}s；未启动，请调整新父窗口或期限。` }}</small></template>
+          <template v-if="autoTimeAllocation"><strong>时间分配：{{ autoTimeAllocation.producer.map(phase => `${phase.key} ${phase.seconds}s`).join(' · ') }} · Dump 55s · 传输 {{ Math.max(0, autoTimeAllocation.transferSeconds) }}s · 最终 {{ autoTimeAllocation.finalSeconds }}s</strong><small>最终预留：归档 {{ autoTimeAllocation.archiveSeconds }}s、导入 {{ autoTimeAllocation.importSeconds }}s、终态 5s。L0/Linker 启动预留10s，L1/统一会话预留{{ autoTimeAllocation.longPlan ? 15 : 10 }}s；传输至少30s。{{ autoTimeAllocation.valid ? '满足时间准入；不保证所有阶段完成。' : `总期限不足，至少需要 ${autoTimeAllocation.minimumSeconds}s；未启动，请调整新父窗口或期限。` }}</small></template>
           <small v-else>观察窗必须为 1–300 秒整数，总期限必须为 30–3600 秒整数；未启动。</small>
-          <small>默认观察窗为 5 / 30 / 10 秒；有效已保存窗口保留。缩短窗口会缩小覆盖，缺失保持未知。传输额度耗尽时保留 partial；时间准入不保证全部阶段完成。</small>
+          <small>新任务默认4GiB、600秒，观察窗15 / 90 / 15秒；有效已保存窗口保留。缩短窗口会缩小覆盖，缺失保持未知。传输额度耗尽时保留 partial；时间准入不保证全部阶段完成。</small>
         </div>
         <label v-if="captureForm.plan === 'auto'" class="wide"><span>隔离候选运行根（留空使用旧默认路径）</span><input v-model="captureForm.isolatedRoot" :disabled="captureRunning" placeholder="/data/local/tmp/ksight-candidate-本轮ID" /><small>目录、agent、BPF、资产与证据均需处于此根；不安装或替换默认工具。</small></label>
         <label v-if="captureForm.plan === 'auto' && captureForm.isolatedRoot.trim()" class="wide"><span>隔离agent绝对路径（留空为运行根/ksightd）</span><input v-model="captureForm.isolatedAgent" :disabled="captureRunning" /><span>候选完整SHA256（必填）</span><input v-model="captureForm.isolatedSha256" :disabled="captureRunning" /></label>
@@ -642,13 +643,13 @@ const captureForm = reactive({
   plan: 'auto' as 'capture' | 'dump' | 'auto',
   codeOnly:false,
   isolatedRoot:"",isolatedAgent:"",isolatedSha256:"",
-  totalBudgetMiB:2048,
-  maxSessionSeconds:300,
+  totalBudgetMiB:4096,
+  maxSessionSeconds:600,
   collectKeys:false,collectPrivate:false,collectMemoryWindows:false,
   autoSessionMode: 'startup_replay' as 'startup_replay' | 'unified',
-  autoL0Seconds: 5,
-  autoL1Seconds: 30,
-  autoLinkerSeconds: 10,
+  autoL0Seconds: 15,
+  autoL1Seconds: 90,
+  autoLinkerSeconds: 15,
 })
 const capturePhase = ref('')
 const unifiedSessionAwaiting = ref(false)
@@ -666,9 +667,9 @@ function loadAutoDurations() {
     const raw = localStorage.getItem(AUTO_DURATION_KEY)
     if (!raw) return
     const parsed = JSON.parse(raw) as Record<string, unknown>
-    captureForm.autoL0Seconds = clampCaptureSeconds(parsed.autoL0Seconds, 5)
-    captureForm.autoL1Seconds = clampCaptureSeconds(parsed.autoL1Seconds, 30)
-    captureForm.autoLinkerSeconds = clampCaptureSeconds(parsed.autoLinkerSeconds, 10)
+    captureForm.autoL0Seconds = clampCaptureSeconds(parsed.autoL0Seconds, 15)
+    captureForm.autoL1Seconds = clampCaptureSeconds(parsed.autoL1Seconds, 90)
+    captureForm.autoLinkerSeconds = clampCaptureSeconds(parsed.autoLinkerSeconds, 15)
   } catch { /* keep defaults */ }
 }
 loadAutoDurations()
@@ -676,9 +677,9 @@ watch(
   () => [captureForm.autoL0Seconds, captureForm.autoL1Seconds, captureForm.autoLinkerSeconds],
   ([l0, l1, linker]) => {
     const next = {
-      autoL0Seconds: clampCaptureSeconds(l0, 5),
-      autoL1Seconds: clampCaptureSeconds(l1, 30),
-      autoLinkerSeconds: clampCaptureSeconds(linker, 10),
+      autoL0Seconds: clampCaptureSeconds(l0, 15),
+      autoL1Seconds: clampCaptureSeconds(l1, 90),
+      autoLinkerSeconds: clampCaptureSeconds(linker, 15),
     }
     if (captureForm.autoL0Seconds !== next.autoL0Seconds) captureForm.autoL0Seconds = next.autoL0Seconds
     if (captureForm.autoL1Seconds !== next.autoL1Seconds) captureForm.autoL1Seconds = next.autoL1Seconds

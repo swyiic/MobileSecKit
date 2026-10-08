@@ -163,12 +163,17 @@ export function captureGroupIPC(request: Pick<KernSightCaptureRequest, 'runtimeP
 export function captureTimeAllocation(durations: { l0: number; l1: number; linker: number }, totalSeconds: number, separate: boolean) {
   buildAutoCaptureStages(durations.l0, durations.l1, durations.linker)
   if (!Number.isInteger(totalSeconds) || totalSeconds < 30 || totalSeconds > 3600) throw new Error('总期限必须是 30–3600 秒的整数')
+  const longPlan = totalSeconds >= 600
+  const l1Padding = longPlan ? 15 : 10
+  const archiveSeconds = longPlan ? 120 : 60
+  const importSeconds = longPlan ? 120 : 75
+  const finalSeconds = archiveSeconds + importSeconds + 5
   const producer = separate
-    ? [{ key: 'L0', seconds: durations.l0 + 10 }, { key: 'L1', seconds: durations.l1 + 10 }, { key: 'Linker', seconds: durations.linker + 10 }]
-    : [{ key: '统一 session', seconds: durations.l0 + durations.l1 + durations.linker + 10 }]
-  const heldSeconds = producer.reduce((sum, phase) => sum + phase.seconds, 0) + 55 + 140
+    ? [{ key: 'L0', seconds: durations.l0 + 10 }, { key: 'L1', seconds: durations.l1 + l1Padding }, { key: 'Linker', seconds: durations.linker + 10 }]
+    : [{ key: '统一 session', seconds: durations.l0 + durations.l1 + durations.linker + l1Padding }]
+  const heldSeconds = producer.reduce((sum, phase) => sum + phase.seconds, 0) + 55 + finalSeconds
   const transferSeconds = totalSeconds - heldSeconds
   const minimumSeconds = heldSeconds + 30
-  return { producer, dumpSeconds: 55, archiveSeconds: 60, importSeconds: 75, terminalSeconds: 5,
-    finalSeconds: 140, transferSeconds, minimumSeconds, valid: transferSeconds >= 30 }
+  return { producer, dumpSeconds: 55, archiveSeconds, importSeconds, terminalSeconds: 5,
+    finalSeconds, transferSeconds, minimumSeconds, longPlan, valid: transferSeconds >= 30 }
 }

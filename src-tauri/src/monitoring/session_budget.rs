@@ -76,6 +76,24 @@ impl Guard {
         );
         Ok(Self(id))
     }
+    /// Acceptance checkpoint writes keep their existing counter; a later phase
+    /// may only shorten this guard's original deadline, never renew it.
+    #[cfg(test)]
+    pub(super) fn constrain_time(&self, max_ms: u64) -> io::Result<()> {
+        if max_ms == 0 || max_ms > 3600000 {
+            return Err(io::Error::other("invalid phase time cap"));
+        }
+        let remaining = super::session_deadline::remaining_ms(max_ms).map_err(io::Error::other)?;
+        let bound = Instant::now() + Duration::from_millis(remaining);
+        let mut all = states()
+            .lock()
+            .map_err(|_| io::Error::other("budget lock"))?;
+        let state = all
+            .get_mut(&self.0)
+            .ok_or_else(|| io::Error::other("missing budget guard"))?;
+        state.deadline = state.deadline.min(bound);
+        Ok(())
+    }
     pub fn receipt(&self) -> Receipt {
         states()
             .lock()
@@ -1306,7 +1324,12 @@ mod planned_allocation_tests {
 
 impl TimePlan {
     fn validate(&self, total_ms: u64) -> Result<(), String> {
-        if self.schema != "mobilee.session-time-plan/v1" || self.final_reserve_ms != 140000 {
+        let (archive_ms, import_ms, final_ms) = match self.schema.as_str() {
+            "mobilee.session-time-plan/v1" => (60000, 75000, 140000),
+            "mobilee.session-time-plan/v2" if total_ms >= 600000 => (120000, 120000, 245000),
+            _ => return Err("时间计划schema/总期限无效".into()),
+        };
+        if self.final_reserve_ms != final_ms {
             return Err("时间计划schema/终态预留无效".into());
         }
         let mut names = std::collections::BTreeSet::new();
@@ -1320,7 +1343,11 @@ impl TimePlan {
             }
             sum = sum.checked_add(p.cap_ms).ok_or("时间总数溢出")?;
         }
-        for (kind, cap) in [("archive", 60000), ("import", 75000), ("terminal", 5000)] {
+        for (kind, cap) in [
+            ("archive", archive_ms),
+            ("import", import_ms),
+            ("terminal", 5000),
+        ] {
             if !self
                 .phases
                 .iter()
@@ -1360,28 +1387,45 @@ impl Contract {
             return Err("无效显式采集时间计划".into());
         }
         let total = limits.max_seconds.checked_mul(1000).ok_or("时间额度溢出")?;
+        let long_plan = limits.max_seconds >= 600;
+        let l1_padding = if long_plan { 15 } else { 10 };
+        let (archive_ms, import_ms, final_ms) = if long_plan {
+            (120000, 120000, 245000)
+        } else {
+            (60000, 75000, 140000)
+        };
         let mut caps = if separate {
             vec![
                 ("l0", (durations[0] + 10) * 1000),
-                ("l1", (durations[1] + 10) * 1000),
+                ("l1", (durations[1] + l1_padding) * 1000),
                 ("linker", (durations[2] + 10) * 1000),
             ]
         } else {
-            vec![("unified", (durations.iter().sum::<u64>() + 10) * 1000)]
+            vec![(
+                "unified",
+                (durations.iter().sum::<u64>() + l1_padding) * 1000,
+            )]
         };
         caps.extend([
             ("dump", 55000),
-            ("archive", 60000),
-            ("import", 75000),
+            ("archive", archive_ms),
+            ("import", import_ms),
             ("terminal", 5000),
         ]);
         let held = caps.iter().map(|(_, n)| *n).sum::<u64>();
-        let transfer=total.checked_sub(held).filter(|n|*n>=30000).ok_or("总期限不足以保留观察、Dump55秒、transfer至少30秒、final140秒；请显式缩短新父窗口（例如5/30/10），未启动")?;
+        let transfer = total.checked_sub(held).filter(|n| *n >= 30000).ok_or(
+            "总期限不足以保留观察、Dump55秒、传输至少30秒和最终处理；90秒观察建议新父600秒，未启动",
+        )?;
         caps.push(("transfer", transfer));
         let mut c = Self::new_planned(limits, now, separate)?;
         c.time_plan = Some(TimePlan {
-            schema: "mobilee.session-time-plan/v1".into(),
-            final_reserve_ms: 140000,
+            schema: if long_plan {
+                "mobilee.session-time-plan/v2"
+            } else {
+                "mobilee.session-time-plan/v1"
+            }
+            .into(),
+            final_reserve_ms: final_ms,
             phases: caps
                 .into_iter()
                 .map(|(kind, cap_ms)| TimePhase {
@@ -1417,7 +1461,12 @@ impl Contract {
         remaining
             .checked_sub(plan.final_reserve_ms)
             .filter(|n| *n > 0)
-            .ok_or("collection_time_holdback_exhausted: final140秒已预留，未续期".into())
+            .ok_or_else(|| {
+                format!(
+                    "collection_time_holdback_exhausted: final{}秒已预留，未续期",
+                    plan.final_reserve_ms / 1000
+                )
+            })
     }
     /// Persist the first lease before starting the phase. Repeat calls never reset it.
     pub fn begin_time_phase(&mut self, kind: &str, now: u64) -> Result<u64, String> {
@@ -1472,6 +1521,56 @@ mod time_plan_tests {
             &[5, 30, 10],
         )
         .unwrap()
+    }
+    #[test]
+    fn long_new_parent_preserves_observations_and_reserves_finite_closeout() {
+        for (separate, transfer) in [(true, 145000), (false, 165000)] {
+            let c = Contract::new_planned_with_time(
+                Limits {
+                    total_bytes: 4 * 1024 * 1024 * 1024,
+                    max_seconds: 600,
+                },
+                1,
+                separate,
+                &[15, 90, 15],
+            )
+            .unwrap();
+            let p = c.time_plan.as_ref().unwrap();
+            assert_eq!(p.schema, "mobilee.session-time-plan/v2");
+            assert_eq!(p.final_reserve_ms, 245000);
+            p.validate(600000).unwrap();
+            p.validate_observations(separate, &[15, 90, 15]).unwrap();
+            assert!(p.validate_observations(separate, &[15, 89, 15]).is_err());
+            for (kind, cap) in [
+                ("dump", 55000),
+                ("transfer", transfer),
+                ("archive", 120000),
+                ("import", 120000),
+                ("terminal", 5000),
+            ] {
+                assert!(p
+                    .phases
+                    .iter()
+                    .any(|phase| phase.kind == kind && phase.cap_ms == cap));
+            }
+        }
+    }
+    #[test]
+    fn serialized_v1_long_parent_is_not_upgraded_or_renewed() {
+        let c = new();
+        let mut old = c.time_plan.unwrap();
+        old.phases
+            .iter_mut()
+            .find(|p| p.kind == "transfer")
+            .unwrap()
+            .cap_ms += 300000;
+        old.validate(600000).unwrap();
+        let bytes = serde_json::to_vec(&old).unwrap();
+        let restored: TimePlan = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(restored.schema, "mobilee.session-time-plan/v1");
+        assert_eq!(restored.final_reserve_ms, 140000);
+        restored.validate_observations(true, &[5, 30, 10]).unwrap();
+        assert_eq!(serde_json::to_vec(&restored).unwrap(), bytes);
     }
     #[test]
     fn explicit_short_plan_holds_final140_and_refuses_old_long_windows_before_clock() {
@@ -1610,14 +1709,22 @@ impl TimePlan {
         if durations.len() != 3 {
             return Err("时间计划观察窗口缺失".into());
         }
+        let l1_padding = if self.schema == "mobilee.session-time-plan/v2" {
+            15
+        } else {
+            10
+        };
         let caps = if separate {
             vec![
                 ("l0", (durations[0] + 10) * 1000),
-                ("l1", (durations[1] + 10) * 1000),
+                ("l1", (durations[1] + l1_padding) * 1000),
                 ("linker", (durations[2] + 10) * 1000),
             ]
         } else {
-            vec![("unified", (durations.iter().sum::<u64>() + 10) * 1000)]
+            vec![(
+                "unified",
+                (durations.iter().sum::<u64>() + l1_padding) * 1000,
+            )]
         };
         for (kind, ms) in caps {
             if !self.phases.iter().any(|p| p.kind == kind && p.cap_ms == ms) {
@@ -1883,5 +1990,27 @@ mod capability_time_release_tests {
         assert_eq!(c.deadline_token, token);
         assert!(c.time_plan.as_ref().unwrap().phases[0].completed);
         assert!(c.begin_time_phase("l0", 1).is_err());
+    }
+}
+
+#[cfg(test)]
+mod phase_guard_tests {
+    use super::*;
+    #[test]
+    fn constraining_guard_keeps_charges_and_cannot_extend_deadline() {
+        let root = std::env::temp_dir().join(format!("me-constrain-{}", uuid::Uuid::new_v4()));
+        let guard = Guard::install(vec![root.clone()], 1024, 10000).unwrap();
+        charge(&root.join("evidence"), 123).unwrap();
+        guard.constrain_time(100).unwrap();
+        let first = states().lock().unwrap().get(&guard.0).unwrap().deadline;
+        guard.constrain_time(10000).unwrap();
+        assert_eq!(
+            states().lock().unwrap().get(&guard.0).unwrap().deadline,
+            first
+        );
+        assert_eq!(guard.receipt().admitted_write_bytes, 123);
+        assert_eq!(guard.receipt().limit_bytes, 1024);
+        assert!(guard.constrain_time(0).is_err());
+        assert_eq!(guard.receipt().admitted_write_bytes, 123);
     }
 }

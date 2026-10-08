@@ -464,7 +464,10 @@ fn save(root: &Path, g: &Group) -> Result<(), String> {
             .map_err(|e| e.to_string())?;
         // Opt-in physical acceptance audit; normal production builds are unchanged.
         #[cfg(test)]
-        if std::env::var("ME_APPROVED_USB_79").as_deref() == Ok("single-parent-300s4GiB") {
+        if matches!(
+            std::env::var("ME_APPROVED_USB_79").as_deref(),
+            Ok("single-parent-300s4GiB" | "single-parent-600s4GiB")
+        ) {
             session_budget::charge(&temp, encoded.len() as u64).map_err(|e| e.to_string())?;
         }
         f.write_all(&encoded).map_err(|e| e.to_string())?;

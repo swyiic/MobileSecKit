@@ -1,6 +1,6 @@
 use super::*;
 #[test]
-#[ignore = "explicit single authorized provenance-pinned USB parent 300s4GiB; preserves original sources"]
+#[ignore = "explicit single authorized provenance-pinned USB parent 300s/600s4GiB; preserves original sources"]
 fn approved_usb_pinned_single_parent_4g() {
     // This monolithic debug acceptance future needs a bounded test-only stack.
     // Production UI invokes separate commands and does not use this runner.
@@ -19,10 +19,8 @@ fn approved_usb_pinned_single_parent_4g() {
         .unwrap();
 }
 async fn usb79_single_parent_body() {
-    assert_eq!(
-        std::env::var("ME_APPROVED_USB_79").as_deref(),
-        Ok("single-parent-300s4GiB")
-    );
+    let max_seconds =
+        approved_usb_parent_seconds(std::env::var("ME_APPROVED_USB_79").as_deref()).unwrap();
     let out = PathBuf::from(std::env::var_os("ME_USB_79_OUTPUT").unwrap());
     assert!(out.is_absolute() && !out.exists());
     std::fs::create_dir_all(&out).unwrap();
@@ -66,7 +64,7 @@ async fn usb79_single_parent_body() {
                 && lock.stdout.contains("screenState=SCREEN_STATE_ON")
         );
     }
-    let req:KernSightCaptureRequest=serde_json::from_value(serde_json::json!({"serial":serial,"package":"com.dlxx.mam.Internal","durationSeconds":15,"runtimePaths":paths,"sessionBudget":{"totalBytes":4294967296u64,"maxSeconds":300},"files":true,"network":true,"memory":true,"binder":true,"inspectMaxBytes":512,"inspectMaxHits":256})).unwrap();
+    let req:KernSightCaptureRequest=serde_json::from_value(serde_json::json!({"serial":serial,"package":"com.dlxx.mam.Internal","durationSeconds":15,"runtimePaths":paths,"sessionBudget":{"totalBytes":4294967296u64,"maxSeconds":max_seconds},"files":true,"network":true,"memory":true,"binder":true,"inspectMaxBytes":512,"inspectMaxHits":256})).unwrap();
     let groups = out.join("groups");
     std::fs::create_dir_all(&groups).unwrap();
     let mut manager_roots = vec![groups.clone()];
@@ -90,7 +88,7 @@ async fn usb79_single_parent_body() {
     let manager_guard = session_budget::Guard::install(
         manager_roots,
         2 * 1024 * 1024 - TERMINAL_RESERVED_BYTES,
-        300000,
+        max_seconds * 1000,
     )
     .unwrap();
     let mut group =
@@ -200,6 +198,9 @@ async fn usb79_single_parent_body() {
             if key == "linker"
                 || (key == "dump" && value.error.is_some() && !value.continue_after_partial)
             {
+                let phase_ms =
+                    capture_groups::begin_export_time_at(&groups, &mut group, "transfer")?;
+                guard.constrain_time(phase_ms).map_err(|e| e.to_string())?;
                 let spent = guard.receipt().admitted_write_bytes;
                 let cap = planned_transfer_payload_limit(
                     transfer.saturating_sub(spent),
@@ -238,6 +239,7 @@ async fn usb79_single_parent_body() {
         let root = bundle_root.as_ref().ok_or("dump source was not received")?;
         append_device_sessions_to_package_evidence(&serial, &group.package, root, Some(&group))
             .await?;
+        check_acceptance_time_phase(&group, "transfer")?;
         let limits = serde_json::json!({"schema":"mobilee.archive-output-limits/v1","archive_bytes":archive_cap,"import_bytes":import_cap,"max_ms":deadline.remaining_ms()?,"deadline_unix_ms":group.budget.as_ref().unwrap().deadline_unix_ms,"parent_id":group.id});
         session_budget::write(
             root.join("archive-output-limits.json"),
@@ -296,10 +298,19 @@ async fn usb79_single_parent_body() {
     let root = bundle_root.unwrap();
     let mut final_import_guard = None;
     let final_work=deadline.run(async {
-  println!("production_archive_start parent={}",group.id);write_kernsight_evidence_archive(&root,&archive)?;
+  let archive_ms=capture_groups::begin_export_time_at(&groups,&mut group,"archive")?;
+  session_budget::write_json(root.join("archive-output-limits.json"),&serde_json::json!({"schema":"mobilee.archive-output-limits/v1","archive_bytes":archive_cap,"import_bytes":import_cap,"max_ms":archive_ms,"deadline_unix_ms":group.budget.as_ref().unwrap().deadline_unix_ms,"parent_id":group.id})).map_err(|e|e.to_string())?;
+  let share_guard=session_budget::Guard::install(vec![root.clone()],archive_cap.saturating_sub(65536),archive_ms).map_err(|e|e.to_string())?;
+  println!("production_archive_start parent={}",group.id);
+  write_kernsight_evidence_archive(&root,&archive)?;
+  archive_objects::share_fresh_pull(&root,&archive)?;
+  session_budget::remaining_ms(&root,u64::MAX).map_err(|e|e.to_string())?;
+  check_acceptance_time_phase(&group,"archive")?;
+  drop(share_guard);
   let note:Value=serde_json::from_str(&std::fs::read_to_string(format!("{}.budget.json",archive.display())).map_err(|e|e.to_string())?).map_err(|e|e.to_string())?;
   let _archive_note=note; // Real archive receipt is settled in independent bounded metadata cleanup.
-  final_import_guard=Some(session_budget::Guard::install(vec![root.clone(),out.join("production-import-result.json")],import_cap-65536,deadline.remaining_ms()?).map_err(|e|e.to_string())?);
+  let import_ms=capture_groups::begin_export_time_at(&groups,&mut group,"import")?;
+  final_import_guard=Some(session_budget::Guard::install(vec![root.clone(),out.join("production-import-result.json")],import_cap.saturating_sub(65536),import_ms).map_err(|e|e.to_string())?);
   let bundle=import_kernsight_evidence_directory(root.to_string_lossy().into_owned()).await?;
   let report=bundle.session_report.as_ref().ok_or("actual parent report absent")?;if report["mobilee_capture_group"]["id"]!=group.id.to_string(){return Err("parent report mismatch".into());}
   let execution_complete=report["execution_complete"]==true;
@@ -309,8 +320,10 @@ async fn usb79_single_parent_body() {
   let preview=if let Some(f)=code{Some(read_local_kernsight_evidence_file(bundle.root.clone(),group.package.clone(),f.relative_path.clone(),512).await?)}else{None};
   let code_preview_present=preview.is_some();
   let child_events_present=children.len()==3 && children.iter().all(|c|c["totalEvents"].as_u64().unwrap_or(0)>0);
-  session_budget::write_json(out.join("production-import-result.json"),&serde_json::json!({"bundle":bundle,"children":children,"codePreview":preview,"parentCaptureState":group.state,"rawSessionsPreserved":seen,"archiveBytes":std::fs::metadata(&archive).map_err(|e|e.to_string())?.len(),"newParentBudgetBytes":4294967296u64,"captureMaxSeconds":300,"oldParentUnchanged":true,"ackSent":false,"sourceDeleted":false})).map_err(|e|e.to_string())?;
+  session_budget::write_json(out.join("production-import-result.json"),&serde_json::json!({"bundle":bundle,"children":children,"codePreview":preview,"parentCaptureState":group.state,"rawSessionsPreserved":seen,"archiveBytes":std::fs::metadata(&archive).map_err(|e|e.to_string())?.len(),"newParentBudgetBytes":4294967296u64,"captureMaxSeconds":max_seconds,"oldParentUnchanged":true,"ackSent":false,"sourceDeleted":false})).map_err(|e|e.to_string())?;
   deadline.check()?;
+  session_budget::remaining_ms(&root,u64::MAX).map_err(|e|e.to_string())?;
+  check_acceptance_time_phase(&group,"import")?;
   println!("production_import_finished parent={} children={}",group.id,children.len());
   if group.state!="succeeded"||!execution_complete||!code_preview_present||!child_events_present{return Err(format!("full acceptance not passed: parent={}, execution_complete={execution_complete}, code_preview={code_preview_present}, three_real_child_events={child_events_present}; retained partial preserved",group.state));}
   Ok(())
@@ -1135,4 +1148,36 @@ fn offline_terminal_finalizer_retains_blocker_and_manager_after_snapshot_error()
     assert!(cleanup.charged <= TERMINAL_RESERVED_BYTES);
     drop(guard);
     std::fs::remove_dir_all(root).unwrap();
+}
+
+fn approved_usb_parent_seconds(value: Result<&str, &std::env::VarError>) -> Result<u64, String> {
+    match value {
+        Ok("single-parent-300s4GiB") => Ok(300),
+        Ok("single-parent-600s4GiB") => Ok(600),
+        _ => Err("missing exact authorized USB parent duration".into()),
+    }
+}
+fn check_acceptance_time_phase(group: &capture_groups::Group, phase: &str) -> Result<(), String> {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|e| e.to_string())?
+        .as_millis() as u64;
+    group
+        .budget
+        .as_ref()
+        .ok_or("parent budget missing")?
+        .check_time_phase(phase, now)
+}
+#[test]
+fn offline_authorized_usb_duration_gate_is_exact() {
+    assert_eq!(
+        approved_usb_parent_seconds(Ok("single-parent-300s4GiB")).unwrap(),
+        300
+    );
+    assert_eq!(
+        approved_usb_parent_seconds(Ok("single-parent-600s4GiB")).unwrap(),
+        600
+    );
+    assert!(approved_usb_parent_seconds(Ok("single-parent-601s4GiB")).is_err());
+    assert!(approved_usb_parent_seconds(Err(&std::env::VarError::NotPresent)).is_err());
 }
