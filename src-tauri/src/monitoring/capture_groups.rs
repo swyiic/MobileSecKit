@@ -254,7 +254,8 @@ impl Group {
             && remote_terminal_confirmed(note)
             && validate_remote_lifecycle(note, &a.relation).is_ok()
             && note["collection_status"] == "partial"
-            && note["stop_reason"] == "output_budget_exhausted"
+            && (note["stop_reason"] == "output_budget_exhausted"
+                || (stage.key == "dump" && dump_coverage_verified(note, &self.package)))
             && (stage.key == "dump" || note["startup"]["timing"]["launcher_status"] == "completed")
             && self.budget.as_ref().is_some_and(|b| {
                 b.reservations.iter().any(|r| {
@@ -278,7 +279,12 @@ impl Group {
             }
             // A snapshot depends on its immediate source stage succeeding. An
             // earlier quota partial is safe only after a later successful cold start.
-            let independent = next.key != "dump" && next.launch_after_attach;
+            let independent = next.launch_after_attach
+                && if previous.key == "dump" {
+                    next.key == "linker" && i + 1 == index
+                } else {
+                    next.key != "dump"
+                };
             let replaced = next.key == "dump"
                 && i + 1 < index
                 && self.stages[i + 1..index].iter().any(|s| {
@@ -913,7 +919,10 @@ async fn run_group_stage_at(
                         .find(|a| a.relation == r)
                     {
                         a.state = "partial".into();
-                        a.error = Some("输出预算耗尽；已保存证据可拉取，覆盖 partial".into());
+                        a.error = Some(format!(
+                            "采集覆盖 partial（{}）；已保存证据可拉取",
+                            note["reason"].as_str().unwrap_or("原因未确认")
+                        ));
                     }
                     g.refresh();
                 }
@@ -1205,6 +1214,77 @@ mod tests {
         let r = g.start("linker", epoch()).unwrap();
         g.finish(&r, Some(Uuid::new_v4()), None, None).unwrap();
         assert_eq!(g.state, "partial");
+    }
+    fn coverage_partial_dump_group() -> Group {
+        let mut g = closed_partial_dump_group();
+        let note = g.stages[2].attempts[0].remote_lifecycle.as_mut().unwrap();
+        note["stop_reason"] = serde_json::json!("bound_code_copy_partial");
+        note["stop_request_recorded"] = serde_json::json!(false);
+        note["stop_command_attempted"] = serde_json::json!(false);
+        note["dump_coverage"] = serde_json::json!({"schema":"kernsight.dump-coverage/v1","classification":"coverage_only","package":g.package,"catalog_complete":true,"catalog_bytes":1000,"catalog_sha256":"a".repeat(64),"bound_notes":1,"bound_notes_sha256":"b".repeat(64),"admitted_ranges":161});
+        g
+    }
+    #[test]
+    fn verified_coverage_partial_dump_allows_linker_without_upgrading_dump() {
+        let mut g = coverage_partial_dump_group();
+        assert!(g.continue_after_partial("dump"));
+        let r = g.start("linker", epoch()).unwrap();
+        g.finish(&r, Some(Uuid::new_v4()), None, None).unwrap();
+        assert_eq!(g.stages[2].attempts[0].state, "partial");
+        assert_eq!(g.state, "partial");
+    }
+    #[test]
+    fn coverage_partial_dump_refuses_missing_unknown_or_unsafe_proof() {
+        for (field, value) in [
+            ("classification", serde_json::json!("unknown")),
+            ("package", serde_json::json!("foreign")),
+            ("catalog_complete", serde_json::json!(false)),
+            ("catalog_bytes", serde_json::json!(0)),
+            ("catalog_sha256", serde_json::json!("bad")),
+            ("bound_notes_sha256", Value::Null),
+            ("bound_notes", serde_json::json!(0)),
+            ("admitted_ranges", serde_json::json!(0)),
+        ] {
+            let mut g = coverage_partial_dump_group();
+            g.stages[2].attempts[0].remote_lifecycle.as_mut().unwrap()["dump_coverage"][field] =
+                value;
+            assert!(!g.continue_after_partial("dump"), "{field}");
+            assert!(g.start("linker", epoch()).is_err());
+        }
+        for (field, value) in [
+            ("dump_coverage", Value::Null),
+            ("agent_exited_confirmed", Value::Null),
+            ("cleanup", serde_json::json!("unconfirmed")),
+            ("stop_request_recorded", serde_json::json!(true)),
+            ("stop_command_attempted", serde_json::json!(true)),
+            (
+                "qualification_failure",
+                serde_json::json!({"failure":"identity"}),
+            ),
+            ("relation", Value::Null),
+            ("stop_reason", serde_json::json!("output_io_failed")),
+        ] {
+            let mut g = coverage_partial_dump_group();
+            g.stages[2].attempts[0].remote_lifecycle.as_mut().unwrap()[field] = value;
+            assert!(!g.continue_after_partial("dump"), "{field}");
+            assert!(g.start("linker", epoch()).is_err());
+        }
+        let mut g = coverage_partial_dump_group();
+        g.cancel_requested = true;
+        assert!(!g.continue_after_partial("dump"));
+        assert!(g.start("linker", epoch()).is_err());
+        let mut g = coverage_partial_dump_group();
+        g.budget.as_mut().unwrap().deadline_token =
+            Some(session_deadline::Deadline::register(Duration::ZERO));
+        assert!(!g.continue_after_partial("dump"));
+        assert!(g.start("linker", epoch()).is_err());
+        let mut g = coverage_partial_dump_group();
+        g.stages[3].launch_after_attach = false;
+        assert!(!g.continue_after_partial("dump"));
+        assert!(g.start("linker", epoch()).is_err());
+        let mut g = coverage_partial_dump_group();
+        g.stages[3].key = "l1".into();
+        assert!(!g.continue_after_partial("dump"));
     }
     #[test]
     fn partial_dump_missing_cleanup_cancel_and_unsettled_budget_stop_linker() {
@@ -2388,6 +2468,31 @@ fn mark_stopped_budget(g: &mut Group, error: Option<&str>) {
     }
 }
 
+fn dump_coverage_verified(note: &Value, package: &str) -> bool {
+    let p = &note["dump_coverage"];
+    let hash = |v: &Value| {
+        v.as_str()
+            .is_some_and(|s| s.len() == 64 && s.bytes().all(|b| b.is_ascii_hexdigit()))
+    };
+    note["stop_reason"] == "bound_code_copy_partial"
+        && note["stop_request_recorded"] == false
+        && note["stop_command_attempted"] == false
+        && note.get("qualification_failure").is_none_or(Value::is_null)
+        && p["schema"] == "kernsight.dump-coverage/v1"
+        && p["classification"] == "coverage_only"
+        && p["package"] == package
+        && p["catalog_complete"] == true
+        && p["bound_notes"]
+            .as_u64()
+            .is_some_and(|n| (1..=16).contains(&n))
+        && p["admitted_ranges"].as_u64().is_some_and(|n| n > 0)
+        && p["catalog_bytes"]
+            .as_u64()
+            .is_some_and(|n| (1..=64 * 1024 * 1024).contains(&n))
+        && hash(&p["catalog_sha256"])
+        && hash(&p["bound_notes_sha256"])
+}
+
 fn validate_remote_lifecycle(note: &Value, r: &Relation) -> Result<(), String> {
     let rel = &note["relation"];
     if note["schema"] != "kernsight.capture-lifecycle/v1"
@@ -2471,7 +2576,12 @@ fn decode_remote_lifecycle(
         return Err("远端control RPC响应超过64KiB，未确认".into());
     }
     let note: Value = serde_json::from_str(&response.stdout).map_err(|_| "远端control JSON未知")?;
-    for field in ["startup", "qualification", "qualification_failure"] {
+    for field in [
+        "startup",
+        "qualification",
+        "qualification_failure",
+        "dump_coverage",
+    ] {
         if let Some(record) = note.get(field).filter(|value| !value.is_null()) {
             if serde_json::to_vec(record).map_err(|e| e.to_string())?.len()
                 > MAX_REMOTE_CONTROL_RECORD_BYTES
@@ -2596,18 +2706,32 @@ mod remote_lifecycle_tests {
     fn lifecycle_nested_records_keep_their_independent_16kib_bounds() {
         let relation = relation();
         let mut value = note(&relation, Uuid::new_v4(), true, true);
-        for field in ["startup", "qualification", "qualification_failure"] {
+        for field in [
+            "startup",
+            "qualification",
+            "qualification_failure",
+            "dump_coverage",
+        ] {
             value[field] = padded_value(
                 serde_json::json!({"schema":"synthetic-bounded-record"}),
-                MAX_REMOTE_CONTROL_RECORD_BYTES,
+                if field == "dump_coverage" {
+                    512
+                } else {
+                    MAX_REMOTE_CONTROL_RECORD_BYTES
+                },
             );
         }
         let output = response(value.clone());
         assert!(output.stdout.len() > 3 * MAX_REMOTE_CONTROL_RECORD_BYTES);
         assert!(output.stdout.len() < MAX_REMOTE_CONTROL_BYTES);
         decode_remote_lifecycle(&output, &relation).unwrap();
-        for field in ["startup", "qualification", "qualification_failure"] {
-            let mut oversized = value.clone();
+        for field in [
+            "startup",
+            "qualification",
+            "qualification_failure",
+            "dump_coverage",
+        ] {
+            let mut oversized = note(&relation, Uuid::new_v4(), true, true);
             oversized[field] =
                 padded_value(serde_json::json!({}), MAX_REMOTE_CONTROL_RECORD_BYTES + 1);
             assert!(decode_remote_lifecycle(&response(oversized), &relation)
