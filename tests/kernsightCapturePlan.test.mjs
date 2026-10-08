@@ -215,7 +215,7 @@ test('insufficient time never silently shortens persisted windows', () => {
 
 
 test('new600s closeout profile retains90s observation with bounded archive and import', () => {
-  for (const [separate, transfer] of [[true,145],[false,165]]) {
+  for (const [separate, transfer] of [[true,105],[false,125]]) {
     const plan = captureTimeAllocation({l0:15,l1:90,linker:15},600,separate)
     assert.equal(plan.valid,true)
     assert.equal(plan.longPlan,true)
@@ -223,7 +223,7 @@ test('new600s closeout profile retains90s observation with bounded archive and i
     assert.equal(plan.finalSeconds,245)
     assert.equal(plan.archiveSeconds,120)
     assert.equal(plan.importSeconds,120)
-    assert.equal(plan.dumpSeconds,55)
+    assert.equal(plan.dumpSeconds,95)
   }
   assert.equal(captureTimeAllocation({l0:15,l1:90,linker:15},300,true).valid,false)
   assert.equal(captureTimeAllocation({l0:15,l1:90,linker:15},599,true).finalSeconds,140)

@@ -23,7 +23,7 @@ test('running records cannot hide and retained preference count is bounded',()=>
 test('session page omits historical purge entry while keeping normal groups and explicit cleanup preview',()=>{
  const view=readFileSync(new URL('../src/views/AndroidRuntimeMonitorView.vue',import.meta.url),'utf8')
  assert.doesNotMatch(view,/KernSightPurgeHistory|openPurgeRetry|重试读取清理记录/)
- assert.match(view,/KernSightGroupPurge v-if="purgeTarget"/)
+ assert.match(view,/KernSightGroupPurge v-if="purgeTarget\?\.parentId === group.id"/)
  assert.match(view,/visibleCaptureGroups/)
  assert.match(view,/legacyDeviceSessions/)
  assert.match(view,/attempts/)

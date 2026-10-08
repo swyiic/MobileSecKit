@@ -1,6 +1,5 @@
 <template>
   <div class="runtime-monitor-layout">
-    <KernSightGroupPurge v-if="purgeTarget" :target="purgeTarget" :busy="purgeBusy" :active="active && workspaceMode === 'evidence'" @close="closePurgePreview" @executing="purgeExecuting = $event" @complete="completePurge" @uncertain="loadPurgeReports" />
     <section class="runtime-hero panel">
       <div class="runtime-hero-copy">
         <div class="eyebrow">ANDROID · L0 OBSERVE · L1 INSPECT · L2 DUMP</div>
@@ -41,6 +40,7 @@
       <button :class="{ active: workspaceMode === 'capture' }" @click="workspaceMode = 'capture'"><span class="material-symbols-outlined">radio_button_checked</span><strong>新建采集</strong><small>L0 内核事实 · 可选 L1 Inspect</small></button>
       <button class="import-local" :disabled="importingLocal || purgeExecuting" @click="importLocalEvidence"><span class="material-symbols-outlined">folder_open</span><strong>{{ importingLocal ? '正在索引…' : '导入本地证据' }}</strong><small>选择包含 dump-report.json 的包目录</small></button>
       <button class="import-local" :disabled="importingLocal || purgeExecuting" @click="importEvidenceArchive"><span class="material-symbols-outlined">folder_zip</span><strong>{{ importingLocal ? '正在载入…' : '打开证据' }}</strong><small>.mee · 兼容旧格式</small></button>
+      <OperationError :message="operationErrors.import" />
     </section>
 
     <section v-if="probeError" class="notice error-notice runtime-probe-error" role="alert"><span class="material-symbols-outlined">error</span><span>{{ probeError }}</span><button @click="probeError = ''">关闭</button></section>
@@ -124,7 +124,7 @@
         <label v-if="captureForm.plan === 'auto'"><span>累计输出写入预算（MiB）</span><input v-model.number="captureForm.totalBudgetMiB" type="number" min="4" max="16384" :disabled="captureRunning" /></label>
         <label v-if="captureForm.plan === 'auto'"><span>总期限（秒）</span><input v-model.number="captureForm.maxSessionSeconds" type="number" min="30" max="3600" :disabled="captureRunning" /></label>
         <div v-if="captureForm.plan === 'auto'" class="wide ks-time-allocation" role="status">
-          <template v-if="autoTimeAllocation"><strong>时间分配：{{ autoTimeAllocation.producer.map(phase => `${phase.key} ${phase.seconds}s`).join(' · ') }} · Dump 55s · 传输 {{ Math.max(0, autoTimeAllocation.transferSeconds) }}s · 最终 {{ autoTimeAllocation.finalSeconds }}s</strong><small>最终预留：归档 {{ autoTimeAllocation.archiveSeconds }}s、导入 {{ autoTimeAllocation.importSeconds }}s、终态 5s。L0/Linker 启动预留10s，L1/统一会话预留{{ autoTimeAllocation.longPlan ? 15 : 10 }}s；传输至少30s。{{ autoTimeAllocation.valid ? '满足时间准入；不保证所有阶段完成。' : `总期限不足，至少需要 ${autoTimeAllocation.minimumSeconds}s；未启动，请调整新父窗口或期限。` }}</small></template>
+          <template v-if="autoTimeAllocation"><strong>时间分配：{{ autoTimeAllocation.producer.map(phase => `${phase.key} ${phase.seconds}s`).join(' · ') }} · Dump {{ autoTimeAllocation.dumpSeconds }}s · 传输 {{ Math.max(0, autoTimeAllocation.transferSeconds) }}s · 最终 {{ autoTimeAllocation.finalSeconds }}s</strong><small>最终预留：归档 {{ autoTimeAllocation.archiveSeconds }}s、导入 {{ autoTimeAllocation.importSeconds }}s、终态 5s。L0/Linker 启动预留10s，L1/统一会话预留{{ autoTimeAllocation.longPlan ? 15 : 10 }}s；传输至少30s。{{ autoTimeAllocation.valid ? '满足时间准入；不保证所有阶段完成。' : `总期限不足，至少需要 ${autoTimeAllocation.minimumSeconds}s；未启动，请调整新父窗口或期限。` }}</small></template>
           <small v-else>观察窗必须为 1–300 秒整数，总期限必须为 30–3600 秒整数；未启动。</small>
           <small>新任务默认4GiB、600秒，观察窗15 / 90 / 15秒；有效已保存窗口保留。缩短窗口会缩小覆盖，缺失保持未知。传输额度耗尽时保留 partial；时间准入不保证全部阶段完成。</small>
         </div>
@@ -146,6 +146,7 @@
       <div class="ks-capture-actions">
         <button class="primary-button" :disabled="captureRunning || purgeExecuting || !captureValid" @click="startCapture"><span class="material-symbols-outlined" :class="{ spinning: captureRunning }">{{ captureRunning ? 'sync' : 'radio_button_checked' }}</span>{{ captureActionLabel }}</button>
         <p>{{ capturePolicyHint }}</p>
+        <OperationError :message="operationErrors.start" />
       </div>
       <div class="ks-capture-plan">
         <div><small>范围</small><strong>{{ captureScopeLabel }}</strong></div>
@@ -197,6 +198,7 @@
       <p v-if="!localOwnershipConfirmed" class="ks-trash-message" role="status">本地主会话归属尚未确认，暂不显示旧会话删除入口；可重试“刷新本地记录”。</p>
       <p v-if="trashMessage" class="ks-trash-message" role="status">{{ trashMessage }}</p>
       <p v-if="purgeMessage" class="ks-trash-message" role="status">{{ purgeMessage }}</p>
+      <KernSightGroupPurge v-if="purgeTarget && !visibleCaptureGroups.some(g => g.id === purgeTarget?.parentId) && !trashedCaptureGroups.some(e => e.group.id === purgeTarget?.parentId)" :target="purgeTarget" :busy="purgeBusy" :active="active && workspaceMode === 'evidence'" @close="closePurgePreview" @executing="purgeExecuting = $event" @complete="completePurge" @uncertain="loadPurgeReports" />
       <details v-if="trashedCaptureGroups.length" class="ks-group-trash">
         <summary>主会话回收站 · {{ trashedCaptureGroups.length }}</summary>
         <p>这里只移除会话列表记录，可恢复。原始证据、导入目录与设备文件保留，不释放磁盘空间。</p>
@@ -204,6 +206,8 @@
           <span>{{ entry.group.package }} · {{ shortSession(entry.group.id) }} · {{ captureStateLabel(entry.group.state) }} · {{ formatDate(entry.trashedUnixMs) }}</span>
           <button class="ghost-button" :disabled="Boolean(changingTrashGroup)" @click="restoreCaptureGroup(entry)">{{ changingTrashGroup === entry.group.id ? '处理中…' : '恢复主会话' }}</button>
           <button class="ghost-button danger-button" :disabled="!canPurgeCaptureGroup(entry.group)" @click="openPurgePreview(entry.group)">永久清理本地与手机…</button>
+          <OperationError :message="operationErrors[`restore:${entry.group.id}`]" />
+          <KernSightGroupPurge v-if="purgeTarget?.parentId === entry.group.id" :target="purgeTarget" :busy="purgeBusy" :active="active && workspaceMode === 'evidence'" @close="closePurgePreview" @executing="purgeExecuting = $event" @complete="completePurge" @uncertain="loadPurgeReports" />
         </article>
       </details>
       <div class="ks-session-list">
@@ -236,7 +240,7 @@
               <KernSightCaptureDiagnostics :group="group" :attempt="attempt" />
             </div>
           </article>
-          <div class="ks-group-actions"><button v-if="captureGroups.some(item => item.id === group.id && item.serial === device?.serial) && !group.cancelRequested && runningCaptureGroup !== group.id && group.state!=='succeeded' && group.state!=='running'" class="ghost-button" :disabled="captureRunning || purgeExecuting" @click="resumeCaptureGroup(group)">继续 / 重试未成功阶段</button>
+          <div class="ks-group-actions"><button v-if="captureGroups.some(item => item.id === group.id && item.serial === device?.serial) && !group.cancelRequested && runningCaptureGroup !== group.id && group.state!=='succeeded' && group.state!=='running'" class="ghost-button" :disabled="captureRunning || purgeExecuting" @click="restartCaptureGroup(group)">重新采集（新主会话）</button>
           <button v-if="!group.cancelRequested && (runningCaptureGroup === group.id || group.state === 'running') && captureGroups.some(item => item.id === group.id && item.serial === device?.serial)" class="ghost-button" @click="cancelCaptureGroup(group)">请求取消（当前阶段封存后停止）</button><span v-if="group.cancelRequested && runningCaptureGroup === group.id" class="ks-form-help" role="status">已请求取消，正在等待当前阶段封存</span>
           <button v-if="group.stages.some(s=>s.key==='dump'&&['succeeded','partial','failed'].includes(s.attempts[s.attempts.length-1]?.state||'')) && captureGroups.some(g=>g.id===group.id && g.serial===device?.serial)" class="ghost-button" :disabled="pullingPackage || purgeExecuting" @click="pullCaptureGroup(group)">拉取本次主会话全部信息</button>
           <template v-if="pendingTrashGroup === group.id">
@@ -245,7 +249,10 @@
             <button class="ghost-button danger-button" :disabled="!canTrashCaptureGroup(group)" @click="confirmTrashCaptureGroup(group)">确认移入回收站</button>
           </template>
           <button v-else class="ghost-button danger-button" :disabled="!canTrashCaptureGroup(group)" :title="canTrashCaptureGroup(group) ? '移除列表记录，可从回收站恢复；不释放磁盘空间' : '采集或拉取期间不可移除，请等待封存'" @click="pendingTrashGroup = group.id">移入回收站</button>
-          <button class="ghost-button danger-button" :disabled="!canPurgeCaptureGroup(group)" @click="openPurgePreview(group)">永久清理本地与手机…</button></div>
+          <button class="ghost-button danger-button" :disabled="!canPurgeCaptureGroup(group)" @click="openPurgePreview(group)">永久清理本地与手机…</button>
+          <OperationError :message="operationErrors[`capture:${group.id}`] || operationErrors[`restart:${group.id}`] || operationErrors[`pull:${group.id}`] || operationErrors[`cancel:${group.id}`] || operationErrors[`trash:${group.id}`]" />
+          <KernSightGroupPurge v-if="purgeTarget?.parentId === group.id" :target="purgeTarget" :busy="purgeBusy" :active="active && workspaceMode === 'evidence'" @close="closePurgePreview" @executing="purgeExecuting = $event" @complete="completePurge" @uncertain="loadPurgeReports" />
+          </div>
         </details>
         <article v-for="session in legacyDeviceSessions" :key="session.session_id" class="ks-session-row" :class="{ active: selectedSession === session.session_id, 'legacy-readonly': true }">
           <button class="ks-session-open" :disabled="loadingReport" @click="loadSessionReport(session.session_id)">
@@ -432,7 +439,7 @@
       <label v-if="selectedEvidenceSource === 'local' && selectedPackageBundles.length > 1" class="ks-local-capture-picker"><span>本地采集记录（{{ selectedPackageBundles.length }}）</span><select :value="selectedLocalBundle?.root" @change="selectLocalEvidenceRoot(($event.target as HTMLSelectElement).value)"><option v-for="bundle in selectedPackageBundles" :key="bundle.root" :value="bundle.root">{{ bundleSessionId(bundle) }} · {{ bundle.dumpReport.dump_id || 'legacy dump' }} · {{ bundle.root }}</option></select><small>列表统计、文件、导出与分析关联均使用此记录；不会按包名合并不同采集。</small></label>
       <details v-if="selectedEvidenceSource === 'local'" class="ks-source-diagnostics"><summary>本地运行时来源诊断与逐库加载段</summary><p v-if="!selectedPackageDump.local_storage_accounting?.runtime_source_diagnostics">旧数据：来源诊断未知。</p><pre>{{ selectedPackageDump.local_storage_accounting?.runtime_source_diagnostics }}</pre><article v-for="module in selectedPackageDump.local_storage_accounting?.elf_module_observations || []" :key="`${module.source_report}:${module.path}`"><p>{{ module.path }} · 已观察/已读范围 {{ module.verified_range_count ?? '未知' }} · 留存 {{ module.verified_range_bytes ?? '未知' }} B · PT_LOAD 可分析 {{ elfLoadCoverageLabel(module.all_load_file_bytes_covered) }} · 完整文件缺失（未重建）</p><details><summary>来源与缺口</summary><pre>{{ module }}</pre></details></article></details>
       <KernSightDexIndex :key="selectedLocalBundle?.root || selectedPackageDump.dump_id || selectedPackage" :dump="selectedPackageDump" />
-      <section v-if="evidenceError" class="notice error-notice ks-pull-notice" role="alert"><span class="material-symbols-outlined">error</span><span>{{ evidenceError }}</span><button @click="evidenceError = ''">关闭</button></section>
+      <OperationError :message="operationErrors[`pull:${device?.serial}:${selectedPackage}`] || operationErrors[`export:${selectedLocalBundle?.root}`]" />
       <section v-if="evidenceMessage" class="notice status-notice ks-pull-notice" role="status"><span class="material-symbols-outlined">task_alt</span><span>{{ evidenceMessage }}</span><button @click="evidenceMessage = ''">关闭</button></section>
       <section v-if="landedKeyFiles.length" class="ks-dex-ownership">
         <header><div><strong>已落地的 key 文件</strong><small>正常读取过程中写出的文件。文件在目录里，不表示这个值已经验证可用于解密。</small></div></header>
@@ -495,11 +502,12 @@
 <script setup lang="ts">
 import FullValue from '@/components/FullValue.vue'
 import { runCaptureGroupPlan, mergeCaptureResults, captureStateLabel, captureStageLabel, latestGroupSession } from '@/services/kernsightCaptureRunner'
-import { mergeCaptureGroups,groupSessionIds,captureGroupEdges,captureGroupCanTrash,captureGroupImportIsTrashed } from '../services/kernsightCaptureGroups'
+import { mergeCaptureGroups,groupSessionIds,captureGroupEdges,captureGroupCanTrash,captureGroupImportIsTrashed,newCaptureFromGroup } from '../services/kernsightCaptureGroups'
 import { packageEvidenceReports, importedSessionId, bundleForSession, linkedEvidenceMatches, createLatestRequest, createKeyedRequests, evidenceCountLabel, executionStatusLabel } from '../services/kernsightWorkspaceState'
 import { memoryCounterLabel, memoryEvidenceLabel } from '../services/kernsightMemoryEvidence'
 import KernSightDexIndex from '@/components/KernSightDexIndex.vue'
 import KernSightCaptureDiagnostics from '@/components/KernSightCaptureDiagnostics.vue'
+import OperationError from '@/components/OperationError.vue'
 import KernSightGroupPurge from '@/components/KernSightGroupPurge.vue'
 import { bundleRemovedByPurge, purgeReportLabel, type PurgeTarget } from '@/services/kernsightGroupPurge'
 import { verifiedDexObjectCount, indexedElfModuleCount, indexedDexCount, runtimeDexClassMatches, elfLoadCoverageLabel, codeEvidenceLabel, allocatedEvidenceLabel, ownershipEvidenceEntries, codeNoiseLayers, archiveCoverageLabel, dexScanSummary, dexScanSummaryForObject, fileScanLabel } from '../services/kernsightCodeEvidence'
@@ -563,6 +571,11 @@ const capabilityProbe = ref<AndroidMonitorCapabilityProbe | null>(null)
 const probing = ref(false)
 const provisioning = ref(false)
 const provisionResult = ref<KernSightProvisionResult | null>(null)
+const operationErrors = reactive<Record<string, string>>({})
+const operationTickets = new Map<string, number>()
+let operationRevision = 0
+function beginOperation(key: string) { const ticket = ++operationRevision; operationTickets.set(key, ticket); operationErrors[key] = ''; return ticket }
+function failOperation(key: string, ticket: number, error: unknown) { if (operationTickets.get(key) !== ticket) return false; operationErrors[key] = readableError(error); return operationRevision === ticket }
 const probeError = ref('')
 const evidenceError = ref('')
 const evidenceMessage = ref('')
@@ -588,6 +601,7 @@ const detailTab = ref('chain')
 const aiCopied = ref(false)
 const workspaceMode = ref<'evidence' | 'capture'>('evidence')
 const selectedPackage = ref('')
+watch(() => [props.active, props.device?.serial, workspaceMode.value, selectedPackage.value, selectedCaptureGroup.value], () => { operationRevision += 1 }, { flush: 'sync' })
 const selectedEvidenceSource = ref<'local' | 'device'>('local')
 const { bundles: localEvidenceBundles, refreshPresence, selectedRoots, bundleForPackage, selectBundle, upsertBundle, importDirectory, importArchive, requestedPackage } = useKernSightEvidence()
 const devicePackageNames = ref(new Set<string>())
@@ -1397,7 +1411,9 @@ async function importLocalEvidence() {
 }
 
 async function importEvidenceDirectory(path?: string) {
-  if (purgeExecuting.value) return
+  if (purgeExecuting.value || importingLocal.value) return
+  const operationKey = 'import'
+  const operationTicket = beginOperation(operationKey)
   importingLocal.value = true
   probeError.value = ''
   emit('show-evidence')
@@ -1408,7 +1424,7 @@ async function importEvidenceDirectory(path?: string) {
     selectPackage(bundle.package)
     evidenceMessage.value = `已索引 ${bundle.package} 的本地证据目录：${bundle.fileCount.toLocaleString()} 个文件，${formatBytes(bundle.totalBytes)}`
   } catch (error) {
-    probeError.value = readableError(error)
+    if (failOperation(operationKey, operationTicket, error)) probeError.value = readableError(error)
   } finally {
     importingLocal.value = false
   }
@@ -1425,7 +1441,9 @@ onMounted(() => {
 })
 
 async function importEvidenceArchive() {
-  if (purgeExecuting.value) return
+  if (purgeExecuting.value || importingLocal.value) return
+  const operationKey = 'import'
+  const operationTicket = beginOperation(operationKey)
   importingLocal.value = true
   probeError.value = ''
   try {
@@ -1435,7 +1453,7 @@ async function importEvidenceArchive() {
     selectPackage(bundle.package)
     evidenceMessage.value = `已打开 ${bundle.package} 的 MobileE 证据包：${bundle.fileCount.toLocaleString()} 个文件，${formatBytes(bundle.totalBytes)}`
   } catch (error) {
-    probeError.value = readableError(error)
+    if (failOperation(operationKey, operationTicket, error)) probeError.value = readableError(error)
   } finally {
     importingLocal.value = false
   }
@@ -1443,9 +1461,13 @@ async function importEvidenceArchive() {
 
 async function pullSelectedPackageEvidence(parentId?:string) {
   if (!props.device || !selectedPackage.value || pullingPackage.value || purgeExecuting.value) return
+  const operationKey = typeof parentId === 'string' ? `pull:${parentId}` : `pull:${props.device.serial}:${selectedPackage.value}`
+  const operationTicket = beginOperation(operationKey)
   const serial = props.device.serial
   const packageName = selectedPackage.value
   const expectedBytes = Number(selectedPackageDump.value?.total_bytes ?? 0)
+  pullingPackage.value = true
+  try {
   const destination = await save({
     defaultPath: `${packageName}.mee`,
     filters: [{ name: 'ME evidence', extensions: ['mee'] }],
@@ -1456,7 +1478,6 @@ async function pullSelectedPackageEvidence(parentId?:string) {
   probeError.value = ''
   evidenceError.value = ''
   evidenceMessage.value = `正在拉取并封装 ME v2 内容引用归档 ${packageName}${expectedBytes ? `（约 ${formatBytes(expectedBytes)}）` : ''}。目标旁会先出现 .part 文件，完成后原子替换为：${archivePath}`
-  try {
     const bundle = await monitoringBackend.pullKernSightPackageArchive(serial, packageName, archivePath, typeof parentId==='string'?parentId:undefined)
     upsertBundle(bundle)
     selectPackage(bundle.package)
@@ -1464,8 +1485,7 @@ async function pullSelectedPackageEvidence(parentId?:string) {
     const failedSessions = Array.isArray(bundle.sessionReport?.mobilee_session_failures) ? bundle.sessionReport.mobilee_session_failures.length : 0
     evidenceMessage.value = `已保存并由 MobileE 自动解析 ${bundle.package}：${bundle.fileCount.toLocaleString()} 个文件、${includedSessions} 条手机会话${failedSessions ? `；另有 ${failedSessions} 条会话无法读取，详情已写入 session-index.json` : ''} · ${archivePath}`
   } catch (error) {
-    evidenceMessage.value = ''
-    evidenceError.value = readableError(error)
+    if (failOperation(operationKey, operationTicket, error)) { evidenceMessage.value = ''; evidenceError.value = readableError(error) }
   } finally {
     pullingPackage.value = false
   }
@@ -1473,7 +1493,11 @@ async function pullSelectedPackageEvidence(parentId?:string) {
 
 async function exportSelectedEvidenceArchive() {
   if (!selectedLocalBundle.value || pullingPackage.value || purgeExecuting.value) return
+  const operationKey = `export:${selectedLocalBundle.value.root}`
+  const operationTicket = beginOperation(operationKey)
   const bundle = selectedLocalBundle.value
+  pullingPackage.value = true
+  try {
   const destination = await save({
     defaultPath: `${bundle.package}.mee`,
     filters: [{ name: 'ME evidence', extensions: ['mee'] }],
@@ -1484,12 +1508,10 @@ async function exportSelectedEvidenceArchive() {
   probeError.value = ''
   evidenceError.value = ''
   evidenceMessage.value = `正在导出 ${bundle.package} 的已留存运行时证据（覆盖仍按 partial/未知核对）：${archivePath}`
-  try {
     const savedPath = await monitoringBackend.exportKernSightEvidenceArchive(bundle.root, archivePath)
     evidenceMessage.value = `MobileE 证据包已导出：${savedPath}`
   } catch (error) {
-    evidenceMessage.value = ''
-    evidenceError.value = readableError(error)
+    if (failOperation(operationKey, operationTicket, error)) { evidenceMessage.value = ''; evidenceError.value = readableError(error) }
   } finally {
     pullingPackage.value = false
   }
@@ -1617,12 +1639,12 @@ async function loadPurgeReports() {
 }
 async function completePurge(report: KernSightGroupPurgeReport, plan: KernSightGroupPurgePlan) {
   purgeRequests.invalidate()
-  purgeTarget.value = null
   if (report.parentId !== plan.parentId || report.serial !== plan.serial || report.package !== plan.package) {
     purgeMessage.value = '返回清理结果的会话身份不一致；请刷新记录核对，当前列表未据此移除。'
     await loadPurgeReports()
     return
   }
+  if (report.localState === 'completed' && ['completed', 'not_required'].includes(report.deviceState)) purgeTarget.value = null
   purgeReports.value = [...purgeReports.value.filter(item => item.id !== report.id), report]
   purgeMessage.value = `${purgeReportLabel(report)} · 父会话 ${report.parentId} · 本地 ${report.localState} / 手机 ${report.deviceState}。${report.error || ''}`
   if (report.localState === 'completed') {
@@ -1645,7 +1667,7 @@ async function completePurge(report: KernSightGroupPurgeReport, plan: KernSightG
     try { await loadKernSight() } catch { /* durable per-side report remains visible */ }
   }
 }
-watch(() => [props.active, props.device?.serial, props.device?.status, workspaceMode.value, selectedCaptureGroup.value, selectedPackage.value], closePurgePreview, { flush: 'sync' })
+watch(() => [props.active, props.device?.serial, props.device?.status, workspaceMode.value], closePurgePreview, { flush: 'sync' })
 
 function canTrashCaptureGroup(group: KernSightCaptureGroup) {
   return captureGroupCanTrash(group, runningCaptureGroup.value, captureRunning.value || pullingPackage.value || Boolean(changingTrashGroup.value) || purgeExecuting.value)
@@ -1653,6 +1675,7 @@ function canTrashCaptureGroup(group: KernSightCaptureGroup) {
 
 async function confirmTrashCaptureGroup(group: KernSightCaptureGroup) {
   if (pendingTrashGroup.value !== group.id || !canTrashCaptureGroup(group)) return
+  const operationKey = `trash:${group.id}`; const operationTicket = beginOperation(operationKey)
   pendingTrashGroup.value = ''
   changingTrashGroup.value = group.id
   localGroupsRequests.invalidate()
@@ -1666,13 +1689,16 @@ async function confirmTrashCaptureGroup(group: KernSightCaptureGroup) {
     reconcileTrashedSelection()
     trashMessage.value = `主会话 ${shortSession(group.id)} 已移入回收站，可恢复；原始文件与设备空间未清理。`
   } catch (error) {
-    await loadLocalCaptureGroups()
-    probeError.value = `移入回收站失败：${readableError(error)}`
+    if (failOperation(operationKey, operationTicket, error)) {
+      await loadLocalCaptureGroups()
+      if (failOperation(operationKey, operationTicket, error)) probeError.value = `移入回收站失败：${readableError(error)}`
+    }
   } finally { changingTrashGroup.value = '' }
 }
 
 async function restoreCaptureGroup(entry: KernSightCaptureGroupTrash) {
   if (changingTrashGroup.value || purgeExecuting.value) return
+  const operationKey = `restore:${entry.group.id}`; const operationTicket = beginOperation(operationKey)
   changingTrashGroup.value = entry.group.id
   localGroupsRequests.invalidate()
   probeError.value = ''
@@ -1685,8 +1711,10 @@ async function restoreCaptureGroup(entry: KernSightCaptureGroupTrash) {
     trashMessage.value = `主会话 ${shortSession(entry.group.id)} 已恢复${entry.managed ? '' : '；如本地证据未打开，请重新导入原目录或归档'}。`
     await loadLocalCaptureGroups()
   } catch (error) {
-    await loadLocalCaptureGroups()
-    probeError.value = `恢复主会话失败：${readableError(error)}`
+    if (failOperation(operationKey, operationTicket, error)) {
+      await loadLocalCaptureGroups()
+      if (failOperation(operationKey, operationTicket, error)) probeError.value = `恢复主会话失败：${readableError(error)}`
+    }
   } finally { changingTrashGroup.value = '' }
 }
 
@@ -1910,13 +1938,16 @@ async function showCaptureOutcome(groupId: string, revision: number, serial: str
   selectedCaptureGroup.value = group.id
   const sessionId = latestGroupSession(group)
   const captureError = probeError.value
+  const errorRevision = operationRevision
   if (sessionId) await openGroupedSession(group, sessionId)
   // Opening retained evidence must not hide the reason automatic capture stopped.
-  if (captureError) probeError.value = captureError
+  if (captureError && operationRevision === errorRevision) probeError.value = captureError
 }
 
 async function startCapture() {
   if (!props.device || !captureValid.value || captureRunning.value || purgeExecuting.value) return
+  const operationKey = 'start'
+  const operationTicket = beginOperation(operationKey)
   const serial = props.device.serial
   const automatic = captureForm.plan === 'auto'
   clearCurrentSession()
@@ -1938,17 +1969,20 @@ async function startCapture() {
       captureResult.value = await monitoringBackend.startKernSightCapture(buildCaptureRequest(captureForm.inspectMode, Number(captureForm.durationSeconds), false))
     }
   } catch (error) {
-    probeError.value = readableError(error)
+    if (failOperation(operationKey, operationTicket, error)) {
+      if (lastCaptureGroupId.value) operationErrors[`capture:${lastCaptureGroupId.value}`] = readableError(error)
+      probeError.value = readableError(error)
+    }
   } finally {
     const captureError = probeError.value
     await refreshCaptureOverview(serial)
-    if (captureError) probeError.value = captureError
+    if (captureError && operationRevision === operationTicket) probeError.value = captureError
     finishCaptureRun()
     if (automatic && lastCaptureGroupId.value) await showCaptureOutcome(lastCaptureGroupId.value, revision, serial)
     else if (props.device?.serial === serial && captureSelectionRevision === revision && captureResult.value?.sessionId) {
       workspaceMode.value = 'evidence'
       await loadSessionReport(captureResult.value.sessionId)
-      if (captureError) probeError.value = captureError
+      if (captureError && operationRevision === operationTicket) probeError.value = captureError
     }
   }
 }
@@ -1974,27 +2008,35 @@ async function executeCaptureGroup(group: KernSightCaptureGroup) {
     })
   } finally { runningCaptureGroup.value = '' }
 }
-async function resumeCaptureGroup(group: KernSightCaptureGroup) {
-  if (captureRunning.value || purgeExecuting.value) return
+async function restartCaptureGroup(group: KernSightCaptureGroup) {
+  if (captureRunning.value || purgeExecuting.value || props.device?.serial !== group.serial) return
+  const key = `restart:${group.id}`
+  const ticket = beginOperation(key)
   clearCurrentSession()
   const revision = captureSelectionRevision
   const serial = group.serial
-  lastCaptureGroupId.value = group.id
-  selectedCaptureGroup.value = group.id
+  lastCaptureGroupId.value = ''
   resetCaptureRun()
-  try { await executeCaptureGroup(group) }
-  catch (error) { probeError.value = readableError(error) }
+  try {
+    const request = newCaptureFromGroup(group)
+    const fresh = await monitoringBackend.beginKernSightGroup(request.base, request.durations, request.separate)
+    lastCaptureGroupId.value = fresh.id
+    replaceCaptureGroup(fresh)
+    if (captureSelectionRevision === revision) selectedCaptureGroup.value = fresh.id
+    await executeCaptureGroup(fresh)
+  } catch (error) { if (failOperation(key, ticket, error)) { if (lastCaptureGroupId.value) operationErrors[`capture:${lastCaptureGroupId.value}`] = readableError(error); probeError.value = readableError(error) } }
   finally {
     const captureError = probeError.value
     await refreshCaptureOverview(serial)
-    if (captureError) probeError.value = captureError
+    if (captureError && operationRevision === ticket) probeError.value = captureError
     finishCaptureRun()
-    await showCaptureOutcome(group.id, revision, serial)
+    if (lastCaptureGroupId.value) await showCaptureOutcome(lastCaptureGroupId.value, revision, serial)
   }
 }
 async function cancelCaptureGroup(group: KernSightCaptureGroup) {
+  const key = `cancel:${group.id}`; const ticket = beginOperation(key)
   try { replaceCaptureGroup(await monitoringBackend.cancelKernSightGroup(group.id)) }
-  catch (error) { probeError.value = readableError(error) }
+  catch (error) { if (failOperation(key, ticket, error)) probeError.value = readableError(error) }
 }
 async function openGroupedSession(group: KernSightCaptureGroup, sessionId: string) {
   captureSelectionRevision += 1

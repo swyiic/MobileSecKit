@@ -171,9 +171,10 @@ export function captureTimeAllocation(durations: { l0: number; l1: number; linke
   const producer = separate
     ? [{ key: 'L0', seconds: durations.l0 + 10 }, { key: 'L1', seconds: durations.l1 + l1Padding }, { key: 'Linker', seconds: durations.linker + 10 }]
     : [{ key: '统一 session', seconds: durations.l0 + durations.l1 + durations.linker + l1Padding }]
-  const heldSeconds = producer.reduce((sum, phase) => sum + phase.seconds, 0) + 55 + finalSeconds
+  const dumpSeconds = longPlan ? 95 : 55
+  const heldSeconds = producer.reduce((sum, phase) => sum + phase.seconds, 0) + dumpSeconds + finalSeconds
   const transferSeconds = totalSeconds - heldSeconds
   const minimumSeconds = heldSeconds + 30
-  return { producer, dumpSeconds: 55, archiveSeconds, importSeconds, terminalSeconds: 5,
+  return { producer, dumpSeconds, archiveSeconds, importSeconds, terminalSeconds: 5,
     finalSeconds, transferSeconds, minimumSeconds, longPlan, valid: transferSeconds >= 30 }
 }

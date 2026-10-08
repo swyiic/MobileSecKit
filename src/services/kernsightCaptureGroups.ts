@@ -1,4 +1,4 @@
-import type { KernSightCaptureGroup, KernSightCaptureGroupTrash, KernSightLocalEvidenceBundle } from '../types/monitoring'
+import type { KernSightCaptureGroup, KernSightCaptureGroupTrash, KernSightLocalEvidenceBundle, KernSightCaptureRequest } from '../types/monitoring'
 export function mergeCaptureGroups(device:KernSightCaptureGroup[], imported:KernSightCaptureGroup[]):KernSightCaptureGroup[] {
   const groups=new Map(device.map(group=>[group.id,group]))
   for(const group of imported)if(!groups.has(group.id))groups.set(group.id,group)
@@ -34,4 +34,19 @@ export function captureGroupImportIsTrashed(group: KernSightCaptureGroup, root: 
 export function captureGroupCanTrash(group: KernSightCaptureGroup, runningParent = '', busy = false): boolean {
   return !busy && group.id !== runningParent && group.state !== 'running'
     && !group.stages.some(stage => stage.attempts.some(attempt => attempt.state === 'running'))
+}
+
+
+/** Only configuration is copied. The backend allocates fresh parent/stages/attempts/deadline. */
+export function newCaptureFromGroup(group: KernSightCaptureGroup) {
+  const base = structuredClone(group.base) as unknown as KernSightCaptureRequest
+  delete base.captureRelation
+  delete base.captureRelations
+  delete base.outputBudgetBytes
+  delete base.outputBudgetMs
+  base.serial = group.serial
+  base.package = group.package
+  const durations = ['l0', 'l1', 'linker'].map(key => group.stages.find(stage => stage.key === key)?.durationSeconds)
+  if (durations.some(value => !Number.isFinite(value) || Number(value) <= 0)) throw new Error('旧主会话缺少有效阶段窗口；请在新建采集中重新配置。')
+  return { base, durations: durations as number[], separate: group.unified !== true }
 }

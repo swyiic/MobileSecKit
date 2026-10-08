@@ -88,3 +88,55 @@ test('package evidence preserves open and pull while retiring unowned package-wi
  const backend=readFileSync(new URL('../src/services/backend/monitoring.ts',import.meta.url),'utf8')
  assert.doesNotMatch(backend,/cleanup_kernsight_session|cleanup_kernsight_package_dump/)
 })
+
+const { newCaptureFromGroup } = await import(`data:text/javascript;base64,${Buffer.from(code).toString('base64')}`)
+test('restart copies configuration without old identity, charge or deadline and leaves evidence untouched', () => {
+ const old = { id:'expired-parent', serial:'usb', package:'com.immomo.momo', unified:false,
+   base:{serial:'usb',package:'com.immomo.momo',sessionBudget:{maxSeconds:600,totalBytes:4294967296},runtimePaths:{root:'/trusted',agentPath:'/trusted/ksightd',expectedSha256:'a'.repeat(64)},captureRelation:{parentId:'expired-parent'},captureRelations:[{attemptId:'old'}],outputBudgetBytes:1,outputBudgetMs:1},
+   budget:{deadlineUnixMs:1},stages:['l0','l1','linker'].map((key,i)=>({key,durationSeconds:[15,90,15][i],attempts:[{sessionId:'old-child'}]})) }
+ const before=structuredClone(old)
+ const request=newCaptureFromGroup(old)
+ assert.deepEqual(request.durations,[15,90,15]);assert.equal(request.separate,true)
+ assert.equal(request.base.captureRelation,undefined);assert.equal(request.base.captureRelations,undefined)
+ assert.equal(request.base.outputBudgetMs,undefined);assert.equal(request.base.outputBudgetBytes,undefined)
+ assert.deepEqual(request.base.sessionBudget,old.base.sessionBudget)
+ request.base.runtimePaths.root='/other';assert.deepEqual(old,before)
+ assert.equal(newCaptureFromGroup({...old,unified:true}).separate,false)
+})
+test('restart refuses missing observation windows before allocating a parent', () => {
+ assert.throws(()=>newCaptureFromGroup({base:{},stages:[],serial:'usb',package:'com.immomo.momo'}),/阶段窗口/)
+})
+
+test('operation errors remain with their row while late completions cannot replace a newer global error', () => {
+ const view=readFileSync(new URL('../src/views/AndroidRuntimeMonitorView.vue',import.meta.url),'utf8')
+ const functions=view.slice(view.indexOf('function beginOperation('),view.indexOf("const probeError = ref('')"))
+ const compiled=ts.transpileModule(functions,{compilerOptions:{target:ts.ScriptTarget.ES2022}}).outputText
+ const make=new Function('readableError',`const operationTickets=new Map(); const operationErrors={}; let operationRevision=0; ${compiled}; return {beginOperation,failOperation,operationErrors}`)
+ const tracker=make(String)
+ const old=tracker.beginOperation('cancel:old-parent')
+ const fresh=tracker.beginOperation('start')
+ assert.equal(tracker.failOperation('cancel:old-parent',old,'old error'),false)
+ assert.equal(tracker.operationErrors['cancel:old-parent'],'old error')
+ assert.equal(tracker.failOperation('start',fresh,'new error'),true)
+ const newer=tracker.beginOperation('start')
+ assert.equal(tracker.failOperation('start',fresh,'late error'),false)
+ assert.equal(tracker.operationErrors.start,'')
+ assert.equal(tracker.failOperation('start',newer,'current error'),true)
+})
+
+test('changing parent or leaving the feature invalidates global errors while preserving their source row', () => {
+ const view=readFileSync(new URL('../src/views/AndroidRuntimeMonitorView.vue',import.meta.url),'utf8')
+ const watchLine=view.split('\n').find(line=>line.includes('operationRevision += 1'))
+ assert.ok(watchLine.includes('props.active'))
+ assert.ok(watchLine.includes('selectedCaptureGroup.value'))
+ const functions=view.slice(view.indexOf('function beginOperation('),view.indexOf("const probeError = ref('')"))
+ const compiled=ts.transpileModule(functions+'\n'+watchLine,{compilerOptions:{target:ts.ScriptTarget.ES2022}}).outputText
+ let invalidate
+ const make=new Function('readableError','watch','props','workspaceMode','selectedPackage','selectedCaptureGroup',`const operationTickets=new Map(); const operationErrors={}; let operationRevision=0; ${compiled}; return {beginOperation,failOperation,operationErrors}`)
+ const tracker=make(String,(_source,changed)=>{invalidate=changed},{active:true,device:{serial:'usb'}},{value:'evidence'},{value:'com.immomo.momo'},{value:'old-parent'})
+ for(const key of ['cancel:old-parent','pull:old-parent']) {
+  const ticket=tracker.beginOperation(key);invalidate()
+  assert.equal(tracker.failOperation(key,ticket,'retained error'),false)
+  assert.equal(tracker.operationErrors[key],'retained error')
+ }
+})
