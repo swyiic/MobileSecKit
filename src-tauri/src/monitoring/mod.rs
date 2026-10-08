@@ -2399,6 +2399,7 @@ async fn dump_kernsight_package_scoped(
     relation: Option<capture_groups::Relation>,
     scope: Option<&KernSightCaptureRequest>,
 ) -> Result<KernSightCaptureResult, String> {
+    let preflight_started = std::time::Instant::now();
     let paths = scope.and_then(|s| s.runtime_paths.as_ref());
     require_runtime_paths(&serial, paths).await?;
     validate_serial(&serial)?;
@@ -2480,7 +2481,13 @@ async fn dump_kernsight_package_scoped(
         if let (Some(n), Some(t)) = (s.output_budget_bytes, s.output_budget_ms) {
             dump.push_str(&format!(
                 " --output-budget-bytes {n} --output-budget-ms {}",
-                session_deadline::remaining_ms(t)?
+                dump_policy::producer_time_ms(
+                    session_deadline::remaining_ms(t)?,
+                    preflight_started
+                        .elapsed()
+                        .as_millis()
+                        .min(u64::MAX as u128) as u64,
+                )?
             ));
         }
     }

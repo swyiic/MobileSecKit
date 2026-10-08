@@ -26,6 +26,18 @@ pub(super) fn dump_launch_flag(
     })
 }
 
+/// Charge preflight to the original grant and leave time for producer return and
+/// the remote lifecycle observation. Exhaustion refuses launch; it never renews.
+pub(super) fn producer_time_ms(grant_ms: u64, preflight_ms: u64) -> Result<u64, String> {
+    grant_ms
+        .checked_sub(preflight_ms)
+        .and_then(|remaining| remaining.checked_sub(10_000))
+        .filter(|remaining| *remaining > 0)
+        .ok_or_else(|| {
+            "phase_time_holdback_exhausted: Dump preflight/terminal reserve; not started".into()
+        })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -57,6 +69,17 @@ mod tests {
         assert_eq!(dump_launch_flag(true, false, false).unwrap(), " --launch");
         assert_eq!(dump_launch_flag(false, false, false).unwrap(), " --launch");
         assert_eq!(dump_launch_flag(false, false, true).unwrap(), " --launch");
+    }
+
+    #[test]
+    fn producer_grant_charges_preflight_and_preserves_terminal_reserve() {
+        assert_eq!(producer_time_ms(95_000, 2_000).unwrap(), 83_000);
+        // Real UI Dump ran 63.042s: the old 55s lease must still fail;
+        // a new 95s lease admits that duration before its original boundary.
+        assert!(producer_time_ms(95_000, 2_000).unwrap() > 63_042);
+        for elapsed in [85_000, 95_000, u64::MAX] {
+            assert!(producer_time_ms(95_000, elapsed).is_err());
+        }
     }
 
     #[test]
