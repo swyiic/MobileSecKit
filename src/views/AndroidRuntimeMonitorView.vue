@@ -581,7 +581,7 @@ const aiCopied = ref(false)
 const workspaceMode = ref<'evidence' | 'capture'>('evidence')
 const selectedPackage = ref('')
 const selectedEvidenceSource = ref<'local' | 'device'>('local')
-const { bundles: localEvidenceBundles, selectedRoots, bundleForPackage, selectBundle, upsertBundle, importDirectory, importArchive, requestedPackage } = useKernSightEvidence()
+const { bundles: localEvidenceBundles, refreshPresence, selectedRoots, bundleForPackage, selectBundle, upsertBundle, importDirectory, importArchive, requestedPackage } = useKernSightEvidence()
 const devicePackageNames = ref(new Set<string>())
 const importingLocal = ref(false)
 const pullingPackage = ref(false)
@@ -1551,12 +1551,15 @@ async function loadLocalCaptureGroups() {
   const request = localGroupsRequests.begin()
   localOwnershipConfirmed.value = false
   try {
-    const [groups, trash, purges] = await Promise.all([monitoringBackend.listKernSightGroups(), monitoringBackend.listKernSightGroupTrash(), monitoringBackend.listKernSightGroupPurges()])
+    const [groups, trash, purges, presenceErrors] = await Promise.all([monitoringBackend.listKernSightGroups(), monitoringBackend.listKernSightGroupTrash(), monitoringBackend.listKernSightGroupPurges(), refreshPresence(() => localGroupsRequests.isCurrent(request)).then(errors => {
+      if (localGroupsRequests.isCurrent(request) && sessionSourceRoot.value && !localEvidenceBundles.value.some(bundle => bundle.root === sessionSourceRoot.value)) clearCurrentSession()
+      return errors
+    })])
     if (!localGroupsRequests.isCurrent(request)) return
     captureGroups.value = groups
     captureGroupTrash.value = trash
     purgeReports.value = purges
-    purgeLoadError.value = ''
+    purgeLoadError.value = presenceErrors.length ? `部分导入来源状态未确认，保留显示：${presenceErrors.join('；')}` : ''
     localOwnershipConfirmed.value = true
     reconcileTrashedSelection()
   } catch (error) {
@@ -1565,6 +1568,7 @@ async function loadLocalCaptureGroups() {
 }
 
 function reconcileTrashedSelection() {
+  if (sessionSourceRoot.value && !localEvidenceBundles.value.some(bundle => bundle.root === sessionSourceRoot.value)) clearCurrentSession()
   if (trashedCaptureGroups.value.some(entry => entry.group.id === selectedCaptureGroup.value) && !visibleCaptureGroups.value.some(group => group.id === selectedCaptureGroup.value)) selectedCaptureGroup.value = ''
   const requested = sessionRequestedGroup.value
   const removedReport = trashedCaptureGroups.value.some(entry => sessionSourceRoot.value

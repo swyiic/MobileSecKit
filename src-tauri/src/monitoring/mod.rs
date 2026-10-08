@@ -2762,6 +2762,51 @@ pub async fn read_kernsight_package_file(
     })
 }
 
+/// Read-only presence refresh. Only NotFound proves absence; other IO errors stay unknown.
+#[tauri::command]
+pub fn local_kernsight_evidence_present(path: String) -> Result<bool, String> {
+    let root = PathBuf::from(path.trim());
+    if !root.is_absolute() {
+        return Err("本地证据路径必须为绝对路径".into());
+    }
+    match std::fs::metadata(&root) {
+        Ok(meta) if meta.is_dir() => {}
+        Ok(_) => return Err("本地证据路径不再是目录；状态未确认".into()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(e) => return Err(e.to_string()),
+    }
+    for name in [
+        "dump-report.json",
+        "bounded-code-report.json",
+        "session-report.json",
+    ] {
+        match std::fs::metadata(root.join(name)) {
+            Ok(meta) if meta.is_file() => return Ok(true),
+            Ok(_) => return Err("证据清单类型已改变；状态未确认".into()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e.to_string()),
+        }
+    }
+    Ok(false)
+}
+
+#[test]
+fn evidence_presence_refresh_distinguishes_missing_and_retained_reports() {
+    let root = std::env::temp_dir().join(format!("me-presence-{}", uuid::Uuid::new_v4()));
+    let path = root.to_string_lossy().into_owned();
+    assert!(!local_kernsight_evidence_present(path.clone()).unwrap());
+    std::fs::create_dir(&root).unwrap();
+    assert!(!local_kernsight_evidence_present(path.clone()).unwrap());
+    std::fs::write(root.join("bounded-code-report.json"), b"{}").unwrap();
+    assert!(local_kernsight_evidence_present(path.clone()).unwrap());
+    std::fs::remove_file(root.join("bounded-code-report.json")).unwrap();
+    std::fs::write(root.join("dump-report.json"), b"{}").unwrap();
+    assert!(local_kernsight_evidence_present(path).unwrap());
+    std::fs::remove_file(root.join("dump-report.json")).unwrap();
+    std::fs::remove_dir(root).unwrap();
+    assert!(local_kernsight_evidence_present("relative".into()).is_err());
+}
+
 #[tauri::command]
 pub async fn import_kernsight_evidence_directory(
     path: String,

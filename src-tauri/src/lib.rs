@@ -1124,6 +1124,7 @@ pub fn run() {
             monitoring::list_kernsight_package_dumps,
             monitoring::read_kernsight_package_file,
             monitoring::import_kernsight_evidence_directory,
+            monitoring::local_kernsight_evidence_present,
             monitoring::import_kernsight_evidence_archive,
             monitoring::export_kernsight_evidence_archive,
             monitoring::pull_kernsight_package_evidence,

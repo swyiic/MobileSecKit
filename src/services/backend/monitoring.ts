@@ -21,6 +21,7 @@ import type {
 } from '@/types/monitoring'
 
 export const monitoringBackend = {
+  localKernSightEvidencePresent: (path: string) => invoke<boolean>('local_kernsight_evidence_present', { path }),
   prepareKernSightGroupPurge: (parentId: string, importedRoots: string[], localOnly: boolean) => invoke<KernSightGroupPurgePlan>('prepare_kernsight_group_purge', { parentId, importedRoots, localOnly }),
   executeKernSightGroupPurge: (planId: string, confirmationToken: string) => invoke<KernSightGroupPurgeReport>('execute_kernsight_group_purge', { planId, confirmationToken }),
   listKernSightGroupPurges: () => invoke<KernSightGroupPurgeReport[]>('list_kernsight_group_purges'),

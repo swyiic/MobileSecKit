@@ -77,12 +77,25 @@ export function requestKernSightPackage(packageName: string) {
   requestedPackage.value = packageName
 }
 
+async function refreshPresence(stillCurrent: () => boolean): Promise<string[]> {
+  const snapshot = [...bundles.value]
+  const results = await Promise.allSettled(snapshot.map(bundle => monitoringBackend.localKernSightEvidencePresent(bundle.root)))
+  if (!stillCurrent()) return []
+  const absent = new Set(snapshot.filter((_, i) => results[i]?.status === 'fulfilled' && (results[i] as PromiseFulfilledResult<boolean>).value === false))
+  // A newly imported replacement must survive an older presence response.
+  bundles.value = bundles.value.filter(bundle => !absent.has(bundle))
+  const absentRoots = new Set([...absent].map(bundle => bundle.root))
+  selectedRoots.value = Object.fromEntries(Object.entries(selectedRoots.value).filter(([, root]) => !absentRoots.has(root) || bundles.value.some(bundle => bundle.root === root)))
+  return results.flatMap((result, i) => result.status === 'rejected' ? [`${snapshot[i]?.root}: ${String(result.reason)}`] : [])
+}
+
 export function useKernSightEvidence(packageName?: MaybeRef<string>) {
   const currentPackage = computed(() => unref(packageName) || '')
   const bundle = computed(() => currentPackage.value ? bundleForPackage(currentPackage.value) : null)
   const join = computed<KernSightAnalyzerJoin | null>(() => bundle.value ? buildKernSightAnalyzerJoin(bundle.value) : null)
   return {
     bundles,
+    refreshPresence,
     selectedRoots,
     bundleForPackage,
     selectBundle: selectKernSightBundle,
