@@ -3,6 +3,7 @@ use super::*;
 use std::sync::{Mutex, OnceLock};
 use tauri::Manager;
 
+mod coverage_continuation;
 mod diagnostics;
 pub mod purge;
 mod purge_device;
@@ -25,6 +26,10 @@ pub struct Relation {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Attempt {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub coverage_continuation: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_disposition: Option<String>,
     pub relation: Relation,
     pub owner_epoch: Uuid,
     pub state: String,
@@ -151,6 +156,7 @@ impl Group {
                         "cancelled",
                         "interrupted",
                         "unknown",
+                        "unavailable",
                     ]
                     .contains(&a.state.as_str())
                     || a.session_id
@@ -182,14 +188,14 @@ impl Group {
                 .is_some_and(|b| b.reservations.iter().any(|r| r.status == "partial"))
         {
             "succeeded"
-        } else if self
-            .stages
-            .iter()
-            .any(|s| s.attempts.last().is_some_and(|a| a.state == "partial"))
-            || self
-                .budget
-                .as_ref()
-                .is_some_and(|b| b.reservations.iter().any(|r| r.status == "partial"))
+        } else if self.stages.iter().any(|s| {
+            s.attempts
+                .last()
+                .is_some_and(|a| matches!(a.state.as_str(), "partial" | "unavailable"))
+        }) || self
+            .budget
+            .as_ref()
+            .is_some_and(|b| b.reservations.iter().any(|r| r.status == "partial"))
         {
             "partial"
         } else if self
@@ -301,7 +307,32 @@ impl Group {
                     s.launch_after_attach
                         && s.attempts.last().is_some_and(|a| a.state == "succeeded")
                 });
-            if !(self.quota_partial_closed(previous) && (independent || replaced)) {
+            let coverage = coverage_continuation::verified(self, previous);
+            let source_absent = previous.key == "dump"
+                && next.key == "linker"
+                && next.launch_after_attach
+                && previous.attempts.last().is_some_and(|a| {
+                    a.state == "unavailable"
+                        && a.source_disposition.as_deref() == Some(coverage_continuation::ABSENT)
+                        && a.session_id.is_none()
+                        && a.remote_artifact_root.is_none()
+                        && a.remote_lifecycle.is_none()
+                        && self.budget.as_ref().is_some_and(|b| {
+                            b.reservations.iter().any(|r| {
+                                r.id == a.relation.attempt_id.to_string()
+                                    && r.kind == "dump"
+                                    && r.status == "not_started"
+                                    && r.charged_bytes == Some(0)
+                            })
+                        })
+                })
+                && self.stages[..i]
+                    .last()
+                    .is_some_and(|s| coverage_continuation::verified(self, s));
+            if !(self.quota_partial_closed(previous) && (independent || replaced))
+                && !(coverage && (independent || (next.key == "dump" && i + 1 == index)))
+                && !source_absent
+            {
                 return Err("前置必需阶段未成功或依赖/清理未确认".into());
             }
         }
@@ -312,14 +343,22 @@ impl Group {
             return false;
         };
         !self.cancel_requested
-            && self.quota_partial_closed(&self.stages[index])
+            && (self.quota_partial_closed(&self.stages[index])
+                || coverage_continuation::verified(self, &self.stages[index])
+                || (self.stages[index].key == "dump"
+                    && self.stages[index].attempts.last().is_some_and(|a| {
+                        a.state == "unavailable"
+                            && a.source_disposition.as_deref()
+                                == Some(coverage_continuation::ABSENT)
+                    })))
             && self.budget.as_ref().is_some_and(|b| {
                 b.remaining() >= 262144 && b.deadline().is_ok_and(|d| d.check().is_ok())
             })
-            && self
-                .stages
-                .get(index + 1)
-                .is_some_and(|s| s.key != "dump" && s.launch_after_attach)
+            && self.stages.get(index + 1).is_some_and(|s| {
+                (s.key != "dump" && s.launch_after_attach)
+                    || (s.key == "dump"
+                        && coverage_continuation::verified(self, &self.stages[index]))
+            })
             && self.check_predecessors(index + 1).is_ok()
     }
     fn start(&mut self, key: &str, epoch: Uuid) -> Result<Relation, String> {
@@ -374,6 +413,8 @@ impl Group {
             error: None,
             diagnostic_tail: None,
             capture_diagnostic: None,
+            coverage_continuation: None,
+            source_disposition: None,
             remote_artifact_root: None,
             process_instances: vec![],
             observation_error: None,
@@ -671,6 +712,7 @@ pub fn cancel_kernsight_group(app: tauri::AppHandle, parent_id: Uuid) -> Result<
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct StageResult {
+    pub continuation_policy: Option<String>,
     pub group: Group,
     pub result: Option<KernSightCaptureResult>,
     pub error: Option<String>,
@@ -765,6 +807,7 @@ async fn run_group_stage_at(
         .as_ref()
         .ok_or("旧父会话deadline未知")?
         .deadline()?;
+    let mut dump_sources_absent = false;
     let run = deadline.run(async {
         let busy=run_device_root_script(&g.serial,r#"for p in $(pidof ksightd 2>/dev/null); do c=$(tr '\0' ' ' < /proc/$p/cmdline); case "$c" in *ksightd*\ capture*) echo capture_busy; exit 73;; esac; done"#).await?;
         if busy.code!=Some(0) {return Err("设备已有采集进程或状态未知；未启动/重试，不强杀其他会话".into());}
@@ -787,6 +830,11 @@ async fn run_group_stage_at(
         if stage.key == "dump" {
             let previous=g.stages[..g.stages.iter().position(|s|s.key=="dump").unwrap_or(0)].iter().rev().find_map(|s|s.attempts.last().and_then(|a|a.remote_lifecycle.as_ref()));
             request.expected_code_sources=Some(super::qualified_dump_sources(previous,&g.package)?);
+            if g.stages.iter().find(|s| s.key == "l1").is_some_and(|s| coverage_continuation::verified(&g,s))
+                && coverage_continuation::sources_absent(&g.serial,request.expected_code_sources.as_ref().unwrap()).await? {
+                deadline.check()?; dump_sources_absent = true;
+                return Err(coverage_continuation::ABSENT.to_owned());
+            }
             dump_kernsight_package_scoped(
                 g.serial.clone(),
                 g.package.clone(),
@@ -816,11 +864,11 @@ async fn run_group_stage_at(
         }
         Err(e) => (None, Some(e), None),
     };
+    let mut continuation_phase_safe = true;
     if let Some(b) = g.budget.as_ref() {
-        merge_phase_failure(
-            &mut error,
-            b.check_time_phase(&stage.key, now_millis()).err(),
-        );
+        let phase_failure = b.check_time_phase(&stage.key, now_millis()).err();
+        continuation_phase_safe &= phase_failure.is_none();
+        merge_phase_failure(&mut error, phase_failure);
     }
     let remote_lifecycle =
         if result.is_some() || error.as_deref().is_some_and(session_deadline::is_stop) {
@@ -850,6 +898,16 @@ async fn run_group_stage_at(
     {
         error = Some("remote_collection_partial：producer已返回，采集partial，原件保留".into());
     }
+    let coverage_proof =
+        if let (Some(result), Some(note)) = (result.as_ref(), remote_lifecycle.as_ref()) {
+            deadline
+                .run(async { Ok(coverage_continuation::observe(&g, &r, result, note).await) })
+                .await
+                .ok()
+                .flatten()
+        } else {
+            None
+        };
     let (instances, observation_error) = if let Some(session) = session {
         match deadline
             .run(get_kernsight_session_report_scoped(
@@ -878,7 +936,7 @@ async fn run_group_stage_at(
         )
     };
     let paths = runtime_paths_from_group(Some(&g))?;
-    let artifact = if stage.key == "dump" {
+    let artifact = if stage.key == "dump" && !dump_sources_absent {
         Some(runtime_paths::route(
             paths.as_ref(),
             &format!(
@@ -893,6 +951,7 @@ async fn run_group_stage_at(
         let _guard = IO_LOCK.lock().map_err(|e| e.to_string())?;
         g = load(&root, parent_id)?;
         if let Err(stop) = deadline.check() {
+            continuation_phase_safe = false;
             if error.is_none() {
                 error = Some(stop);
             } else if !error.as_deref().is_some_and(session_deadline::is_stop) {
@@ -900,12 +959,27 @@ async fn run_group_stage_at(
             }
         }
         if let Some(b) = g.budget.as_ref() {
-            merge_phase_failure(
-                &mut error,
-                b.check_time_phase(&stage.key, now_millis()).err(),
-            );
+            let phase_failure = b.check_time_phase(&stage.key, now_millis()).err();
+            continuation_phase_safe &= phase_failure.is_none();
+            merge_phase_failure(&mut error, phase_failure);
         }
         g.finish(&r, session, artifact, error.clone())?;
+        if dump_sources_absent && continuation_phase_safe {
+            g.budget
+                .as_mut()
+                .ok_or("parent预算缺失")?
+                .release_stage_granted_before_capture(&r.attempt_id.to_string())?;
+            let a = g
+                .stages
+                .iter_mut()
+                .flat_map(|s| s.attempts.iter_mut())
+                .find(|a| a.relation == r)
+                .unwrap();
+            a.state = "unavailable".into();
+            a.source_disposition = Some(coverage_continuation::ABSENT.into());
+            a.error = Some("原 qualified sources 均已消失；Dump 未启动，不替换PID；保留partial并检查独立Linker".into());
+            g.refresh();
+        }
         mark_stopped_budget(&mut g, error.as_deref());
         if result.is_none()
             && error.as_deref().is_some_and(|e| {
@@ -925,9 +999,11 @@ async fn run_group_stage_at(
             {
                 let (note, phase_failure) =
                     b.phase_settlement_note(&stage.key, &note, now_millis());
+                continuation_phase_safe &= phase_failure.is_none();
                 merge_phase_failure(&mut error, phase_failure);
                 let settlement = b.settle(&r.attempt_id.to_string(), &note);
                 let settled = settlement.is_ok();
+                continuation_phase_safe &= settled;
                 if let Err(e) = settlement {
                     if let Some(a) = g
                         .stages
@@ -972,11 +1048,26 @@ async fn run_group_stage_at(
         attempt.process_instances = instances.into_iter().take(16).collect();
         attempt.observation_error = observation_error;
         attempt.remote_lifecycle = remote_lifecycle;
+        attempt.coverage_continuation =
+            coverage_continuation::authorize_phase(coverage_proof, continuation_phase_safe);
         retain_capture_diagnostic(attempt, result.as_ref());
         save(&root, &g)?;
     }
     let continue_after_partial = g.continue_after_partial(&stage_key);
+    let continuation_policy = if continue_after_partial
+        && stage_key == "l1"
+        && coverage_continuation::verified(
+            &g,
+            g.stages.iter().find(|s| s.key == stage_key).unwrap(),
+        ) {
+        Some("sealed_loss_only_snapshot".to_owned())
+    } else if continue_after_partial && dump_sources_absent {
+        Some("source_absent_independent_start".to_owned())
+    } else {
+        None
+    };
     Ok(StageResult {
+        continuation_policy,
         group: g,
         result,
         error,
@@ -1817,6 +1908,18 @@ pub(super) fn verify_session_relation(g: &Group, id: Uuid, note: &Value) -> Resu
     }
     Ok(())
 }
+pub(super) fn selected_for_save(root: &Path, id: Uuid) -> Result<Group, String> {
+    let _guard = IO_LOCK.lock().map_err(|e| e.to_string())?;
+    trash::ensure_not_trashed(root, id)?;
+    let g = load(root, id)?;
+    if g.stages
+        .iter()
+        .any(|s| s.attempts.last().is_some_and(|a| a.state == "running"))
+    {
+        return Err("采集尚活动，不能自动封装".into());
+    }
+    Ok(g)
+}
 pub fn export_root(g: &Group) -> Result<String, String> {
     g.stages
         .iter()
@@ -1956,6 +2059,8 @@ impl Group {
                 error: None,
                 diagnostic_tail: None,
                 capture_diagnostic: None,
+                coverage_continuation: None,
+                source_disposition: None,
                 remote_artifact_root: None,
                 process_instances: vec![],
                 observation_error: None,
@@ -2239,6 +2344,7 @@ pub async fn run_kernsight_unified_group(
         .then(|| "统一阶段未确认全部成功，未执行 dump".into())
     });
     Ok(StageResult {
+        continuation_policy: None,
         group: g,
         result,
         error,
@@ -2497,6 +2603,8 @@ mod source_relation_tests {
                     error: None,
                     diagnostic_tail: None,
                     capture_diagnostic: None,
+                    coverage_continuation: None,
+                    source_disposition: None,
                     remote_artifact_root: None,
                     process_instances: vec![],
                     observation_error: None,

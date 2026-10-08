@@ -25,8 +25,9 @@ export async function runCaptureGroupPlan(initial: KernSightCaptureGroup, backen
     const latest = group.stages.find(stage => stage.key === key)
     const state = latest?.attempts[latest.attempts.length - 1]?.state
     const next = group.stages[group.stages.findIndex(stage => stage.key === key) + 1]
-    const allowedPartial = key !== 'session' && state === 'partial' && reply.continueAfterPartial === true
-      && next?.key !== 'dump' && next?.launchAfterAttach === true
+    const allowedPartial = key !== 'session' && (state === 'partial' || state === 'unavailable') && reply.continueAfterPartial === true
+      && ((next?.key === 'dump' && reply.continuationPolicy === 'sealed_loss_only_snapshot')
+        || (next?.launchAfterAttach === true && (state !== 'unavailable' || reply.continuationPolicy === 'source_absent_independent_start')))
     if (reply.error && !allowedPartial) throw new Error(reply.error)
     if (key !== 'session' && state !== 'succeeded' && !allowedPartial) {
       throw new Error(`${captureStageLabel(key)}执行状态未确认成功，停止后续阶段并保留已返回证据`)
@@ -73,5 +74,5 @@ export function captureStageLabel(key: string): string {
   return ({ l0: 'L0 内核观察', l1: 'L1 TLS / JNI / Binder', dump: 'L2 代码快照', linker: 'Linker 加载观察', session: '统一阶段会话' } as Record<string, string>)[key] || key
 }
 export function captureStateLabel(state: string): string {
-  return ({ planned: '待执行', running: '采集中', succeeded: '执行结束', partial: '部分完成', failed: '采集失败', interrupted: '已中断', cancelled: '已取消', canceled: '已取消' } as Record<string, string>)[state] || state
+  return ({ planned: '待执行', running: '采集中', succeeded: '执行结束', partial: '部分完成', failed: '采集失败', interrupted: '已中断', unavailable: '来源不可用（未启动）', cancelled: '已取消', canceled: '已取消' } as Record<string, string>)[state] || state
 }

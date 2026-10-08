@@ -17,7 +17,7 @@ function harness(group, states = {}) {
       const state = options.state || 'succeeded'
       current.stages.find(stage => stage.key === key).attempts.push({ state, sessionId: key === 'dump' ? null : `session-${key}`, relation: { attemptId: `${key}-${calls.length}` } })
       if (options.cancel) current.cancelRequested = true
-      return { group: current, result: result(key, state === 'succeeded' ? 0 : 1), error: options.noError ? null : state === 'succeeded' ? null : `failed-${key}`, continueAfterPartial: options.continueAfterPartial }
+      return { group: current, result: result(key, state === 'succeeded' ? 0 : 1), error: options.noError ? null : state === 'succeeded' ? null : `failed-${key}`, continueAfterPartial: options.continueAfterPartial, continuationPolicy: options.continuationPolicy }
     },
     async runKernSightUnifiedGroup(id) {
       calls.push([id, 'session'])
@@ -135,3 +135,14 @@ test('even a mistaken continuation flag cannot run the snapshot after partial L1
   await assert.rejects(runCaptureGroupPlan(g, h.backend, h.hooks), /failed-l1/)
   assert.deepEqual(h.calls.map(call => call[1]), ['l0', 'l1'])
 })
+
+ test('typed sealed coverage partial reaches snapshot and independent Linker without upgrading state',async()=>{
+  const g=initial(false),h=harness(g,{l1:{state:'partial',continueAfterPartial:true,continuationPolicy:'sealed_loss_only_snapshot'}});
+  const done=await runCaptureGroupPlan(g,h.backend,h.hooks);
+  assert.deepEqual(h.calls.map(c=>c[1]),['l0','l1','dump','linker']);assert.equal(done.stages[1].attempts[0].state,'partial');
+ });
+ test('typed original source absence skips unavailable Dump and permits independent Linker',async()=>{
+  const g=initial(false),h=harness(g,{l1:{state:'partial',continueAfterPartial:true,continuationPolicy:'sealed_loss_only_snapshot'},dump:{state:'unavailable',continueAfterPartial:true,continuationPolicy:'source_absent_independent_start'}});
+  const done=await runCaptureGroupPlan(g,h.backend,h.hooks);
+  assert.deepEqual(h.calls.map(c=>c[1]),['l0','l1','dump','linker']);assert.equal(done.stages[2].attempts[0].state,'unavailable');
+ });

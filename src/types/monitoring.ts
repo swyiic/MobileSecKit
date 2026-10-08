@@ -437,6 +437,8 @@ export interface KernSightCaptureDiagnostic {
   structuredRecordOmitted: boolean
 }
 export interface KernSightCaptureAttempt {
+  coverageContinuation?: Record<string, unknown> | null
+  sourceDisposition?: string | null
   relation: KernSightCaptureRelation
   state: string
   startedUnixMs: number
@@ -459,7 +461,9 @@ export interface KernSightCaptureGroup {
   stages:Array<{id:string;key:string;mode:string;durationSeconds:number;launchAfterAttach:boolean;required:boolean;
     attempts:KernSightCaptureAttempt[]}>
 }
-export interface KernSightGroupStageResult {group:KernSightCaptureGroup;result:KernSightCaptureResult|null;error:string|null;continueAfterPartial?:boolean}
+export interface KernSightGroupStageResult {
+  continuationPolicy?: "sealed_loss_only_snapshot" | "source_absent_independent_start" | null
+  group:KernSightCaptureGroup;result:KernSightCaptureResult|null;error:string|null;continueAfterPartial?:boolean}
 
 export interface KernSightCaptureGroupTrash {
   schema: 'mobilee.capture-group-trash/v1'; group: KernSightCaptureGroup;

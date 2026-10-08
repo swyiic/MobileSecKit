@@ -1171,6 +1171,7 @@ pub fn run() {
             monitoring::export_kernsight_evidence_archive,
             monitoring::pull_kernsight_package_evidence,
             monitoring::pull_kernsight_package_archive,
+            monitoring::save_kernsight_group_evidence,
             monitoring::read_local_kernsight_evidence_file,
             monitoring::cleanup_kernsight_package_dump,
         ])

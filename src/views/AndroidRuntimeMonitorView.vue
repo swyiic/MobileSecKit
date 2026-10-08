@@ -242,7 +242,7 @@
           </article>
           <div class="ks-group-actions"><button v-if="captureGroups.some(item => item.id === group.id && item.serial === device?.serial) && !group.cancelRequested && runningCaptureGroup !== group.id && group.state!=='succeeded' && group.state!=='running'" class="ghost-button" :disabled="captureRunning || purgeExecuting" @click="restartCaptureGroup(group)">重新采集（新主会话）</button>
           <button v-if="!group.cancelRequested && (runningCaptureGroup === group.id || group.state === 'running') && captureGroups.some(item => item.id === group.id && item.serial === device?.serial)" class="ghost-button" @click="cancelCaptureGroup(group)">请求取消（当前阶段封存后停止）</button><span v-if="group.cancelRequested && runningCaptureGroup === group.id" class="ks-form-help" role="status">已请求取消，正在等待当前阶段封存</span>
-          <button v-if="group.stages.some(s=>s.key==='dump'&&['succeeded','partial','failed'].includes(s.attempts[s.attempts.length-1]?.state||'')) && captureGroups.some(g=>g.id===group.id && g.serial===device?.serial)" class="ghost-button" :disabled="pullingPackage || purgeExecuting" @click="pullCaptureGroup(group)">拉取本次主会话全部信息</button>
+          <button v-if="(group.stages.some(s=>s.attempts.some(a=>Boolean(a.sessionId))) || group.stages.some(s=>s.key==='dump'&&['succeeded','partial','failed'].includes(s.attempts[s.attempts.length-1]?.state||''))) && captureGroups.some(g=>g.id===group.id && g.serial===device?.serial)" class="ghost-button" :disabled="pullingPackage || purgeExecuting" @click="pullCaptureGroup(group)">拉取本次主会话全部信息</button>
           <template v-if="pendingTrashGroup === group.id">
             <p class="ks-trash-confirm">将此主会话及已打开的同次导入记录移入回收站？子会话归属与原始证据保留，可恢复；不会释放设备或本地空间。</p>
             <button class="ghost-button" :disabled="Boolean(changingTrashGroup)" @click="pendingTrashGroup = ''">取消移除</button>
@@ -1249,7 +1249,7 @@ const capturePolicyHint = computed(() => {
   if (captureForm.plan === 'auto' && !autoTimeAllocation.value?.valid) return autoTimeAllocation.value ? `总期限不足：至少 ${autoTimeAllocation.value.minimumSeconds}s，传输需至少 30s，未启动。请显式调整新父会话。` : '采集窗口或总期限无效，未启动。'
   if (!captureValid.value) return 'Inspect / Sched / Dump / 自动采集必须填写包名；时长 1–300 秒；父会话不支持额外密钥、私有存储、通用内存窗口或 Hide debug。'
   if (captureForm.plan === 'dump') return 'L2 dump --launch：force-stop 后由 dump 自己拉起 App，SIGSTOP 拷堆 DEX/SO/CE·DE。不是 eBPF 会话，不要同时挂 Inspect。'
-  if (captureForm.plan === 'auto' && captureForm.autoSessionMode === 'startup_replay') return '启动重采保留各能力自己的启动窗口：L0 → 重启 L1 → 该实例快照 → 重启 Linker。三个 session 不能冒充同一进程生命周期。已确认退出、清理和预算结算的额度 partial 可继续独立冷启动，父流程仍保留 partial；取消、清理未知或其它失败停止并保留已有证据。'
+  if (captureForm.plan === 'auto' && captureForm.autoSessionMode === 'startup_replay') return '启动重采保留各能力自己的启动窗口：L0 → 重启 L1 → 该实例快照 → 重启 Linker。三个 session 不能冒充同一进程生命周期。已确认排空、封存、身份和预算结算的仅丢样 partial 可继续快照，快照会重新核验原实例；原来源已消失时标为不可执行，再检查独立 Linker。缺证明、取消、清理未知或其它失败停止；已有证据仍尝试在原期限内保存，父流程保留 partial。'
   if (captureForm.plan === 'auto') return `统一 session：首次冷启动 → L0 ${captureForm.autoL0Seconds}s → L0+L1 ${captureForm.autoL1Seconds}s → Linker ${captureForm.autoLinkerSeconds}s → 最终驻留快照。后续阶段不重启 App，主进程退出或代际变化则停止。界面显示计划等待，实际起止和失败由 agent 阶段记录核对。按业务顺序逐步操作；阶段成功不代表所有动态代码已覆盖。Memory all 仍是高流量选项。`
   if (captureForm.hideDebug) return 'Hide debug 会暂时断开 ADB；设备端 watchdog 在会话结束后恢复调试，MobileE 会等待重连。'
   if (captureForm.inspectMode === 'tls') return 'TLS Inspect 保留 bounded 明文 preview 与 SHA-256；AArch32 uprobe 在当前 GKI 可能返回 ENOTSUP。'
@@ -2011,7 +2011,22 @@ async function executeCaptureGroup(group: KernSightCaptureGroup) {
         autoStageReceipts.value.push({ stage: { key: key as AutoStageReceipt['stage']['key'], label: captureStageLabel(key), launchAfterAttach: stage?.launchAfterAttach || false, durationSeconds: stage?.durationSeconds }, result, succeeded: key === 'session' ? current.stages.filter(item => item.key !== 'dump').every(item => item.attempts[item.attempts.length - 1]?.state === 'succeeded') : stage?.attempts[stage.attempts.length - 1]?.state === 'succeeded' })
       },
     })
-  } finally { runningCaptureGroup.value = '' }
+  } finally {
+    const current = captureGroups.value.find(item=>item.id===group.id)
+    if (current && current.stages.some(stage=>stage.attempts.some(attempt=>Boolean(attempt.sessionId)))
+        && !current.stages.some(stage=>stage.attempts[stage.attempts.length-1]?.state==='running')) {
+      capturePhase.value='保存已有证据并归档导入'
+      try {
+        const bundle=await monitoringBackend.saveKernSightGroupEvidence(group.id)
+        upsertBundle(bundle)
+        evidenceMessage.value=`本次主会话已保存：${bundle.root}；覆盖按原 partial/未知记录核对`
+      } catch(error) {
+        operationErrors[`save:${group.id}`]=readableError(error)
+        evidenceError.value=`已有源证据保留；自动保存未完成：${readableError(error)}`
+      }
+    }
+    runningCaptureGroup.value = ''
+  }
 }
 async function restartCaptureGroup(group: KernSightCaptureGroup) {
   if (captureRunning.value || purgeExecuting.value || props.device?.serial !== group.serial) return

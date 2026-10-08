@@ -4052,6 +4052,30 @@ async fn pull_kernsight_package_evidence_with_plan(
 }
 
 #[tauri::command]
+pub async fn save_kernsight_group_evidence(
+    app: tauri::AppHandle,
+    parent_id: Uuid,
+) -> Result<KernSightLocalEvidenceBundle, String> {
+    use tauri::Manager;
+    let groups = capture_groups::root(&app)?;
+    let g = capture_groups::selected_for_save(&groups, parent_id)?;
+    let output = app
+        .path()
+        .app_data_dir()
+        .map_err(|e| e.to_string())?
+        .join("kernsight-evidence")
+        .join(format!("{}-{}.mee", parent_id, Uuid::new_v4()));
+    pull_kernsight_package_archive_at(
+        Some(groups),
+        Some(parent_id),
+        g.serial,
+        g.package,
+        output.to_string_lossy().into_owned(),
+    )
+    .await
+}
+
+#[tauri::command]
 pub async fn pull_kernsight_package_archive(
     app: tauri::AppHandle,
     parent_id: Option<Uuid>,
@@ -4079,10 +4103,17 @@ async fn pull_kernsight_package_archive_at(
             )
         })
         .transpose()?;
-    let remote = group
+    let runtime_only = group
         .as_ref()
-        .map(capture_groups::export_root)
-        .transpose()?;
+        .is_some_and(|g| capture_groups::export_root(g).is_err() && !g.session_ids().is_empty());
+    let remote = if runtime_only {
+        None
+    } else {
+        group
+            .as_ref()
+            .map(capture_groups::export_root)
+            .transpose()?
+    };
     let output = PathBuf::from(output_path.trim());
     if !output.is_absolute() {
         return Err("MobileE 证据包输出文件必须是绝对路径".into());
@@ -4157,16 +4188,31 @@ async fn pull_kernsight_package_archive_at(
     let payload_limit = allocations
         .as_ref()
         .map(|a| planned_transfer_payload_limit(a.0, a.1, a.2));
-    let bundle = pull_kernsight_package_evidence_with_plan(
-        serial.clone(),
-        package.clone(),
-        staging.to_string_lossy().into_owned(),
-        remote,
-        runtime_paths_from_group(group.as_ref())?.as_ref(),
-        BTreeMap::new(),
-        payload_limit,
-    )
-    .await;
+    let bundle = if runtime_only {
+        async {
+        let root = staging.join(&package);
+        std::fs::create_dir_all(&root).map_err(|e| e.to_string())?;
+        let g = group.as_ref().ok_or("runtime来源parent缺失")?;
+        session_budget::write_json(root.join("dump-report.json"), &serde_json::json!({
+            "schema_version":"mobilee.retained-runtime-analysis/v1", "package":package,
+            "dump_id":null,"source_parent_id":g.id,"collection_status":"partial","artifacts":[],
+            "warnings":["ME adapter for retained runtime sessions only; no package dump was produced; missing DEX/SO coverage remains unknown"],
+            "dump_stage_state":g.stages.iter().find(|s|s.key=="dump").and_then(|s|s.attempts.last()).map(|a|a.state.as_str()).unwrap_or("not_started")
+        })).map_err(|e|e.to_string())?;
+        import_kernsight_evidence_directory(root.to_string_lossy().into_owned()).await
+    }.await
+    } else {
+        pull_kernsight_package_evidence_with_plan(
+            serial.clone(),
+            package.clone(),
+            staging.to_string_lossy().into_owned(),
+            remote,
+            runtime_paths_from_group(group.as_ref())?.as_ref(),
+            BTreeMap::new(),
+            payload_limit,
+        )
+        .await
+    };
     let bundle = match bundle {
         Ok(bundle) => bundle,
         Err(error) => {
@@ -4202,18 +4248,29 @@ async fn pull_kernsight_package_archive_at(
             return Err(error);
         }
     };
-    let session_result = timeout(
-        Duration::from_secs(120),
-        append_device_sessions_to_package_evidence(
-            &serial,
-            &package,
-            Path::new(&bundle.root),
-            group.as_ref(),
-        ),
-    )
-    .await;
+    let retained_limit = if runtime_only {
+        runtime_retained_json_limit(allocations.as_ref())
+    } else {
+        RETAINED_SESSION_JSON_LIMIT
+    };
+    let session_result = match session_budget::remaining_ms(Path::new(&bundle.root), 120000) {
+        Ok(session_ms) => {
+            timeout(
+                Duration::from_millis(session_ms),
+                append_device_sessions_to_package_evidence_with_limit(
+                    &serial,
+                    &package,
+                    Path::new(&bundle.root),
+                    group.as_ref(),
+                    retained_limit,
+                ),
+            )
+            .await
+        }
+        Err(error) => Ok(Err(error.to_string())),
+    };
     let mut session_error = match session_result {
-        Err(_) => Some("关联会话处理超过120秒".to_owned()),
+        Err(_) => Some("关联会话处理超过原transfer剩余期限，未续期".to_owned()),
         Ok(Err(error)) => Some(error),
         Ok(Ok(())) => transfer_guard.as_ref().and_then(|_| {
             session_budget::remaining_ms(Path::new(&bundle.root), u64::MAX)
@@ -4452,11 +4509,34 @@ fn retain_session_document_bytes(used: &mut u64, bytes: u64, limit: u64) -> Resu
     Ok(())
 }
 
+fn runtime_retained_json_limit(allocations: Option<&(u64, u64, u64, u64)>) -> u64 {
+    allocations
+        .map(|a| a.0.min(a.1).min(a.2).saturating_sub(65536))
+        .unwrap_or(RETAINED_SESSION_JSON_LIMIT)
+        .min(128 * 1024 * 1024)
+}
+#[cfg(test)]
 async fn append_device_sessions_to_package_evidence(
     serial: &str,
     package: &str,
     evidence_root: &Path,
     group: Option<&capture_groups::Group>,
+) -> Result<(), String> {
+    append_device_sessions_to_package_evidence_with_limit(
+        serial,
+        package,
+        evidence_root,
+        group,
+        RETAINED_SESSION_JSON_LIMIT,
+    )
+    .await
+}
+async fn append_device_sessions_to_package_evidence_with_limit(
+    serial: &str,
+    package: &str,
+    evidence_root: &Path,
+    group: Option<&capture_groups::Group>,
+    retained_limit: u64,
 ) -> Result<(), String> {
     let Some(group) = group else {
         session_budget::write(evidence_root.join("session-index.json"),serde_json::to_vec_pretty(&serde_json::json!({"schemaVersion":"mobilee.kernsight-package-sessions/v2","scope":"legacy-parent-unknown","includedSessions":[],"warning":"无父会话依据，未按包名推测或回放设备历史会话"})).map_err(|e|e.to_string())?).map_err(|e|e.to_string())?;
@@ -4477,7 +4557,7 @@ async fn append_device_sessions_to_package_evidence(
     retain_session_document_bytes(
         &mut retained_session_bytes,
         group_bytes,
-        RETAINED_SESSION_JSON_LIMIT - RETAINED_SESSION_METADATA_RESERVE,
+        retained_limit.saturating_sub(RETAINED_SESSION_METADATA_RESERVE),
     )?;
     session_budget::write_json(evidence_root.join("capture-group.json"), group)
         .map_err(|e| e.to_string())?;
@@ -4497,16 +4577,23 @@ async fn append_device_sessions_to_package_evidence(
     let mut matched_ids = Vec::new();
     let mut failures = Vec::new();
     for session_id in selected_ids.iter().copied() {
+        session_budget::remaining_ms(evidence_root, 120000).map_err(|e| e.to_string())?;
         let remote = runtime_paths::route(
             paths.as_ref(),
             &format!("{KSIGHT_SPOOL}/{session_id}/capture-relation.json"),
         )?;
         let relation_result = async {
-            let result = run_device_root_script(
-                serial,
-                &format!("head -c 32769 {}", crate::shell_quote(&remote)),
+            let ms =
+                session_budget::remaining_ms(evidence_root, 120000).map_err(|e| e.to_string())?;
+            let result = timeout(
+                Duration::from_millis(ms),
+                run_device_root_script(
+                    serial,
+                    &format!("head -c 32769 {}", crate::shell_quote(&remote)),
+                ),
             )
-            .await?;
+            .await
+            .map_err(|_| "原transfer期限耗尽；未延长关联读取".to_owned())??;
             if result.code != Some(0) || result.stdout.len() > 32768 {
                 return Err("session 原始关联缺失/读取超预算，未回放".to_owned());
             }
@@ -4590,7 +4677,7 @@ async fn append_device_sessions_to_package_evidence(
         if let Err(error) = retain_session_document_bytes(
             &mut retained_session_bytes,
             document_bytes,
-            RETAINED_SESSION_JSON_LIMIT - RETAINED_SESSION_METADATA_RESERVE,
+            retained_limit.saturating_sub(RETAINED_SESSION_METADATA_RESERVE),
         ) {
             failures.push(serde_json::json!({"sessionId":session_id,"error":error,"sourceStatus":"complete original spool remains at source; no partial JSON written"}));
             continue;
@@ -4662,8 +4749,7 @@ async fn append_device_sessions_to_package_evidence(
         "failures": failures,
         "scope": "仅本主会话明确引用的子 session/attempt；不按包名混入其他轮次",
     });
-    aggregate_value["mobilee_retained_session_json_limit"] =
-        serde_json::json!(RETAINED_SESSION_JSON_LIMIT);
+    aggregate_value["mobilee_retained_session_json_limit"] = serde_json::json!(retained_limit);
     aggregate_value["mobilee_retained_session_group_and_child_bytes"] =
         serde_json::json!(retained_session_bytes);
     let capture_text = format!(
@@ -4682,11 +4768,7 @@ async fn append_device_sessions_to_package_evidence(
         .checked_add(index_bytes)
         .and_then(|n| n.checked_add(capture_text.len() as u64))
         .ok_or("retained session metadata byte overflow")?;
-    retain_session_document_bytes(
-        &mut retained_session_bytes,
-        metadata_bytes,
-        RETAINED_SESSION_JSON_LIMIT,
-    )?;
+    retain_session_document_bytes(&mut retained_session_bytes, metadata_bytes, retained_limit)?;
     session_budget::write_json(evidence_root.join("session-report.json"), &aggregate_value)
         .map_err(|e| format!("无法保存汇总 Session 报告：{e}"))?;
     session_budget::write_json(evidence_root.join("session-index.json"), &index)
