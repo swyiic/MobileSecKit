@@ -4248,11 +4248,12 @@ async fn pull_kernsight_package_archive_at(
             return Err(error);
         }
     };
-    let retained_limit = if runtime_only {
-        runtime_retained_json_limit(allocations.as_ref())
-    } else {
-        RETAINED_SESSION_JSON_LIMIT
-    };
+    let retained_limit =
+        if runtime_only || group.as_ref().is_some_and(|g| !g.session_ids().is_empty()) {
+            runtime_retained_json_limit(allocations.as_ref())
+        } else {
+            RETAINED_SESSION_JSON_LIMIT
+        };
     let session_result = match session_budget::remaining_ms(Path::new(&bundle.root), 120000) {
         Ok(session_ms) => {
             timeout(
