@@ -4,14 +4,14 @@
     <dl class="ks-purge-identity"><dt>父会话 ID</dt><dd>{{ target.parentId }}</dd><dt>设备序列号</dt><dd>{{ target.serial }}</dd><dt>目标包</dt><dd>{{ target.package }}</dd></dl>
     <p class="ks-purge-warning">是否永久删除此主会话在本机和配对手机上的所属证据？删除无法恢复，不进入回收站。系统自动核对范围；共享文件与其他会话不纳入删除。</p>
     <p v-if="resumeAuthorized" class="ks-purge-warning">此清理已确认；继续仅处理原授权清单的剩余路径，不扩展范围。</p>
-    <div class="ks-purge-confirm"><button class="ghost-button danger-button" :disabled="!canExecute" :title="blockedReason || '确认永久删除该会话本地与手机所属证据'" aria-describedby="ks-purge-block-reason" @click="execute">{{ executing ? '正在清理并核验…' : preparing ? '正在核对，完成后可确认' : resumeAuthorized ? '继续已确认清理' : '是，永久删除本地与手机' }}</button><button class="ghost-button" :disabled="executing" @click="close">否</button></div>
+    <div class="ks-purge-confirm"><button class="ghost-button danger-button" :disabled="!canStartConfirmation" :title="blockedReason || '确认永久删除该会话本地与手机所属证据'" aria-describedby="ks-purge-block-reason" @click="execute">{{ executing ? '正在清理并核验…' : confirming ? '正在核对并确认…' : preparing ? '正在核对，完成后可确认' : resumeAuthorized ? '继续已确认清理' : '是，永久删除本地与手机' }}</button><button class="ghost-button" :disabled="executing" @click="close">否</button></div>
     <button v-if="preparing || executing" class="ghost-button" :disabled="cancelling" @click="stopCurrent">{{ cancelling ? '正在停止并核对…' : executing ? '停止清理并保留记录' : '取消范围核对' }}</button>
     <p v-if="blockedReason" id="ks-purge-block-reason" class="ks-purge-error" role="status" data-testid="purge-block-reason">{{ blockedReason }}</p>
     <button class="ghost-button" :disabled="preparing || executing || cancelling || busy || !active" @click="prepare">{{ preparing ? '正在核对…' : '重新核对并重试' }}</button>
     <div v-if="error" class="ks-purge-error" role="alert"><p>{{ error }}</p><details><summary>可复制错误详情</summary><textarea readonly :value="error" aria-label="清理错误详情" /></details></div>
     <div v-if="plan" class="ks-purge-preview" data-testid="purge-preview">
       <p v-if="!resumeAuthorized">预览时间 {{ formatTime(plan.createdUnixMs) }} · 失效时间 {{ formatTime(plan.expiresUnixMs) }}（5 分钟内有效）</p>
-      <p v-if="expired && !resumeAuthorized" class="ks-purge-error" role="alert">预览已失效。请重新核对范围，之前的确认已作废。</p>
+      <p v-if="expired && !resumeAuthorized" class="ks-purge-error" role="alert">预览已失效。点击“是”将自动重新核对范围，通过后执行本次确认。</p>
       <p><strong>本地：{{ plan.localEntries.length }} 条精确路径 · {{ countFiles(plan.localEntries) }} 个文件</strong></p>
       <details><summary>查看系统核验的路径</summary><ul class="ks-purge-paths"><li v-for="entry in plan.localEntries" :key="entry.path"><code>{{ entry.path }}</code><span>{{ entry.kind }} · {{ entry.files }} 文件 · 逻辑大小 {{ bytes(entry.logicalBytes) }} · 实际分配 {{ bytes(entry.allocatedBytes) }}</span></li></ul></details>
       <p v-if="!plan.localEntries.length">本次没有待删除的本地路径。</p>
@@ -38,6 +38,8 @@ const plan = shallowRef<KernSightGroupPurgePlan | null>(null)
 const failedPlanId = ref('')
 const preparing = ref(false)
 const executing = ref(false)
+const confirming = ref(false)
+let confirmationIntent = 0
 const error = ref('')
 const cancelling = ref(false)
 const resumeAuthorized = ref(false)
@@ -63,6 +65,8 @@ const blockedReason = computed(() => {
 })
 const canExecute = computed(() => props.active && !props.busy && !preparing.value && !executing.value && !cancelling.value
   && (resumeAuthorized.value ? Boolean(plan.value && purgePlanMatches(plan.value, props.target)) : canConfirmPurge(plan.value, props.target, now.value)))
+const canStartConfirmation = computed(() => props.active && !props.busy && !preparing.value && !executing.value && !cancelling.value && !confirming.value
+  && (canExecute.value || !plan.value || expired.value))
 const warnings = computed(() => [...new Set([...(plan.value?.warnings || []), ...(plan.value?.device?.warnings || [])])])
 const deviceLabel = computed(() => ({ ready: '范围已核验', offline: '离线 / 不可达', blocked: '范围核验被阻止', not_required: '无待清理路径' })[plan.value?.device?.status || 'offline'])
 const formatTime = (value: number) => new Date(value).toLocaleString()
@@ -74,10 +78,11 @@ function invalidatePlan() {
   preparing.value = false
   error.value = ''
 }
-function close() { if (executing.value || cancelling.value) return; void preparation?.cancel('user').catch(() => {}); invalidatePlan(); emit('close') }
+function close() { if (executing.value || cancelling.value) return; confirmationIntent++; void preparation?.cancel('user').catch(() => {}); invalidatePlan(); emit('close') }
 watch(() => purgeTargetKey(props.target), () => {
   // The parent may persist retryPlanId while reconciling this same owned execution.
   if (executing.value && plan.value && purgePlanMatches(plan.value, props.target)) return
+  confirmationIntent++
   invalidatePlan()
   failedPlanId.value = ''
   resumeAuthorized.value = false
@@ -87,6 +92,7 @@ watch(() => purgeTargetKey(props.target), () => {
 watch(() => [props.active, props.busy] as const, ([active, busy]) => {
   if (executing.value) return
   if (!active || busy) {
+    confirmationIntent++
     // Invalidate an in-flight preview without silently dismissing its confirmation.
     gate.invalidate()
     plan.value = null
@@ -163,6 +169,7 @@ async function cancelExecution(planId: string): Promise<KernSightGroupPurgeRepor
 }
 async function stopCurrent() {
   if (cancelling.value || (!preparation && !execution)) return
+  confirmationIntent++
   cancelling.value = true
   try {
     if (execution) await execution.cancel('user')
@@ -171,6 +178,18 @@ async function stopCurrent() {
   finally { if (mounted) cancelling.value = false }
 }
 async function execute() {
+  if (!canStartConfirmation.value) return
+  const intent = ++confirmationIntent
+  const targetKey = purgeTargetKey(props.target)
+  confirming.value = true
+  try {
+    now.value = Date.now()
+    if (!canExecute.value) await prepare()
+    if (!mounted || intent !== confirmationIntent || targetKey !== purgeTargetKey(props.target)) return
+    await executeVerifiedPlan()
+  } finally { confirming.value = false }
+}
+async function executeVerifiedPlan() {
   now.value = Date.now()
   if (!canExecute.value || !plan.value || !gate.startExecution()) return
   const approvedPlan = plan.value
@@ -211,6 +230,7 @@ async function execute() {
   }
 }
 onBeforeUnmount(() => {
+  confirmationIntent++
   mounted = false
   gate.invalidate()
   clearInterval(clock)
