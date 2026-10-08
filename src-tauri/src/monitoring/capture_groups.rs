@@ -1234,6 +1234,35 @@ mod tests {
         assert_eq!(g.state, "partial");
     }
     #[test]
+    fn local_window_exclusion_is_bounded_and_parent_stays_partial() {
+        let mut g = coverage_partial_dump_group();
+        let note = g.stages[2].attempts[0].remote_lifecycle.as_mut().unwrap();
+        note["dump_coverage"]["excluded_local_window_ranges"] = serde_json::json!(1);
+        note["dump_coverage"]["excluded_local_window_bytes"] = serde_json::json!(786432);
+        note["dump_coverage"]["excluded_scope"] =
+            serde_json::json!("local_copy_window_only; not admitted code coverage");
+        assert!(g.continue_after_partial("dump"));
+        for (field, value) in [
+            ("excluded_local_window_ranges", serde_json::json!(2)),
+            ("excluded_local_window_ranges", Value::Null),
+            (
+                "excluded_local_window_bytes",
+                serde_json::json!(134217729u64),
+            ),
+            ("excluded_scope", serde_json::json!("unknown")),
+        ] {
+            let mut bad = g.clone();
+            bad.stages[2].attempts[0].remote_lifecycle.as_mut().unwrap()["dump_coverage"][field] =
+                value;
+            assert!(!bad.continue_after_partial("dump"));
+            assert!(bad.start("linker", epoch()).is_err());
+        }
+        let r = g.start("linker", epoch()).unwrap();
+        g.finish(&r, Some(Uuid::new_v4()), None, None).unwrap();
+        assert_eq!(g.state, "partial");
+        assert_eq!(g.stages[2].attempts[0].state, "partial");
+    }
+    #[test]
     fn coverage_partial_dump_refuses_missing_unknown_or_unsafe_proof() {
         for (field, value) in [
             ("classification", serde_json::json!("unknown")),
@@ -2486,6 +2515,13 @@ fn dump_coverage_verified(note: &Value, package: &str) -> bool {
             .as_u64()
             .is_some_and(|n| (1..=16).contains(&n))
         && p["admitted_ranges"].as_u64().is_some_and(|n| n > 0)
+        && p.get("excluded_local_window_ranges")
+            .is_none_or(|v| v.as_u64().is_some_and(|n| n <= 1))
+        && (p["excluded_local_window_ranges"] != 1
+            || (p["excluded_scope"] == "local_copy_window_only; not admitted code coverage"
+                && p["excluded_local_window_bytes"]
+                    .as_u64()
+                    .is_some_and(|n| n <= 128 * 1024 * 1024)))
         && p["catalog_bytes"]
             .as_u64()
             .is_some_and(|n| (1..=64 * 1024 * 1024).contains(&n))
