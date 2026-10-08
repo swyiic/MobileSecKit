@@ -722,7 +722,11 @@ fn evidence_script(path: &str) -> Result<String, String> {
         crate::shell_quote(path)
     ))
 }
-fn validate_evidence(group: &Group, root: &DeviceRoot) -> Result<(), String> {
+fn validate_evidence(
+    group: &Group,
+    root: &DeviceRoot,
+    proof: Option<&Value>,
+) -> Result<(), String> {
     let owner: Value = serde_json::from_str(
         root.evidence
             .get("capture-relation.json")
@@ -734,19 +738,30 @@ fn validate_evidence(group: &Group, root: &DeviceRoot) -> Result<(), String> {
     }
     if let Some(session) = root.session_id {
         verify_session_relation(group, session, &owner)?;
-        let manifest: Value = serde_json::from_str(
-            root.evidence
-                .get("session.json")
-                .ok_or("设备 spool 缺少 session.json")?,
-        )
-        .map_err(|_| "设备 session manifest 无效")?;
-        if manifest["session_id"] != session.to_string()
-            || !matches!(
-                manifest["state"].as_str(),
-                Some("completed" | "interrupted" | "rotated" | "storage_limited")
-            )
-        {
-            return Err("设备 session UUID/终态未知，清理已阻止".into());
+        let closed = || -> Result<(), String> {
+            let proof = proof.ok_or("未封存 session 缺少独立的新鲜 collector 退出证明")?;
+            validate_remote_lifecycle(proof, &root.relation)?;
+            let original = original_lifecycle(group, &root.relation)?;
+            if !remote_terminal_confirmed(proof) || proof["token"] != original["token"] {
+                return Err("未封存 session 的 collector 仍活动/退出证明 token 不匹配".into());
+            }
+            Ok(())
+        };
+        if let Some(text) = root.evidence.get("session.json") {
+            let manifest: Value =
+                serde_json::from_str(text).map_err(|_| "设备 session manifest 无效")?;
+            if manifest["session_id"] != session.to_string() {
+                return Err("设备 session UUID 与独占目录/归属不匹配".into());
+            }
+            match manifest["state"].as_str() {
+                Some("completed" | "interrupted" | "rotated" | "storage_limited") => {}
+                Some("running") => closed()?, // failed collector can exit before sealing
+                _ => return Err("设备 session state schema 未知".into()),
+            }
+        } else {
+            // Never invent a completed manifest. The exact retained spool UUID,
+            // matching capture-relation and fresh collector proof own this directory.
+            closed()?;
         }
     } else {
         let r = &root.relation;
@@ -878,7 +893,7 @@ where
             let data = checked_output(rpc(evidence_script(&path)?).await?, MAX_RECORD)?;
             root.evidence.insert(name.into(), data);
         }
-        validate_evidence(group, root)?;
+        validate_evidence(group, root, terminal_proofs.get(&root.relation.attempt_id))?;
         // Shared hard links and potential shared-object namespaces are retained.
         // Their owner/terminal metadata remains with them as evidence.
         let shared = root
@@ -1075,7 +1090,7 @@ pub(super) fn validate_snapshot(snapshot: &DeviceSnapshot) -> Result<(), String>
                 || root
                     .missing_owner_files
                     .iter()
-                    .any(|name| !root.evidence.contains_key(name)))
+                    .any(|name| !root.evidence.contains_key(name) && name != "session.json"))
         {
             return Err("缺失归属恢复没有独立原目录证明".into());
         }
@@ -1098,7 +1113,11 @@ pub(super) fn validate_snapshot(snapshot: &DeviceSnapshot) -> Result<(), String>
             }
         }
         if !root.evidence.is_empty() {
-            validate_evidence(&snapshot.group, root)?;
+            validate_evidence(
+                &snapshot.group,
+                root,
+                snapshot.terminal_proofs.get(&root.relation.attempt_id),
+            )?;
         }
     }
     Ok(())
@@ -1200,7 +1219,12 @@ printf 'MESCOPEEND\n'
         allow_missing_owner = if allow_missing_owner { 1 } else { 0 }
     ))
 }
-fn parse_directory_scope(group: &Group, root: &mut DeviceRoot, text: &str) -> Result<(), String> {
+fn parse_directory_scope(
+    group: &Group,
+    root: &mut DeviceRoot,
+    text: &str,
+    proof: Option<&Value>,
+) -> Result<(), String> {
     root.entries.clear();
     root.evidence.clear();
     root.missing_owner_files.clear();
@@ -1273,8 +1297,13 @@ fn parse_directory_scope(group: &Group, root: &mut DeviceRoot, text: &str) -> Re
             String::from_utf8(bytes).map_err(|_| "独占目录归属内容未知")?,
         );
     }
-    if root.missing_owner_files.is_empty() && !root.evidence.is_empty() {
-        validate_evidence(group, root)?;
+    if root.evidence.contains_key("capture-relation.json")
+        && root
+            .missing_owner_files
+            .iter()
+            .all(|name| name == "session.json")
+    {
+        validate_evidence(group, root, proof)?;
     }
     root.absent = false;
     Ok(())
@@ -1299,7 +1328,7 @@ where
             rpc(directory_scope_script(root, false)?).await?,
             3 * MAX_RECORD,
         )?;
-        parse_directory_scope(group, root, &text)?;
+        parse_directory_scope(group, root, &text, proofs.get(&root.relation.attempt_id))?;
     }
     let mut snapshot = snapshot(group, fingerprint, evidence, roots, proofs)?;
     snapshot.directory_scope = true;
@@ -1332,7 +1361,12 @@ where
             rpc(directory_scope_script(root, true)?).await?,
             3 * MAX_RECORD,
         )?;
-        parse_directory_scope(&original.group, root, &reply)?;
+        parse_directory_scope(
+            &original.group,
+            root,
+            &reply,
+            current.terminal_proofs.get(&root.relation.attempt_id),
+        )?;
     }
     if current.fingerprint != original.fingerprint
         || current.identity_evidence.trim() != original.identity_evidence.trim()
@@ -1356,16 +1390,17 @@ where
             return Err("独占目录 inode 已替换，原确认作废".into());
         }
         for name in &after.missing_owner_files {
-            after.evidence.insert(
-                name.clone(),
-                before
-                    .evidence
-                    .get(name)
-                    .ok_or("缺失归属文件未在原确认快照中，不能恢复")?
-                    .clone(),
-            );
+            if let Some(record) = before.evidence.get(name) {
+                after.evidence.insert(name.clone(), record.clone());
+            } else if name != "session.json" || !before.missing_owner_files.contains(name) {
+                return Err("缺失归属文件未在原确认快照中，不能恢复".into());
+            }
         }
-        validate_evidence(&original.group, after)?;
+        validate_evidence(
+            &original.group,
+            after,
+            current.terminal_proofs.get(&after.relation.attempt_id),
+        )?;
         for (name, value) in &after.evidence {
             if before.evidence.get(name) != Some(value) {
                 return Err("独占目录归属/终态已变化".into());
@@ -1669,7 +1704,7 @@ mod directory_tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
     use std::process::Command;
-    fn fixture_root() -> (PathBuf, DeviceRoot, PathBuf) {
+    pub(super) fn fixture_root() -> (PathBuf, DeviceRoot, PathBuf) {
         let base = std::env::temp_dir().join(format!("me-owned-directory-{}", Uuid::new_v4()));
         let parent = base.join("parent");
         let actual = parent.join("owned");
@@ -1719,7 +1754,11 @@ mod directory_tests {
         };
         (base, root, actual)
     }
-    fn run_fixture(base: &Path, root: &DeviceRoot, actual: &Path) -> std::process::Output {
+    pub(super) fn run_fixture(
+        base: &Path,
+        root: &DeviceRoot,
+        actual: &Path,
+    ) -> std::process::Output {
         let parent = root.path.rsplit_once('/').unwrap().0;
         let mut script = remove_directory_script(root, "fixture identity").unwrap();
         assert!(!script.contains("sha256sum") && !script.contains("rm -rf"));
@@ -1762,7 +1801,7 @@ mod directory_tests {
             &crate::shell_quote(actual.parent().unwrap().to_str().unwrap()),
         );
         script = script.replace(
-            "'./owned'",
+            &crate::shell_quote(&format!("./{}", root.path.rsplit('/').next().unwrap())),
             &crate::shell_quote(&format!(
                 "./{}",
                 actual.file_name().unwrap().to_str().unwrap()
@@ -2442,6 +2481,122 @@ mod tests {
         assert_eq!(result.status, "completed");
         assert_eq!(result.removed_files, 2);
     }
+    #[test]
+    fn unsealed_and_missing_manifest_real_fixture_directory_deletion() {
+        for missing in [false, true] {
+            let mock = Mock::new();
+            let group = &mock.group;
+            let proof = group.stages[0].attempts[0]
+                .remote_lifecycle
+                .as_ref()
+                .unwrap();
+            let (base, mut root, actual) = super::directory_tests::fixture_root();
+            let expected = expected_roots(group).unwrap().remove(0);
+            root.path = expected.path;
+            root.entries[0].path.clone_from(&root.path);
+            root.relation = expected.relation;
+            root.session_id = expected.session_id;
+            root.evidence.clear();
+            let owner = mock
+                .contents
+                .iter()
+                .find(|(p, _)| p.ends_with("capture-relation.json"))
+                .unwrap()
+                .1
+                .clone();
+            root.evidence
+                .insert("capture-relation.json".into(), owner.clone());
+            std::fs::write(actual.join("capture-relation.json"), owner).unwrap();
+            if !missing {
+                let text =
+                    serde_json::json!({"session_id":root.session_id,"state":"running"}).to_string();
+                root.evidence.insert("session.json".into(), text.clone());
+                std::fs::write(actual.join("session.json"), text).unwrap();
+            } else {
+                root.missing_owner_files.push("session.json".into());
+            }
+            validate_evidence(group, &root, Some(proof)).unwrap();
+            let result = super::directory_tests::run_fixture(&base, &root, &actual);
+            assert!(
+                result.status.success(),
+                "{}",
+                String::from_utf8_lossy(&result.stderr)
+            );
+            assert!(!actual.exists());
+            assert_eq!(
+                std::fs::read(base.join("external-original.apk")).unwrap(),
+                b"outside inode"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn exited_unsealed_spool_is_deletable_but_live_or_wrong_uuid_is_not() {
+        for scenario in ["exited", "live", "wrong-uuid"] {
+            let mock = Rc::new(RefCell::new(Mock::new()));
+            {
+                let mut m = mock.borrow_mut();
+                let session = m.group.stages[0].attempts[0].session_id.unwrap();
+                let path = m
+                    .contents
+                    .keys()
+                    .find(|p| p.ends_with("session.json"))
+                    .unwrap()
+                    .clone();
+                let text = serde_json::json!({"session_id":if scenario == "wrong-uuid" {Uuid::new_v4()} else {session},"state":"running"}).to_string();
+                m.contents.insert(path.clone(), text.clone());
+                let entry = m.entries.iter_mut().find(|e| e.path == path).unwrap();
+                *entry = file(path, entry.inode, &text);
+                if scenario == "live" {
+                    m.group.stages[0].attempts[0]
+                        .remote_lifecycle
+                        .as_mut()
+                        .unwrap()["agent_exited_confirmed"] = Value::Bool(false);
+                }
+            }
+            let group = mock.borrow().group.clone();
+            let plan =
+                inspect_with(&group, |s| std::future::ready(mock.borrow_mut().call(s))).await;
+            if scenario != "exited" {
+                assert!(plan.is_err(), "{scenario}");
+                continue;
+            }
+            let plan = plan.unwrap();
+            assert!(plan.roots[0].evidence["session.json"].contains("running"));
+            let result = execute_with(&plan, |s| std::future::ready(mock.borrow_mut().call(s)))
+                .await
+                .unwrap();
+            assert_eq!(result.status, "completed");
+            assert!(!mock.borrow().removed.is_empty());
+        }
+    }
+    #[test]
+    fn missing_manifest_requires_relation_uuid_and_fresh_closed_collector() {
+        let mock = Mock::new();
+        let group = &mock.group;
+        let mut root = expected_roots(group).unwrap().remove(0);
+        root.evidence.insert(
+            "capture-relation.json".into(),
+            mock.contents
+                .iter()
+                .find(|(p, _)| p.ends_with("capture-relation.json"))
+                .unwrap()
+                .1
+                .clone(),
+        );
+        let proof = group.stages[0].attempts[0]
+            .remote_lifecycle
+            .as_ref()
+            .unwrap();
+        validate_evidence(group, &root, Some(proof)).unwrap();
+        assert!(validate_evidence(group, &root, None).is_err());
+        let mut wrong = proof.clone();
+        wrong["token"] = serde_json::json!(Uuid::new_v4());
+        assert!(validate_evidence(group, &root, Some(&wrong)).is_err());
+        root.evidence.clear();
+        assert!(validate_evidence(group, &root, Some(proof)).is_err());
+    }
+
     #[tokio::test]
     async fn new_file_changed_hash_wrong_device_and_missing_owner_fail_closed() {
         for scenario in [
@@ -2629,7 +2784,7 @@ mod tests {
             "attempt_id":relation.attempt_id,"attempt":relation.attempt,"stage_key":relation.stage_key}});
         root.evidence
             .insert("capture-relation.json".into(), owner.to_string());
-        validate_evidence(&group, &root).unwrap();
+        validate_evidence(&group, &root, None).unwrap();
         let script = lifecycle_script(&group, &relation).unwrap();
         assert!(script.contains("/data/local/tmp/ksight-fixture/bin/ksightd"));
         assert!(!script.contains("/data/local/tmp/ksight/"));
@@ -2637,7 +2792,7 @@ mod tests {
         foreign["relation"]["attempt_id"] = serde_json::json!(Uuid::new_v4());
         root.evidence
             .insert("capture-relation.json".into(), foreign.to_string());
-        assert!(validate_evidence(&group, &root).is_err());
+        assert!(validate_evidence(&group, &root, None).is_err());
         group.stages[index].attempts[0].remote_artifact_root =
             Some("/data/local/tmp/ksight-fixture/captures/foreign/dump".into());
         assert!(expected_roots(&group).is_err());
@@ -2674,11 +2829,11 @@ mod tests {
             "session.json".into(),
             serde_json::json!({"session_id":root.session_id,"state":"storage_limited"}).to_string(),
         );
-        validate_evidence(&group, &root).unwrap();
+        validate_evidence(&group, &root, None).unwrap();
         owner["relation"]["stage_links"] = serde_json::json!([]);
         root.evidence
             .insert("capture-relation.json".into(), owner.to_string());
-        assert!(validate_evidence(&group, &root).is_err());
+        assert!(validate_evidence(&group, &root, None).is_err());
     }
     #[cfg(unix)]
     fn synthetic_mount_guard(contents: Option<&str>, selected: &str) -> i32 {

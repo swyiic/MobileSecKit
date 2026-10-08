@@ -1109,6 +1109,59 @@ mod tests {
         assert!(!OPERATIONS.lock().unwrap().contains_key(&id));
     }
     #[tokio::test]
+    #[ignore = "explicit user-authorized deletion of the fixed 18770817 failed parent only"]
+    async fn physical_explicit_failed_parent_purge() {
+        assert_eq!(
+            std::env::var("ME_EXPLICIT_PURGE_187").unwrap(),
+            "authorized-by-user"
+        );
+        let root = PathBuf::from(
+            "/Users/swyiic/Library/Application Support/com.swyiic.mobilee/kernsight-captures",
+        );
+        let parent: Uuid = "18770817-9590-448a-a578-671dc10c3e58".parse().unwrap();
+        let group = load(&root, parent).unwrap();
+        assert_eq!(group.serial, "35251JEGR12568");
+        assert_eq!(group.package, "com.immomo.momo");
+        let plan = prepare_at(root.clone(), parent, vec![], false)
+            .await
+            .unwrap();
+        assert_eq!(plan.device.status, "ready");
+        let journal = read_journal(&root, plan.id).unwrap();
+        let device = journal.device.as_ref().unwrap();
+        assert_eq!(device.roots.len(), 2);
+        let expected: std::collections::BTreeSet<_> = [
+            "/data/local/tmp/ksight/spool/b5964193-118d-41fa-b5b7-ada854144b5e",
+            "/data/local/tmp/ksight/spool/d75d58e8-be5d-4a4c-856a-31ca52ebc9bf",
+        ]
+        .into_iter()
+        .collect();
+        assert_eq!(
+            device
+                .roots
+                .iter()
+                .map(|r| r.path.as_str())
+                .collect::<std::collections::BTreeSet<_>>(),
+            expected
+        );
+        let output = PathBuf::from(std::env::var("ME_EXPLICIT_PURGE_REPORT").unwrap());
+        fs::write(
+            &output,
+            serde_json::to_vec_pretty(&serde_json::json!({"plan":plan,"executed":false})).unwrap(),
+        )
+        .unwrap();
+        let report = run_execution(root, plan.id, Some(plan.confirmation_token))
+            .await
+            .unwrap();
+        fs::write(
+            output,
+            serde_json::to_vec_pretty(&serde_json::json!({"report":report,"executed":true}))
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(report.state, "completed");
+    }
+
+    #[tokio::test]
     async fn cancellation_before_execution_registration_blocks_late_nonce_but_allows_confirmed_resume(
     ) {
         let f = Fixture::new();
