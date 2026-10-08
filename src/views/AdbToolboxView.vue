@@ -172,8 +172,8 @@
       <div v-if="props.certificateFeedback" role="status" aria-live="polite" :aria-busy="props.certificateBusy" class="certificate-feedback"><span v-if="props.certificateBusy" class="material-symbols-outlined mirror-spinner">progress_activity</span><pre>{{ props.certificateFeedback }}</pre></div>
       <div v-if="props.certificate" class="certificate-result">
         <span><b>subject_hash_old</b> {{ props.certificate.subjectHash }}</span>
-        <span><b>SHA-256</b> {{ props.certificate.sha256 }}</span>
-        <span><b>目标</b> {{ props.certificate.systemTarget }}</span>
+        <span><b>SHA-256</b><FullValue label="证书 SHA-256" :value="props.certificate.sha256" monospace /></span>
+        <span><b>目标</b><FullValue label="证书目标路径" :value="props.certificate.systemTarget" monospace /></span>
         <small>{{ props.certificate.note }}</small>
       </div>
     </section>
@@ -201,6 +201,7 @@
 </template>
 
 <script setup lang="ts">
+import FullValue from '@/components/FullValue.vue'
 import { computed, onMounted, onUnmounted, ref, watch, type Ref } from 'vue'
 import { open } from '@tauri-apps/plugin-dialog'
 import type { AdbAction, CertificateInfo, DeviceSummary, KernSightMirrorCoverage } from '@/types'

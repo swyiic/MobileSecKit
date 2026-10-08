@@ -434,6 +434,25 @@ pub struct Contract {
     /// Only newly created automatic parents preallocate later work. Legacy receipts stay unchanged.
     #[serde(default)]
     pub planned_allocation: bool,
+    /// Missing on retained parents: never infer or renew a time plan.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub time_plan: Option<TimePlan>,
+}
+#[derive(Clone, Debug, Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct TimePhase {
+    pub kind: String,
+    pub cap_ms: u64,
+    /// Parent remaining-time coordinate, not a new clock/token.
+    pub stop_at_parent_remaining_ms: Option<u64>,
+    pub completed: bool,
+}
+#[derive(Clone, Debug, Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct TimePlan {
+    pub schema: String,
+    pub final_reserve_ms: u64,
+    pub phases: Vec<TimePhase>,
 }
 fn manager_reserve() -> u64 {
     2 * 1024 * 1024
@@ -451,6 +470,12 @@ impl Contract {
             || self.reservations.len() > 1024
         {
             return Err("预算合同未知/无效".into());
+        }
+        if let Some(plan) = &self.time_plan {
+            plan.validate(self.limits.max_seconds * 1000)?;
+            if !self.planned_allocation {
+                return Err("时间预留缺少新父字节计划".into());
+            }
         }
         if self.planned_allocation {
             for (kind, expected) in [
@@ -496,8 +521,21 @@ impl Contract {
         if r.charged_bytes.is_some() {
             return Err("已执行/未知终态，不能退回额度".into());
         }
+        let kind = r.kind.clone();
+        if self.time_plan.as_ref().is_some_and(|plan| {
+            plan.phases
+                .iter()
+                .any(|p| p.kind == kind && p.stop_at_parent_remaining_ms.is_some())
+        }) {
+            return Err("已启动时间阶段不能作为未启动释放".into());
+        }
         r.charged_bytes = Some(0);
         r.status = "not_started".into();
+        if let Some(plan) = self.time_plan.as_mut() {
+            if let Some(phase) = plan.phases.iter_mut().find(|p| p.kind == kind) {
+                phase.completed = true;
+            }
+        }
         Ok(())
     }
 
@@ -520,6 +558,7 @@ impl Contract {
             reservations: vec![],
             manager_reserve_bytes: manager_reserve(),
             planned_allocation: false,
+            time_plan: None,
         })
     }
     /// Reserve later work before any producer starts, without extending the parent.
@@ -581,14 +620,27 @@ impl Contract {
         if now >= self.deadline_unix_ms {
             return Err("parent_deadline_exhausted".into());
         }
+        if self
+            .reservations
+            .iter()
+            .any(|r| r.id == id && r.kind != kind)
+        {
+            return Err("预算操作身份冲突".into());
+        }
+        let allowance = if self.time_plan.is_some() {
+            if matches!(kind, "transfer" | "archive" | "import") {
+                self.collection_remaining_ms(now)?
+            } else {
+                self.begin_time_phase(kind, now)?
+            }
+        } else {
+            self.deadline_unix_ms.saturating_sub(now).min(monotonic_ms)
+        };
         if let Some(r) = self.reservations.iter().find(|r| r.id == id) {
             if r.kind != kind {
                 return Err("预算操作身份冲突".into());
             }
-            return Ok((
-                r.reserved_bytes,
-                self.deadline_unix_ms.saturating_sub(now).min(monotonic_ms),
-            ));
+            return Ok((r.reserved_bytes, allowance));
         }
         if self.planned_allocation {
             if let Some(slot) = self
@@ -598,10 +650,7 @@ impl Contract {
             {
                 slot.id = id;
                 slot.status = "reserved".into();
-                return Ok((
-                    slot.reserved_bytes,
-                    (self.deadline_unix_ms - now).min(monotonic_ms),
-                ));
+                return Ok((slot.reserved_bytes, allowance));
             }
             if matches!(kind, "transfer" | "archive" | "import" | "linker") {
                 return Err("事前预留已使用；不重复增加后续额度".into());
@@ -631,7 +680,7 @@ impl Contract {
             charged_bytes: None,
             status: "reserved".into(),
         });
-        Ok((quota, (self.deadline_unix_ms - now).min(monotonic_ms)))
+        Ok((quota, allowance))
     }
     pub fn settle(&mut self, id: &str, receipt: &serde_json::Value) -> Result<(), String> {
         let r = self
@@ -650,6 +699,7 @@ impl Contract {
         if r.charged_bytes.is_some_and(|old| old != n) {
             return Err("预算终态冲突，未重复计量".into());
         }
+        let kind = r.kind.clone();
         r.charged_bytes = Some(n);
         r.status = if receipt["partial"].as_bool() == Some(true) {
             "partial"
@@ -657,6 +707,11 @@ impl Contract {
             "admitted_plus_terminal_reserve"
         }
         .into();
+        if let Some(plan) = self.time_plan.as_mut() {
+            if let Some(phase) = plan.phases.iter_mut().find(|p| p.kind == kind) {
+                phase.completed = true;
+            }
+        }
         Ok(())
     }
 }
@@ -1246,5 +1301,587 @@ mod planned_allocation_tests {
             live.reserve("legacy-dump".into(), "dump", 2).unwrap().0,
             before / 2
         );
+    }
+}
+
+impl TimePlan {
+    fn validate(&self, total_ms: u64) -> Result<(), String> {
+        if self.schema != "mobilee.session-time-plan/v1" || self.final_reserve_ms != 140000 {
+            return Err("时间计划schema/终态预留无效".into());
+        }
+        let mut names = std::collections::BTreeSet::new();
+        let mut sum = 0u64;
+        for p in &self.phases {
+            if !names.insert(p.kind.as_str())
+                || p.cap_ms == 0
+                || p.stop_at_parent_remaining_ms.is_some_and(|n| n > total_ms)
+            {
+                return Err("时间阶段身份/边界无效".into());
+            }
+            sum = sum.checked_add(p.cap_ms).ok_or("时间总数溢出")?;
+        }
+        for (kind, cap) in [("archive", 60000), ("import", 75000), ("terminal", 5000)] {
+            if !self
+                .phases
+                .iter()
+                .any(|p| p.kind == kind && p.cap_ms == cap)
+            {
+                return Err("最终时间预留缺失或改变".into());
+            }
+        }
+        let separate = names.contains("l0")
+            && names.contains("l1")
+            && names.contains("linker")
+            && !names.contains("unified");
+        let unified = names.contains("unified")
+            && !names.contains("l0")
+            && !names.contains("l1")
+            && !names.contains("linker");
+        if !(separate || unified)
+            || !names.contains("dump")
+            || !names.contains("transfer")
+            || names.len() != if separate { 8 } else { 6 }
+            || sum != total_ms
+        {
+            return Err("时间计划阶段/总期限无效".into());
+        }
+        Ok(())
+    }
+}
+impl Contract {
+    /// Explicit new-parent schedule. Observation windows are not silently shortened.
+    pub fn new_planned_with_time(
+        limits: Limits,
+        now: u64,
+        separate: bool,
+        durations: &[u64],
+    ) -> Result<Self, String> {
+        if durations.len() != 3 || durations.iter().any(|n| !(1..=300).contains(n)) {
+            return Err("无效显式采集时间计划".into());
+        }
+        let total = limits.max_seconds.checked_mul(1000).ok_or("时间额度溢出")?;
+        let mut caps = if separate {
+            vec![
+                ("l0", (durations[0] + 10) * 1000),
+                ("l1", (durations[1] + 10) * 1000),
+                ("linker", (durations[2] + 10) * 1000),
+            ]
+        } else {
+            vec![("unified", (durations.iter().sum::<u64>() + 10) * 1000)]
+        };
+        caps.extend([
+            ("dump", 55000),
+            ("archive", 60000),
+            ("import", 75000),
+            ("terminal", 5000),
+        ]);
+        let held = caps.iter().map(|(_, n)| *n).sum::<u64>();
+        let transfer=total.checked_sub(held).filter(|n|*n>=30000).ok_or("总期限不足以保留观察、Dump55秒、transfer至少30秒、final140秒；请显式缩短新父窗口（例如5/30/10），未启动")?;
+        caps.push(("transfer", transfer));
+        let mut c = Self::new_planned(limits, now, separate)?;
+        c.time_plan = Some(TimePlan {
+            schema: "mobilee.session-time-plan/v1".into(),
+            final_reserve_ms: 140000,
+            phases: caps
+                .into_iter()
+                .map(|(kind, cap_ms)| TimePhase {
+                    kind: kind.into(),
+                    cap_ms,
+                    stop_at_parent_remaining_ms: None,
+                    completed: false,
+                })
+                .collect(),
+        });
+        c.validate()?;
+        Ok(c)
+    }
+    fn parent_remaining_ms(&self, now: u64) -> Result<u64, String> {
+        let mono = self.deadline()?.remaining_ms()?;
+        if now >= self.deadline_unix_ms {
+            return Err("parent_deadline_exhausted".into());
+        }
+        // New leases use only the monotonic coordinate; wall-clock rollback cannot renew them.
+        Ok(if self.time_plan.is_some() {
+            mono
+        } else {
+            mono.min(self.deadline_unix_ms - now)
+        })
+    }
+    /// Shared collection boundary protects final work even before transfer begins.
+    pub fn collection_remaining_ms(&self, now: u64) -> Result<u64, String> {
+        let remaining = self.parent_remaining_ms(now)?;
+        let Some(plan) = &self.time_plan else {
+            return Ok(remaining);
+        };
+        plan.validate(self.limits.max_seconds * 1000)?;
+        remaining
+            .checked_sub(plan.final_reserve_ms)
+            .filter(|n| *n > 0)
+            .ok_or("collection_time_holdback_exhausted: final140秒已预留，未续期".into())
+    }
+    /// Persist the first lease before starting the phase. Repeat calls never reset it.
+    pub fn begin_time_phase(&mut self, kind: &str, now: u64) -> Result<u64, String> {
+        let remaining = self.parent_remaining_ms(now)?;
+        let Some(plan) = self.time_plan.as_mut() else {
+            return Ok(remaining);
+        };
+        plan.validate(self.limits.max_seconds * 1000)?;
+        let index = plan
+            .phases
+            .iter()
+            .position(|p| p.kind == kind)
+            .ok_or("未知时间阶段")?;
+        if plan.phases[index].completed {
+            return Err("时间阶段已终结，不能重开".into());
+        }
+        if let Some(stop) = plan.phases[index].stop_at_parent_remaining_ms {
+            return remaining
+                .checked_sub(stop)
+                .map(|n| n.min(plan.phases[index].cap_ms))
+                .filter(|n| *n > 0)
+                .ok_or("phase_time_exhausted: 不重置原阶段期限".into());
+        }
+        let held = plan
+            .phases
+            .iter()
+            .enumerate()
+            .filter(|(i, p)| *i != index && !p.completed)
+            .map(|(_, p)| p.cap_ms)
+            .sum::<u64>();
+        let available = remaining
+            .checked_sub(held)
+            .filter(|n| *n > 0)
+            .ok_or("phase_time_holdback_exhausted: 后续时间已预留".to_owned())?;
+        let grant = available.min(plan.phases[index].cap_ms);
+        plan.phases[index].stop_at_parent_remaining_ms = Some(remaining - grant);
+        Ok(grant)
+    }
+}
+
+#[cfg(test)]
+mod time_plan_tests {
+    use super::*;
+    fn new() -> Contract {
+        Contract::new_planned_with_time(
+            Limits {
+                total_bytes: 4 * 1024 * 1024 * 1024,
+                max_seconds: 300,
+            },
+            1,
+            true,
+            &[5, 30, 10],
+        )
+        .unwrap()
+    }
+    #[test]
+    fn explicit_short_plan_holds_final140_and_refuses_old_long_windows_before_clock() {
+        assert!(Contract::new_planned_with_time(
+            Limits {
+                total_bytes: 4 * 1024 * 1024 * 1024,
+                max_seconds: 300
+            },
+            1,
+            true,
+            &[15, 90, 15]
+        )
+        .is_err());
+        let mut c = new();
+        let token = c.deadline_token;
+        let p = c.time_plan.as_ref().unwrap();
+        assert_eq!(p.final_reserve_ms, 140000);
+        for (kind, cap) in [
+            ("l0", 15000),
+            ("l1", 40000),
+            ("dump", 55000),
+            ("linker", 20000),
+            ("transfer", 30000),
+            ("archive", 60000),
+            ("import", 75000),
+            ("terminal", 5000),
+        ] {
+            assert_eq!(
+                p.phases.iter().find(|p| p.kind == kind).unwrap().cap_ms,
+                cap
+            );
+        }
+        assert!(c.collection_remaining_ms(1).unwrap() <= 160000);
+        let grant = c.reserve("l0-attempt".into(), "l0", 1).unwrap().1;
+        assert!(grant <= 15000 && grant > 14000);
+        assert_eq!(c.deadline_token, token);
+        assert_eq!(c.limits.max_seconds, 300);
+    }
+    #[test]
+    fn lease_repetition_and_wall_rollback_never_renew_or_reopen() {
+        let mut c = new();
+        let first = c.reserve("a".into(), "l0", 2000).unwrap().1;
+        let boundary = c.time_plan.as_ref().unwrap().phases[0].stop_at_parent_remaining_ms;
+        std::thread::sleep(Duration::from_millis(4));
+        let repeat = c.reserve("a".into(), "l0", 0).unwrap().1;
+        assert!(repeat < first);
+        assert_eq!(
+            boundary,
+            c.time_plan.as_ref().unwrap().phases[0].stop_at_parent_remaining_ms
+        );
+        c.settle(
+            "a",
+            &serde_json::json!({"admitted_write_bytes":10,"partial":false}),
+        )
+        .unwrap();
+        assert!(c.reserve("a".into(), "l0", 0).is_err());
+        assert!(c.reserve("b".into(), "l0", 0).is_err());
+    }
+    #[test]
+    fn export_byte_reservation_does_not_start_its_phase_and_unknown_token_fails() {
+        let mut c = new();
+        let token = c.deadline_token;
+        for kind in ["transfer", "archive", "import"] {
+            c.reserve(format!("export:{kind}"), kind, 1).unwrap();
+        }
+        assert!(c
+            .time_plan
+            .as_ref()
+            .unwrap()
+            .phases
+            .iter()
+            .all(|p| p.stop_at_parent_remaining_ms.is_none()));
+        let phase = c.begin_time_phase("transfer", 1).unwrap();
+        assert!(phase <= 30000);
+        assert!(c.release_unstarted("export:transfer").is_err());
+        assert_eq!(
+            c.reservations
+                .iter()
+                .find(|r| r.kind == "transfer")
+                .unwrap()
+                .charged_bytes,
+            None
+        );
+        assert_eq!(c.deadline_token, token);
+        c.deadline_token = None;
+        assert!(c.collection_remaining_ms(1).is_err());
+        assert!(c.begin_time_phase("import", 1).is_err());
+    }
+    #[test]
+    fn persisted_legacy_has_no_time_plan_and_keeps_original_clock() {
+        let old = Contract::new_planned(Limits::default(), 1, true).unwrap();
+        let mut value = serde_json::to_value(&old).unwrap();
+        value.as_object_mut().unwrap().remove("timePlan");
+        let mut decoded: Contract = serde_json::from_value(value).unwrap();
+        assert!(decoded.time_plan.is_none());
+        let token = decoded.deadline_token;
+        assert!(decoded.reserve("a".into(), "l0", 1).unwrap().1 > 140000);
+        assert_eq!(decoded.deadline_token, token);
+        decoded.deadline().unwrap().cancel();
+        assert!(decoded.reserve("b".into(), "l1", 1).is_err());
+        assert!(decoded.time_plan.is_none());
+    }
+    #[test]
+    fn tampered_final_plan_or_phase_boundaries_fail_validation() {
+        let mut c = new();
+        c.time_plan
+            .as_mut()
+            .unwrap()
+            .phases
+            .iter_mut()
+            .find(|p| p.kind == "import")
+            .unwrap()
+            .cap_ms = 74000;
+        assert!(c.validate().is_err());
+        let mut c = new();
+        c.time_plan.as_mut().unwrap().phases[0].stop_at_parent_remaining_ms = Some(300001);
+        assert!(c.validate().is_err());
+    }
+    #[test]
+    fn original_monotonic_expiry_and_final_holdback_are_not_new_clocks() {
+        let mut c = new();
+        c.deadline_token = Some(super::super::session_deadline::Deadline::register(
+            Duration::from_millis(140010),
+        ));
+        assert!(c.collection_remaining_ms(1).unwrap() <= 10);
+        std::thread::sleep(Duration::from_millis(15));
+        assert!(c.collection_remaining_ms(1).is_err());
+        assert!(c.deadline().unwrap().check().is_ok()); // parent still has final time
+        c.deadline().unwrap().cancel();
+        assert!(c.begin_time_phase("archive", 1).is_err());
+    }
+}
+
+impl TimePlan {
+    pub fn validate_observations(&self, separate: bool, durations: &[u64]) -> Result<(), String> {
+        if durations.len() != 3 {
+            return Err("时间计划观察窗口缺失".into());
+        }
+        let caps = if separate {
+            vec![
+                ("l0", (durations[0] + 10) * 1000),
+                ("l1", (durations[1] + 10) * 1000),
+                ("linker", (durations[2] + 10) * 1000),
+            ]
+        } else {
+            vec![("unified", (durations.iter().sum::<u64>() + 10) * 1000)]
+        };
+        for (kind, ms) in caps {
+            if !self.phases.iter().any(|p| p.kind == kind && p.cap_ms == ms) {
+                return Err("父观察窗口与事前时间计划不一致".into());
+            }
+        }
+        if !self
+            .phases
+            .iter()
+            .any(|p| p.kind == "dump" && p.cap_ms == 55000)
+            || !self
+                .phases
+                .iter()
+                .any(|p| p.kind == "transfer" && p.cap_ms >= 30000)
+        {
+            return Err("Dump/transfer时间预留无效".into());
+        }
+        Ok(())
+    }
+}
+
+impl Contract {
+    /// Completion fence: read the first lease without starting, renewing or settling it.
+    pub fn check_time_phase(&self, kind: &str, now: u64) -> Result<(), String> {
+        if self.time_plan.is_none() {
+            return self.deadline()?.check();
+        }
+        let remaining = self.parent_remaining_ms(now)?;
+        let plan = self.time_plan.as_ref().unwrap();
+        plan.validate(self.limits.max_seconds * 1000)?;
+        let phase = plan
+            .phases
+            .iter()
+            .find(|p| p.kind == kind)
+            .ok_or("phase_time_unknown: missing phase")?;
+        if phase.completed {
+            return Err("phase_time_finished: cannot report another completion".into());
+        }
+        let stop = phase
+            .stop_at_parent_remaining_ms
+            .ok_or("phase_time_unknown: original lease not started")?;
+        if remaining <= stop {
+            return Err(format!("phase_time_exhausted: {kind} crossed its original lease; original evidence retained"));
+        }
+        Ok(())
+    }
+    /// Keep real admitted bytes/source fields; only the host's completion claim changes.
+    pub fn phase_settlement_note(
+        &self,
+        kind: &str,
+        receipt: &serde_json::Value,
+        now: u64,
+    ) -> (serde_json::Value, Option<String>) {
+        let mut note = receipt.clone();
+        let failure = self.check_time_phase(kind, now).err();
+        if let Some(error) = failure.as_ref() {
+            note["partial"] = serde_json::json!(true);
+            note["host_time_fence"] = serde_json::json!(error);
+        }
+        (note, failure)
+    }
+}
+#[cfg(test)]
+mod phase_completion_tests {
+    use super::*;
+    fn new() -> Contract {
+        Contract::new_planned_with_time(
+            Limits {
+                total_bytes: 4294967296,
+                max_seconds: 300,
+            },
+            1,
+            true,
+            &[5, 30, 10],
+        )
+        .unwrap()
+    }
+    #[test]
+    fn completion_check_cannot_start_or_renew_a_lease() {
+        let mut c = new();
+        assert!(c.check_time_phase("l0", 1).is_err());
+        let token = c.deadline_token;
+        c.reserve("a".into(), "l0", 1).unwrap();
+        let boundary = c.time_plan.as_ref().unwrap().phases[0].stop_at_parent_remaining_ms;
+        c.check_time_phase("l0", 1).unwrap();
+        assert_eq!(
+            boundary,
+            c.time_plan.as_ref().unwrap().phases[0].stop_at_parent_remaining_ms
+        );
+        assert_eq!(c.deadline_token, token);
+        c.time_plan.as_mut().unwrap().phases[0].stop_at_parent_remaining_ms = Some(300000);
+        assert!(c.check_time_phase("l0", 1).is_err());
+        assert_eq!(
+            c.time_plan.as_ref().unwrap().phases[0].stop_at_parent_remaining_ms,
+            Some(300000)
+        );
+    }
+    #[test]
+    fn expired_phase_keeps_real_source_and_bytes_but_settles_partial() {
+        let mut c = new();
+        c.reserve("a".into(), "l0", 1).unwrap();
+        let token = c.deadline_token;
+        c.time_plan.as_mut().unwrap().phases[0].stop_at_parent_remaining_ms = Some(300000);
+        let original = serde_json::json!({"schema":"kernsight.output-budget/v1","admitted_write_bytes":12345,"partial":false,"reason":null,"source":{"pid":42}});
+        let (note, failure) = c.phase_settlement_note("l0", &original, 1);
+        assert!(failure.is_some());
+        assert_eq!(note["source"], original["source"]);
+        assert_eq!(note["admitted_write_bytes"], 12345);
+        assert_eq!(original["partial"], false);
+        assert_eq!(note["partial"], true);
+        c.settle("a", &note).unwrap();
+        let r = c.reservations.iter().find(|r| r.id == "a").unwrap();
+        assert_eq!(r.charged_bytes, Some(12345 + 65536));
+        assert_eq!(r.status, "partial");
+        assert_eq!(c.deadline_token, token);
+        assert!(c.check_time_phase("l0", 1).is_err());
+    }
+    #[test]
+    fn legacy_completion_keeps_none_and_unknown_or_expired_parent_fails() {
+        let mut c = Contract::new(Limits::default(), 1).unwrap();
+        c.check_time_phase("l0", 1).unwrap();
+        assert!(c.time_plan.is_none());
+        c.deadline().unwrap().cancel();
+        assert!(c.check_time_phase("l0", 1).is_err());
+        c.deadline_token = None;
+        assert!(c.check_time_phase("l0", 1).is_err());
+        assert!(c.time_plan.is_none());
+    }
+}
+
+impl Contract {
+    /// Caller must have proved no payload operation began (e.g. Guard install failed).
+    /// Lease issuance alone is not payload IO. Keep its coordinate and retire it forever.
+    pub fn release_granted_before_payload(&mut self, id: &str) -> Result<(), String> {
+        self.release_known_unstarted_lease(id, true)
+    }
+    /// Only an explicit pre-capture capability refusal may release a granted stage lease.
+    pub fn release_stage_granted_before_capture(&mut self, id: &str) -> Result<(), String> {
+        self.release_known_unstarted_lease(id, false)
+    }
+    fn release_known_unstarted_lease(&mut self, id: &str, export: bool) -> Result<(), String> {
+        let index = self
+            .reservations
+            .iter()
+            .position(|r| r.id == id)
+            .ok_or("缺已预留导出操作")?;
+        let r = &self.reservations[index];
+        let allowed = if export {
+            matches!(r.kind.as_str(), "transfer" | "archive" | "import")
+        } else {
+            matches!(r.kind.as_str(), "l0" | "l1" | "dump" | "linker" | "unified")
+        };
+        if !allowed {
+            return Err("操作类型与明确未启动payload证明不一致".into());
+        }
+        if r.status == "not_started" && r.charged_bytes == Some(0) {
+            return Ok(());
+        }
+        if r.charged_bytes.is_some() || r.status != "reserved" {
+            return Err("已有计量/未知终态，不能记为未启动".into());
+        }
+        let kind = r.kind.clone();
+        if let Some(plan) = self.time_plan.as_mut() {
+            let phase = plan
+                .phases
+                .iter_mut()
+                .find(|p| p.kind == kind)
+                .ok_or("导出时间阶段缺失")?;
+            if phase.completed {
+                return Err("时间阶段已完成，不能退回未知payload".into());
+            }
+            phase.completed = true; // original stop coordinate stays immutable
+        }
+        self.reservations[index].charged_bytes = Some(0);
+        self.reservations[index].status = "not_started".into();
+        Ok(())
+    }
+}
+#[cfg(test)]
+mod before_payload_release_tests {
+    use super::*;
+    #[test]
+    fn guard_failure_retires_issued_lease_without_renewal_or_unknown_zero() {
+        let mut c = Contract::new_planned_with_time(
+            Limits {
+                total_bytes: 4294967296,
+                max_seconds: 300,
+            },
+            1,
+            true,
+            &[5, 30, 10],
+        )
+        .unwrap();
+        let token = c.deadline_token;
+        c.reserve("export:import".into(), "import", 1).unwrap();
+        c.begin_time_phase("import", 1).unwrap();
+        let boundary = c
+            .time_plan
+            .as_ref()
+            .unwrap()
+            .phases
+            .iter()
+            .find(|p| p.kind == "import")
+            .unwrap()
+            .stop_at_parent_remaining_ms;
+        c.release_granted_before_payload("export:import").unwrap();
+        assert_eq!(c.deadline_token, token);
+        let p = c
+            .time_plan
+            .as_ref()
+            .unwrap()
+            .phases
+            .iter()
+            .find(|p| p.kind == "import")
+            .unwrap();
+        assert_eq!(p.stop_at_parent_remaining_ms, boundary);
+        assert!(p.completed);
+        assert!(c.begin_time_phase("import", 1).is_err());
+        c.release_granted_before_payload("export:import").unwrap();
+        c.reserve("export:transfer".into(), "transfer", 1).unwrap();
+        c.begin_time_phase("transfer", 1).unwrap();
+        c.settle(
+            "export:transfer",
+            &serde_json::json!({"admitted_write_bytes":7,"partial":true}),
+        )
+        .unwrap();
+        assert!(c.release_granted_before_payload("export:transfer").is_err());
+        assert_eq!(
+            c.reservations
+                .iter()
+                .find(|r| r.id == "export:transfer")
+                .unwrap()
+                .charged_bytes,
+            Some(7 + 65536)
+        );
+    }
+}
+
+#[cfg(test)]
+mod capability_time_release_tests {
+    use super::*;
+    #[test]
+    fn explicit_pre_capture_gate_can_retire_stage_lease_but_export_api_cannot() {
+        let mut c = Contract::new_planned_with_time(
+            Limits {
+                total_bytes: 4294967296,
+                max_seconds: 300,
+            },
+            1,
+            true,
+            &[5, 30, 10],
+        )
+        .unwrap();
+        c.reserve("stage".into(), "l0", 1).unwrap();
+        let token = c.deadline_token;
+        let boundary = c.time_plan.as_ref().unwrap().phases[0].stop_at_parent_remaining_ms;
+        assert!(c.release_granted_before_payload("stage").is_err());
+        c.release_stage_granted_before_capture("stage").unwrap();
+        assert_eq!(
+            c.time_plan.as_ref().unwrap().phases[0].stop_at_parent_remaining_ms,
+            boundary
+        );
+        assert_eq!(c.deadline_token, token);
+        assert!(c.time_plan.as_ref().unwrap().phases[0].completed);
+        assert!(c.begin_time_phase("l0", 1).is_err());
     }
 }

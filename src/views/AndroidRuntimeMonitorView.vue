@@ -122,6 +122,11 @@
         <label v-if="captureForm.plan === 'auto'" class="wide"><span>阶段生命周期</span><select v-model="captureForm.autoSessionMode" :disabled="captureRunning"><option value="startup_replay">启动重采：三次冷启动，分别观察各能力启动窗口</option><option value="unified">统一 session：只首次冷启动，顺序启停 Inspect（需新版 agent）</option></select><small>{{ captureForm.autoSessionMode === 'unified' ? 'L0 全程保留；L1/Linker 各有时间窗，只在会话结束取驻留快照，不能补回其它阶段的启动调用或已卸载代码。' : 'L0/L1/Linker 各由本 attempt 强制停止并启动新实例；L1 后快照属于该实例。实际挂载前的事件可能缺失，失败/未知会停止后续阶段。' }}</small></label>
         <label v-if="captureForm.plan === 'auto'"><span>累计输出写入预算（MiB）</span><input v-model.number="captureForm.totalBudgetMiB" type="number" min="4" max="16384" :disabled="captureRunning" /></label>
         <label v-if="captureForm.plan === 'auto'"><span>总期限（秒）</span><input v-model.number="captureForm.maxSessionSeconds" type="number" min="30" max="3600" :disabled="captureRunning" /></label>
+        <div v-if="captureForm.plan === 'auto'" class="wide ks-time-allocation" role="status">
+          <template v-if="autoTimeAllocation"><strong>时间分配：{{ autoTimeAllocation.producer.map(phase => `${phase.key} ${phase.seconds}s`).join(' · ') }} · Dump 55s · 传输 {{ Math.max(0, autoTimeAllocation.transferSeconds) }}s · 最终 140s</strong><small>最终预留：归档 60s、导入 75s、终态 5s。每个采集启动预留 10s；传输至少 30s。{{ autoTimeAllocation.valid ? '满足时间准入；不保证所有阶段完成。' : `总期限不足，至少需要 ${autoTimeAllocation.minimumSeconds}s；未启动，请调整新父窗口或期限。` }}</small></template>
+          <small v-else>观察窗必须为 1–300 秒整数，总期限必须为 30–3600 秒整数；未启动。</small>
+          <small>默认观察窗为 5 / 30 / 10 秒；有效已保存窗口保留。缩短窗口会缩小覆盖，缺失保持未知。传输额度耗尽时保留 partial；时间准入不保证全部阶段完成。</small>
+        </div>
         <label v-if="captureForm.plan === 'auto'" class="wide"><span>隔离候选运行根（留空使用旧默认路径）</span><input v-model="captureForm.isolatedRoot" :disabled="captureRunning" placeholder="/data/local/tmp/ksight-candidate-本轮ID" /><small>目录、agent、BPF、资产与证据均需处于此根；不安装或替换默认工具。</small></label>
         <label v-if="captureForm.plan === 'auto' && captureForm.isolatedRoot.trim()" class="wide"><span>隔离agent绝对路径（留空为运行根/ksightd）</span><input v-model="captureForm.isolatedAgent" :disabled="captureRunning" /><span>候选完整SHA256（必填）</span><input v-model="captureForm.isolatedSha256" :disabled="captureRunning" /></label>
         <label v-if="captureForm.plan === 'auto'" class="wide"><span>独立采集范围</span><span><input v-model="captureForm.codeOnly" type="checkbox" :disabled="captureRunning" /> 仅代码证据（独立选择，默认关闭）</span><small>普通与仅代码范围均按计划执行强制停止和冷启动；不暂停进程。仅代码先核验真实 BTF/task-storage 后端，启动后再资格化具体实例。新父会话两种范围均限定独占 UID 主进程的已登记代码/执行映射，不等于旧全内存采集；共享 UID、容器和未登记匿名堆/FD 扫描不支持。L1仍按阶段开启TLS/JNI/Binder Inspect，“仅代码”不是禁止所有Inspect字节的承诺。事件从实际挂载时刻起可观察，最早事件可能缺失。</small></label>
@@ -192,12 +197,7 @@
       <p v-if="trashMessage" class="ks-trash-message" role="status">{{ trashMessage }}</p>
       <p v-if="purgeMessage" class="ks-trash-message" role="status">{{ purgeMessage }}</p>
       <p v-if="purgeLoadError" class="ks-trash-message" role="alert">{{ purgeLoadError }} <button class="ghost-button" @click="loadPurgeReports">重试读取清理记录</button></p>
-      <details v-if="executedPurges.length" class="ks-group-trash ks-purge-journal" :open="Boolean(incompletePurges.length)">
-        <summary>永久清理记录 · {{ executedPurges.length }}（未完成 {{ incompletePurges.length }}）</summary>
-        <p>本地和手机分别核验。待清理部分不会自动执行，必须重新预览并确认。</p>
-        <article v-for="report in executedPurges" :key="report.id"><div><strong>{{ purgeReportLabel(report) }}</strong><p>{{ report.parentId }} · {{ report.serial }} · {{ report.package }}</p><p>本地 {{ report.localState }} · 手机 {{ report.deviceState }} · 更新 {{ formatDate(report.updatedUnixMs) }}</p><p v-if="report.error">{{ report.error }}</p><p v-for="warning in report.warnings" :key="warning">{{ warning }}</p></div><button v-if="report.state !== 'completed'" class="ghost-button" :disabled="purgeBusy || purgeExecuting || report.state === 'running'" @click="openPurgeRetry(report)">{{ report.state === 'running' ? '执行中，请刷新记录' : '重新预览剩余清理' }}</button></article>
-        <button class="ghost-button" :disabled="purgeExecuting" @click="loadPurgeReports">刷新清理记录</button>
-      </details>
+      <KernSightPurgeHistory :reports="purgeReports" :busy="purgeBusy || purgeExecuting" @retry="openPurgeRetry" @refresh="loadPurgeReports" />
       <details v-if="trashedCaptureGroups.length" class="ks-group-trash">
         <summary>主会话回收站 · {{ trashedCaptureGroups.length }}</summary>
         <p>这里只移除会话列表记录，可恢复。原始证据、导入目录与设备文件保留，不释放磁盘空间。</p>
@@ -300,6 +300,17 @@
         <details v-if="tlsCoverageRows.length" class="ks-command-card ks-coverage-matrix">
           <summary>TLS / Cronet 动态挂载覆盖（{{ tlsCoverageRows.length }}）</summary>
           <div class="ks-data-table"><article v-for="row in tlsCoverageRows" :key="`${row.adapter}-${row.library}`"><strong>{{ shortLibrary(row.library) }}</strong><small>{{ row.adapter }} · {{ row.attached ? '已挂载' : '未挂载' }}</small><span>{{ Number(row.hits || 0).toLocaleString() }} hits</span><code>{{ row.attached ? (Number(row.hits || 0) ? 'active' : 'attached · no hit') : coverageReason(row) }}</code></article></div>
+        </details>
+        <details v-if="linkerObservationRows.length" class="ks-command-card">
+          <summary>实际 Linker 命中 {{ linkerObservationRows.length }}（保留上限 {{ sessionReport.linker_observations_limit }}；遗漏 {{ sessionReport.linker_observations_omitted || 0 }}）</summary>
+          <p>逐条命中记录；重复路径不代表独立加载；这是入口命中，成功加载及整体覆盖未知。时间为内核 monotonic ns，birth 为事件头身份，缺失保持未知。</p>
+          <div class="ks-data-table"><article v-for="(row, index) in linkerObservationRows" :key="`${row.session_id}-${row.source_sequence}-${index}`">
+            <strong>{{ row.path_hint || '路径不可读 / 未提供' }}</strong>
+            <small>PID {{ row.pid }} · TID {{ row.tid }} · boot {{ row.boot_id }} · birth {{ row.header_birth_ns || '未知' }}</small>
+            <code>时间 {{ row.monotonic_ns }} ns · 来源 {{ row.session_id }} / sequence {{ row.source_sequence }}</code>
+            <code>{{ row.library }} · build-id {{ row.build_id || '未知' }} · offset {{ row.offset ?? '未知' }}</code>
+            <small>{{ row.detail }}{{ row.text_truncated ? '（字段已截断）' : '' }}</small>
+          </article></div>
         </details>
         <p class="ks-path-legend"><span class="prio-focus">重点关注</span>明文、可读/堆 DEX、runtime SO、CE/DE 库和 prefs<span class="prio-watch">可复核</span>有事实但不是主干<span class="prio-background">背景</span>系统 Binder / 安装包 stub<span class="prio-gap">缺口</span>这一跳没有证据。高亮来自路径和来源，不是漏洞结论，也不等 AI。</p>
         <ol class="ks-flow">
@@ -491,9 +502,10 @@ import { memoryCounterLabel, memoryEvidenceLabel } from '../services/kernsightMe
 import KernSightDexIndex from '@/components/KernSightDexIndex.vue'
 import KernSightCaptureDiagnostics from '@/components/KernSightCaptureDiagnostics.vue'
 import KernSightGroupPurge from '@/components/KernSightGroupPurge.vue'
+import KernSightPurgeHistory from '@/components/KernSightPurgeHistory.vue'
 import { bundleRemovedByPurge, purgeReportLabel, type PurgeTarget } from '@/services/kernsightGroupPurge'
 import { verifiedDexObjectCount, indexedElfModuleCount, indexedDexCount, runtimeDexClassMatches, elfLoadCoverageLabel, codeEvidenceLabel, allocatedEvidenceLabel, ownershipEvidenceEntries, codeNoiseLayers, archiveCoverageLabel, dexScanSummary, dexScanSummaryForObject, fileScanLabel } from '../services/kernsightCodeEvidence'
-import { buildAutoCaptureStages, captureCodeOnlyChoice, startupEvidenceLabel, qualifiedSourceLabel, type AutoStageReceipt } from '@/services/kernsightCapturePlan'
+import { buildAutoCaptureStages, captureTimeAllocation, captureCodeOnlyChoice, startupEvidenceLabel, qualifiedSourceLabel, type AutoStageReceipt } from '@/services/kernsightCapturePlan'
 import { computed, markRaw, nextTick, onErrorCaptured, onBeforeUnmount, onMounted, reactive, ref, shallowRef, watch } from 'vue'
 import { listen } from '@tauri-apps/api/event'
 import { save } from '@tauri-apps/plugin-dialog'
@@ -538,8 +550,6 @@ const purgeMessage = ref('')
 const purgeLoadError = ref('')
 const purgeRequests = createLatestRequest()
 const purgeBusy = computed(() => !localOwnershipConfirmed.value || captureRunning.value || pullingPackage.value || importingLocal.value || Boolean(changingTrashGroup.value))
-const executedPurges = computed(() => purgeReports.value.filter(report => report.state !== 'prepared'))
-const incompletePurges = computed(() => executedPurges.value.filter(report => report.state !== 'completed'))
 const localGroupsRequests = createLatestRequest()
 const localOwnershipConfirmed = ref(false)
 const knownCaptureGroups = computed(() => [...captureGroups.value, ...importedCaptureGroups.value.map(item => item.group), ...captureGroupTrash.value.map(entry => entry.group)])
@@ -639,9 +649,9 @@ const captureForm = reactive({
   maxSessionSeconds:300,
   collectKeys:false,collectPrivate:false,collectMemoryWindows:false,
   autoSessionMode: 'startup_replay' as 'startup_replay' | 'unified',
-  autoL0Seconds: 15,
-  autoL1Seconds: 90,
-  autoLinkerSeconds: 15,
+  autoL0Seconds: 5,
+  autoL1Seconds: 30,
+  autoLinkerSeconds: 10,
 })
 const capturePhase = ref('')
 const unifiedSessionAwaiting = ref(false)
@@ -659,9 +669,9 @@ function loadAutoDurations() {
     const raw = localStorage.getItem(AUTO_DURATION_KEY)
     if (!raw) return
     const parsed = JSON.parse(raw) as Record<string, unknown>
-    captureForm.autoL0Seconds = clampCaptureSeconds(parsed.autoL0Seconds, 15)
-    captureForm.autoL1Seconds = clampCaptureSeconds(parsed.autoL1Seconds, 90)
-    captureForm.autoLinkerSeconds = clampCaptureSeconds(parsed.autoLinkerSeconds, 15)
+    captureForm.autoL0Seconds = clampCaptureSeconds(parsed.autoL0Seconds, 5)
+    captureForm.autoL1Seconds = clampCaptureSeconds(parsed.autoL1Seconds, 30)
+    captureForm.autoLinkerSeconds = clampCaptureSeconds(parsed.autoLinkerSeconds, 10)
   } catch { /* keep defaults */ }
 }
 loadAutoDurations()
@@ -669,9 +679,9 @@ watch(
   () => [captureForm.autoL0Seconds, captureForm.autoL1Seconds, captureForm.autoLinkerSeconds],
   ([l0, l1, linker]) => {
     const next = {
-      autoL0Seconds: clampCaptureSeconds(l0, 15),
-      autoL1Seconds: clampCaptureSeconds(l1, 90),
-      autoLinkerSeconds: clampCaptureSeconds(linker, 15),
+      autoL0Seconds: clampCaptureSeconds(l0, 5),
+      autoL1Seconds: clampCaptureSeconds(l1, 30),
+      autoLinkerSeconds: clampCaptureSeconds(linker, 10),
     }
     if (captureForm.autoL0Seconds !== next.autoL0Seconds) captureForm.autoL0Seconds = next.autoL0Seconds
     if (captureForm.autoL1Seconds !== next.autoL1Seconds) captureForm.autoL1Seconds = next.autoL1Seconds
@@ -820,6 +830,7 @@ const inspectUrlBoard = computed(() => {
 const dnsRows = computed<any[]>(() => asArray(sessionReport.value?.dns_names))
 const handshakeRows = computed<any[]>(() => asArray(sessionReport.value?.handshake_names))
 const dnsDatagrams = computed(() => Number(sessionReport.value?.dns_datagrams || 0))
+const linkerObservationRows = computed<any[]>(() => asArray(sessionReport.value?.linker_observations).slice(0, 256))
 const inspectRows = computed<any[]>(() => asArray(sessionReport.value?.inspect_hits))
 const mirrorDiagnosticRow = computed<any | null>(() => inspectRows.value.find(row => row.adapter === 'burp_mirror_diagnostics') || null)
 const mirrorMetrics = computed<Record<string, number>>(() => {
@@ -1212,13 +1223,18 @@ const captureCommandPreview = computed(() => {
   }
   return captureKsightctlLine({ duration: captureForm.durationSeconds, inspectMode: captureForm.inspectMode })
 })
+const autoTimeAllocation = computed(() => {
+  try { return captureTimeAllocation({ l0: captureForm.autoL0Seconds, l1: captureForm.autoL1Seconds, linker: captureForm.autoLinkerSeconds }, captureForm.maxSessionSeconds, captureForm.autoSessionMode === 'startup_replay') }
+  catch { return null }
+})
 const captureValid = computed(() => {
   const packageValid = !captureForm.package || /^[A-Za-z0-9._]+$/.test(captureForm.package)
   const inspectValid = !(captureForm.inspectMode !== 'none' || captureForm.sched || captureForm.plan !== 'capture') || Boolean(captureForm.package)
-  const autoOk = captureForm.plan !== 'auto' || (!captureForm.hideDebug && !captureForm.collectKeys && !captureForm.collectPrivate && !captureForm.collectMemoryWindows && [captureForm.autoL0Seconds, captureForm.autoL1Seconds, captureForm.autoLinkerSeconds].every(n => Number.isInteger(n) && n >= 1 && n <= 300))
+  const autoOk = captureForm.plan !== 'auto' || (autoTimeAllocation.value?.valid && !captureForm.hideDebug && !captureForm.collectKeys && !captureForm.collectPrivate && !captureForm.collectMemoryWindows && [captureForm.autoL0Seconds, captureForm.autoL1Seconds, captureForm.autoLinkerSeconds].every(n => Number.isInteger(n) && n >= 1 && n <= 300))
   return packageValid && inspectValid && autoOk && captureForm.durationSeconds >= 1 && captureForm.durationSeconds <= 300 && captureForm.sampleOneIn >= 1
 })
 const capturePolicyHint = computed(() => {
+  if (captureForm.plan === 'auto' && !autoTimeAllocation.value?.valid) return autoTimeAllocation.value ? `总期限不足：至少 ${autoTimeAllocation.value.minimumSeconds}s，传输需至少 30s，未启动。请显式调整新父会话。` : '采集窗口或总期限无效，未启动。'
   if (!captureValid.value) return 'Inspect / Sched / Dump / 自动采集必须填写包名；时长 1–300 秒；父会话不支持额外密钥、私有存储、通用内存窗口或 Hide debug。'
   if (captureForm.plan === 'dump') return 'L2 dump --launch：force-stop 后由 dump 自己拉起 App，SIGSTOP 拷堆 DEX/SO/CE·DE。不是 eBPF 会话，不要同时挂 Inspect。'
   if (captureForm.plan === 'auto' && captureForm.autoSessionMode === 'startup_replay') return '启动重采保留各能力自己的启动窗口：L0 → 重启 L1 → 该实例快照 → 重启 Linker。三个 session 不能冒充同一进程生命周期。已确认退出、清理和预算结算的额度 partial 可继续独立冷启动，父流程仍保留 partial；取消、清理未知或其它失败停止并保留已有证据。'

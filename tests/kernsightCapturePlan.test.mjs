@@ -9,7 +9,7 @@ const source = readFileSync(new URL('../src/services/kernsightCapturePlan.ts', i
 const compiled = ts.transpileModule(source, {
   compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.ES2022 },
 }).outputText
-const { buildAutoCaptureStages, runAutoCapturePlan, runUnifiedCapturePlan, buildUnifiedStageSpec, captureIPCCommand, captureCodeOnlyChoice, startupEvidenceLabel, qualifiedSourceLabel, captureGroupIPC } =
+const { captureTimeAllocation, buildAutoCaptureStages, runAutoCapturePlan, runUnifiedCapturePlan, buildUnifiedStageSpec, captureIPCCommand, captureCodeOnlyChoice, startupEvidenceLabel, qualifiedSourceLabel, captureGroupIPC } =
   await import(`data:text/javascript;base64,${Buffer.from(compiled).toString('base64')}`)
 
 const base = {
@@ -192,4 +192,23 @@ test('isolation uses a new native IPC so old Me cannot silently run the default 
  const oldBackend={begin_kernsight_group(){deviceActions++}}
  assert.throws(()=>{const fn=oldBackend[captureGroupIPC(request)];if(!fn) throw new Error('unknown IPC');fn()},/unknown IPC/)
  assert.equal(deviceActions,0)
+})
+
+test('new-parent time admission matches separate and unified reserved phases', () => {
+  const separate = captureTimeAllocation({l0:5,l1:30,linker:10},300,true)
+  assert.equal(separate.valid,true); assert.equal(separate.minimumSeconds,300); assert.equal(separate.transferSeconds,30)
+  assert.deepEqual(separate.producer.map(p=>p.seconds),[15,40,20])
+  const unified = captureTimeAllocation({l0:5,l1:30,linker:10},300,false)
+  assert.equal(unified.minimumSeconds,280); assert.equal(unified.transferSeconds,50)
+  assert.equal(unified.archiveSeconds+unified.importSeconds+unified.terminalSeconds,140)
+})
+test('insufficient time never silently shortens persisted windows', () => {
+  const original = {l0:15,l1:90,linker:15}
+  const plan = captureTimeAllocation(original,300,true)
+  assert.equal(plan.valid,false); assert.equal(plan.minimumSeconds,375)
+  assert.deepEqual(original,{l0:15,l1:90,linker:15})
+  assert.equal(captureTimeAllocation({l0:5,l1:30,linker:10},299,true).valid,false)
+  assert.equal(captureTimeAllocation({l0:5,l1:30,linker:10},375,true).transferSeconds,105)
+  for (const total of [NaN,Infinity,29,3601,300.1]) assert.throws(()=>captureTimeAllocation({l0:5,l1:30,linker:10},total,true))
+  for (const l0 of [0,301,1.5,NaN]) assert.throws(()=>captureTimeAllocation({l0,l1:30,linker:10},300,true))
 })

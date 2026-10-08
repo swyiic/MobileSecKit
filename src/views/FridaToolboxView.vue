@@ -17,22 +17,21 @@
           <div class="tool-status-body">
             <strong>{{ tool.name }}</strong>
             <FullValue :label="`${tool.name} 版本`" :value="tool.available ? tool.version : null" :empty-text="tool.available ? '版本未知' : '未安装'" />
-            <details v-if="tool.available" class="tool-version-details">
-              <summary>完整版本输出与路径</summary>
+            <div v-if="tool.available" class="tool-version-details">
               <FullValue :label="`${tool.name} 版本输出`" :value="tool.versionOutput || tool.version" empty-text="未返回版本输出" monospace />
               <p v-if="tool.version && !tool.versionOutput" class="tool-version-warning">未提供完整原始输出，此处仅显示版本摘要</p>
               <p v-if="tool.versionOutputTruncated" class="tool-version-warning">版本输出超过 32 KiB，仅保留前 32 KiB</p>
               <p v-if="tool.versionError" class="tool-version-warning">{{ tool.versionError }}</p>
               <p class="tool-path-label">可执行文件路径</p>
               <FullValue :label="`${tool.name} 路径`" :value="tool.path" monospace />
-            </details>
+            </div>
           </div>
         </div>
       </div>
       <p v-if="!fridaTools.length" class="empty-inline">未检测到 Frida 相关工具；App Analyzer 的静态分析工具不在这里展示。</p>
       <button v-if="!hostFridaAvailable || environment?.hostFridaToolsMatch === false" class="primary-button" @click="$emit('install-host')">{{ hostFridaAvailable ? '修复电脑端 Frida / frida-ps 版本' : '自动安装电脑端 Frida Tools' }}</button>
       <p class="safety-note">电脑端 frida / frida-ps：{{ environment?.hostFridaToolsMatch === true ? '版本一致' : environment?.hostFridaToolsMatch === false ? '版本冲突，请点击修复' : '待检测' }} · 设备 Frida：{{ environment?.deviceFridaReachable ? '连接可用' : '未连接' }}{{ environment?.deviceFridaRequiresDeveloperImage ? '（需要挂载 iOS Developer Disk Image）' : '' }} · 版本 {{ environment?.deviceFridaVersion || '路径未知' }} · ABI {{ environment?.deviceArchitecture || '待识别' }} · 推荐 {{ environment?.recommendedFridaServer || (device?.platform === 'ios' ? 'iOS 使用 Frida 设备通道' : device?.platform === 'android' ? '按 ABI 选择 Android frida-server' : '请先选择设备') }} · 主机/设备版本{{ environment?.fridaVersionMatch === true ? '一致' : environment?.fridaVersionMatch === false ? '不一致' : '待检测' }}</p>
-      <div v-if="device?.platform === 'android'" class="frida-server-row"><div class="configured-path"><span>frida-server</span><code>{{ appConfig.fridaServerPath || '未配置，可使用自动下载' }}</code></div><button class="primary-button" :disabled="!appConfig.fridaServerPath" @click="$emit('server', { action: 'start', path: appConfig.fridaServerPath })">推送并启动</button><button class="primary-button" @click="$emit('server', { action: 'harden' })">Frida痕迹清理</button><button class="ghost-button" :disabled="!hostFridaAvailable || environment?.hostFridaToolsMatch === false" @click="$emit('download')">自动下载并启动</button><button class="ghost-button" @click="$emit('server', { action: 'log' })">服务日志</button><button class="ghost-button" @click="$emit('server', { action: 'stop' })">停止</button></div>
+      <div v-if="device?.platform === 'android'" class="frida-server-row"><div class="configured-path"><span>frida-server</span><FullValue label="frida-server 路径" :value="appConfig.fridaServerPath" empty-text="未配置，可使用自动下载" monospace /></div><button class="primary-button" :disabled="!appConfig.fridaServerPath" @click="$emit('server', { action: 'start', path: appConfig.fridaServerPath })">推送并启动</button><button class="primary-button" @click="$emit('server', { action: 'harden' })">Frida痕迹清理</button><button class="ghost-button" :disabled="!hostFridaAvailable || environment?.hostFridaToolsMatch === false" @click="$emit('download')">自动下载并启动</button><button class="ghost-button" @click="$emit('server', { action: 'log' })">服务日志</button><button class="ghost-button" @click="$emit('server', { action: 'stop' })">停止</button></div>
       <div class="environment-actions"><button class="ghost-button" @click="$emit('refresh-environment')"><span class="material-symbols-outlined">manage_search</span>重新检测 Frida 环境</button><button class="ghost-button" @click="$emit('open-terminal')"><span class="material-symbols-outlined">terminal</span>终端诊断</button><button class="ghost-button" @click="$emit('open-settings')"><span class="material-symbols-outlined">settings</span>修改全局路径</button></div>
       <div v-if="device?.platform === 'ios'" class="configured-action"><div class="configured-path"><span>Developer Disk Image</span><code>{{ appConfig.iosDeveloperImageDirectory || '未配置' }}</code></div><button class="primary-button" :disabled="!appConfig.iosDeveloperImageDirectory" @click="$emit('mount-image', appConfig.iosDeveloperImageDirectory)">挂载 Developer Image</button><button class="ghost-button" @click="copyIosCountermeasure">{{ copyFeedback || '复制 iOS 对抗命令' }}</button></div>
       <details v-if="device?.platform === 'ios'" class="frida-guide developer-image-help"><summary>Developer Disk Image.dmg 是什么，什么时候需要？</summary><p>它是 Apple/Xcode 随 iOS 版本提供的开发调试支持镜像，不是 IPA、系统固件或 Frida Server。只有环境检测明确显示“需要 Developer Disk Image”或调试服务不可用时才需要挂载；镜像及其签名文件应与手机 iOS 版本匹配。越狱设备通过 root 启动的 frida-server 通常不靠它完成注入，因此 Frida 已能列出进程时无需重复挂载。</p></details>
@@ -64,7 +63,7 @@
       <p v-if="attachUnavailable" class="dependency-notice"><strong>当前 App 未运行，无法 Attach。</strong> 请切换为 Spawn（冷启动）；Frida 17 默认会在脚本载入后继续运行应用，不需要旧参数 <code>--no-pause</code>。</p>
       <p v-if="device?.platform === 'ios'" class="safety-note">先用 Minimal + “iOS 注入通道探针（零 Hook）”。如果连 <code>ME_IOS_INJECTION_OK</code> 都没有出现，失败发生在用户脚本执行前，Compat/Aggressive 也无法从脚本内部修复。Aggressive 仅用于普通注入已经成功、但 App 随后主动检测并退出的场景。</p>
       <label class="script-editor"><span>用户脚本（仅本次运行，默认脚本只读取进程模块信息）</span><textarea v-model="script" spellcheck="false"></textarea></label>
-      <div class="configured-action external-script"><div class="configured-path"><span>默认外部脚本</span><code>{{ externalScriptPath || '未配置' }}</code></div><button class="ghost-button" @click="$emit('open-settings')">设置脚本</button><button class="primary-button" :disabled="!selectedProcess || !externalScriptPath || attachUnavailable" @click="submit">运行外部脚本</button></div>
+      <div class="configured-action external-script"><div class="configured-path"><span>默认外部脚本</span><FullValue label="默认外部脚本路径" :value="externalScriptPath" empty-text="未配置" monospace /></div><button class="ghost-button" @click="$emit('open-settings')">设置脚本</button><button class="primary-button" :disabled="!selectedProcess || !externalScriptPath || attachUnavailable" @click="submit">运行外部脚本</button></div>
       <p class="active-script-line"><strong>当前将执行：</strong>{{ activeScriptLabel }}</p>
       <div v-if="device?.platform === 'ios'" class="ios-runtime-workflow runtime-evidence-workflow">
         <header>
@@ -83,7 +82,7 @@
         <div><strong>DEX 运行时产物 · {{ runtimeStatusLabel('dex-artifact') }}</strong><p>程序已内置 Frida 17 原生 dump_dex.js。先勘查 ClassLoader 委派链与 dexElements，可定位隐藏 DEX / 热修复补丁；随后 Dump 会同时覆盖现有元素、内存 DEX 与 DefineClass。</p><button class="ghost-button compact-button" :disabled="!selectedProcess || running" @click="runBuiltinDiagnostic('inspect_classloader.js')">先勘查类加载器</button><button class="ghost-button compact-button" @click="useBuiltIn('dex')">使用内置 DEX 脚本</button></div>
         <div class="runtime-artifact-controls">
           <label><span>触发等待（秒）</span><input v-model.number="dexDuration" type="number" min="10" max="120" /></label>
-          <div class="configured-path workflow-path"><span>DEX 输出目录</span><code>{{ dexDestination || '桌面 MobileE-Dumps' }}</code></div>
+          <div class="configured-path workflow-path"><span>DEX 输出目录</span><FullValue label="DEX 输出目录" :value="dexDestination" empty-text="桌面 MobileE-Dumps" monospace /></div>
           <button class="primary-button" :disabled="!dexDumpReady" @click="runDexDump">按当前模式 Dump、修复并拉回电脑</button>
         </div>
         <small v-if="activeScriptPath && !isDexScript">当前脚本不是 DEX Dump 脚本，请从脚本列表选择 dump_dex。</small>
@@ -92,7 +91,7 @@
         <div><strong>SO 运行时产物 · {{ runtimeStatusLabel('so-artifact') }}</strong><p>内置 dump_so.js 会提取 App 私有的已加载/新加载 SO 内存映像，自动拉回电脑，并扫描 URL、IP、接口和硬编码凭据。</p><button class="ghost-button compact-button" @click="useBuiltIn('so')">使用内置 SO 脚本</button></div>
         <div class="runtime-artifact-controls">
           <label><span>触发等待（秒）</span><input v-model.number="soDuration" type="number" min="10" max="120" /></label>
-          <div class="configured-path workflow-path"><span>SO 输出目录</span><code>{{ soDestination || '桌面 MobileE-Dumps' }}</code></div>
+          <div class="configured-path workflow-path"><span>SO 输出目录</span><FullValue label="SO 输出目录" :value="soDestination" empty-text="桌面 MobileE-Dumps" monospace /></div>
           <button class="primary-button" :disabled="!soDumpReady" @click="runSoDump">按当前模式 Dump SO、拉回并分析</button>
         </div>
         <small v-if="activeScriptPath && !isSoScript">当前脚本不是 SO Dump 脚本；点击“使用内置 SO 脚本”。</small>
@@ -346,8 +345,6 @@ function submit() {
 .tool-status-body { min-width:0; flex:1; }
 .tool-status-body > strong { white-space:normal; overflow-wrap:anywhere; margin-bottom:5px; }
 .tool-version-details { min-width:0; margin-top:7px; }
-.tool-version-details summary { color:var(--primary); font-size:10px; line-height:1.6; cursor:pointer; overflow-wrap:anywhere; }
-.tool-version-details[open] summary { margin-bottom:8px; }
 .tool-version-warning, .tool-path-label { color:var(--muted); font-size:10px; line-height:1.5; overflow-wrap:anywhere; }
 .tool-version-warning { color:var(--amber); }
 .environment-card .safety-note { overflow-wrap:anywhere; }

@@ -88,6 +88,16 @@ impl Group {
         }
         if let Some(b) = self.budget.as_ref() {
             b.validate()?;
+            if let Some(plan) = b.time_plan.as_ref() {
+                let durations = ["l0", "l1", "linker"].map(|kind| {
+                    self.stages
+                        .iter()
+                        .find(|s| s.key == kind)
+                        .map(|s| s.duration_seconds)
+                        .unwrap_or(0)
+                });
+                plan.validate_observations(!self.unified, &durations)?;
+            }
         }
         validate_serial(&self.serial)?;
         validate_package(&self.package)?;
@@ -597,10 +607,11 @@ fn begin_group_at(
         cancel_requested: false,
         unified: !startup_replay,
         state: "planned".into(),
-        budget: Some(session_budget::Contract::new_planned(
+        budget: Some(session_budget::Contract::new_planned_with_time(
             request.session_budget.clone().unwrap_or_default(),
             now_millis(),
             startup_replay,
+            &durations,
         )?),
         base,
         stages,
@@ -802,6 +813,12 @@ async fn run_group_stage_at(
         }
         Err(e) => (None, Some(e), None),
     };
+    if let Some(b) = g.budget.as_ref() {
+        merge_phase_failure(
+            &mut error,
+            b.check_time_phase(&stage.key, now_millis()).err(),
+        );
+    }
     let remote_lifecycle =
         if result.is_some() || error.as_deref().is_some_and(session_deadline::is_stop) {
             Some(
@@ -879,6 +896,12 @@ async fn run_group_stage_at(
                 error = Some(format!("{}; {stop}", error.as_deref().unwrap()));
             }
         }
+        if let Some(b) = g.budget.as_ref() {
+            merge_phase_failure(
+                &mut error,
+                b.check_time_phase(&stage.key, now_millis()).err(),
+            );
+        }
         g.finish(&r, session, artifact, error.clone())?;
         mark_stopped_budget(&mut g, error.as_deref());
         if result.is_none()
@@ -887,7 +910,7 @@ async fn run_group_stage_at(
             })
         {
             if let Some(b) = g.budget.as_mut() {
-                b.release_unstarted(&r.attempt_id.to_string())?;
+                b.release_stage_granted_before_capture(&r.attempt_id.to_string())?;
             }
         }
         if let (Some(b), Some(result)) = (g.budget.as_mut(), result.as_ref()) {
@@ -897,6 +920,9 @@ async fn run_group_stage_at(
                 .filter_map(|l| serde_json::from_str::<Value>(l).ok())
                 .find(|v| v["schema"] == "kernsight.output-budget/v1")
             {
+                let (note, phase_failure) =
+                    b.phase_settlement_note(&stage.key, &note, now_millis());
+                merge_phase_failure(&mut error, phase_failure);
                 let settlement = b.settle(&r.attempt_id.to_string(), &note);
                 let settled = settlement.is_ok();
                 if let Err(e) = settlement {
@@ -921,7 +947,10 @@ async fn run_group_stage_at(
                         a.state = "partial".into();
                         a.error = Some(format!(
                             "采集覆盖 partial（{}）；已保存证据可拉取",
-                            note["reason"].as_str().unwrap_or("原因未确认")
+                            note["reason"]
+                                .as_str()
+                                .or_else(|| note["host_time_fence"].as_str())
+                                .unwrap_or("原因未确认")
                         ));
                     }
                     g.refresh();
@@ -2070,6 +2099,12 @@ pub async fn run_kernsight_unified_group(
         Ok(r) => (Some(r), None),
         Err(e) => (None, Some(e)),
     };
+    if let Some(b) = g.budget.as_ref() {
+        merge_phase_failure(
+            &mut error,
+            b.check_time_phase("unified", now_millis()).err(),
+        );
+    }
     let remote_lifecycle =
         if result.is_some() || error.as_deref().is_some_and(session_deadline::is_stop) {
             Some(
@@ -2109,6 +2144,12 @@ pub async fn run_kernsight_unified_group(
                 error = Some(format!("{}; {stop}", error.as_deref().unwrap()));
             }
         }
+        if let Some(b) = g.budget.as_ref() {
+            merge_phase_failure(
+                &mut error,
+                b.check_time_phase("unified", now_millis()).err(),
+            );
+        }
         g.finish_unified(&relations, result.as_ref(), error.as_deref())?;
         mark_stopped_budget(&mut g, error.as_deref());
         for attempt in g.stages[..3]
@@ -2124,7 +2165,7 @@ pub async fn run_kernsight_unified_group(
             })
         {
             if let Some(b) = g.budget.as_mut() {
-                b.release_unstarted(&relations[0].attempt_id.to_string())?;
+                b.release_stage_granted_before_capture(&relations[0].attempt_id.to_string())?;
             }
         }
         if let (Some(b), Some(result)) = (g.budget.as_mut(), result.as_ref()) {
@@ -2134,6 +2175,8 @@ pub async fn run_kernsight_unified_group(
                 .filter_map(|l| serde_json::from_str::<Value>(l).ok())
                 .find(|v| v["schema"] == "kernsight.output-budget/v1")
             {
+                let (note, phase_failure) = b.phase_settlement_note("unified", &note, now_millis());
+                merge_phase_failure(&mut error, phase_failure);
                 if let Err(e) = b.settle(&relations[0].attempt_id.to_string(), &note) {
                     for a in g.stages[..3]
                         .iter_mut()
@@ -2152,7 +2195,14 @@ pub async fn run_kernsight_unified_group(
                         .filter(|a| relations.contains(&a.relation))
                     {
                         a.state = "partial".into();
-                        a.error = Some("统一采集预算耗尽，保留原 session，覆盖 partial".into());
+                        a.error = Some(
+                            note["host_time_fence"]
+                                .as_str()
+                                .map(|s| format!("{s}；保留原session，覆盖partial"))
+                                .unwrap_or_else(|| {
+                                    "统一采集预算耗尽，保留原 session，覆盖 partial".into()
+                                }),
+                        );
                     }
                     g.refresh();
                 }
@@ -3036,3 +3086,155 @@ mod missing_child_report_tests {
 
 #[cfg(test)]
 mod approved_usb_dependency_acceptance;
+
+/// Start the actual export phase, not its earlier byte reservation. No new parent clock.
+pub(super) fn begin_export_time_at(root: &Path, g: &mut Group, kind: &str) -> Result<u64, String> {
+    if !matches!(kind, "transfer" | "archive" | "import" | "terminal") {
+        return Err("无效导出时间阶段".into());
+    }
+    let _lock = IO_LOCK.lock().map_err(|e| e.to_string())?;
+    *g = load(root, g.id)?;
+    if g.cancel_requested {
+        return Err("父会话已取消，未启动导出".into());
+    }
+    let ms = g
+        .budget
+        .as_mut()
+        .ok_or("父预算未知，未续期")?
+        .begin_time_phase(kind, now_millis())?;
+    save(root, g)?;
+    Ok(ms)
+}
+
+#[cfg(test)]
+mod explicit_time_parent_tests {
+    use super::*;
+    #[test]
+    fn new_parent_refuses_long_windows_before_saving_and_persists_explicit_short_plan() {
+        let root = std::env::temp_dir().join(format!("me-new-time-{}", Uuid::new_v4()));
+        let req:KernSightCaptureRequest=serde_json::from_value(serde_json::json!({"serial":"synthetic","package":"org.example.fixture","durationSeconds":5,"sessionBudget":{"totalBytes":4294967296u64,"maxSeconds":300}})).unwrap();
+        assert!(begin_group_at(root.clone(), req.clone(), vec![15, 90, 15], true).is_err());
+        assert!(!root.exists());
+        let group = begin_group_at(root.clone(), req, vec![5, 30, 10], true).unwrap();
+        let token = group.budget.as_ref().unwrap().deadline_token;
+        let restored = load(&root, group.id).unwrap();
+        assert!(restored.budget.as_ref().unwrap().time_plan.is_some());
+        assert_eq!(restored.budget.as_ref().unwrap().deadline_token, token);
+        let mut altered = restored.clone();
+        altered
+            .stages
+            .iter_mut()
+            .find(|s| s.key == "l1")
+            .unwrap()
+            .duration_seconds = 90;
+        assert!(altered.validate().is_err());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn export_phase_start_is_persisted_without_new_parent_token() {
+        let root = std::env::temp_dir().join(format!("me-phase-time-{}", Uuid::new_v4()));
+        let req:KernSightCaptureRequest=serde_json::from_value(serde_json::json!({"serial":"synthetic","package":"org.example.fixture","durationSeconds":5,"sessionBudget":{"totalBytes":4294967296u64,"maxSeconds":300}})).unwrap();
+        let mut g = begin_group_at(root.clone(), req, vec![5, 30, 10], true).unwrap();
+        let token = g.budget.as_ref().unwrap().deadline_token;
+        let first = begin_export_time_at(&root, &mut g, "transfer").unwrap();
+        assert!(first <= 30000);
+        std::thread::sleep(Duration::from_millis(3));
+        let next = begin_export_time_at(&root, &mut g, "transfer").unwrap();
+        assert!(next < first);
+        assert_eq!(g.budget.as_ref().unwrap().deadline_token, token);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+}
+
+fn merge_phase_failure(error: &mut Option<String>, failure: Option<String>) {
+    if let Some(failure) = failure {
+        if let Some(previous) = error.as_mut() {
+            if !previous.contains(&failure) {
+                previous.push_str("; ");
+                previous.push_str(&failure);
+            }
+        } else {
+            *error = Some(failure);
+        }
+    }
+}
+
+/// Only the caller's known pre-payload failure paths may use this cleanup wrapper.
+pub(super) fn release_unstarted_export_after_lease_at(
+    root: &Path,
+    g: &mut Group,
+    output: &Path,
+    kinds: &[&str],
+) -> Result<(), String> {
+    let _lock = IO_LOCK.lock().map_err(|e| e.to_string())?;
+    *g = load(root, g.id)?;
+    if let Some(b) = g.budget.as_mut() {
+        for kind in kinds {
+            b.release_granted_before_payload(&format!("export:{}:{kind}", output.display()))?;
+        }
+    }
+    g.refresh();
+    save(root, g)
+}
+
+#[cfg(test)]
+mod stage_time_fence_tests {
+    use super::*;
+    #[test]
+    fn actual_session_survives_late_completion_without_success_upgrade() {
+        let mut g = tests::group();
+        for stage in &mut g.stages {
+            stage.duration_seconds = match stage.key.as_str() {
+                "l0" => 5,
+                "l1" => 30,
+                "linker" => 10,
+                _ => 0,
+            };
+        }
+        g.budget = Some(
+            session_budget::Contract::new_planned_with_time(
+                session_budget::Limits {
+                    total_bytes: 4294967296,
+                    max_seconds: 300,
+                },
+                now_millis(),
+                true,
+                &[5, 30, 10],
+            )
+            .unwrap(),
+        );
+        let relation = g.start("l0", epoch()).unwrap();
+        let sid = Uuid::new_v4();
+        let token = g.budget.as_ref().unwrap().deadline_token;
+        let b = g.budget.as_mut().unwrap();
+        b.reserve(relation.attempt_id.to_string(), "l0", now_millis())
+            .unwrap();
+        b.time_plan
+            .as_mut()
+            .unwrap()
+            .phases
+            .iter_mut()
+            .find(|p| p.kind == "l0")
+            .unwrap()
+            .stop_at_parent_remaining_ms = Some(300000);
+        let mut error = None;
+        merge_phase_failure(&mut error, b.check_time_phase("l0", now_millis()).err());
+        assert!(error.is_some());
+        g.finish(&relation, Some(sid), None, error.clone()).unwrap();
+        let raw =
+            serde_json::json!({"admitted_write_bytes":77,"partial":false,"source_session":sid});
+        let b = g.budget.as_mut().unwrap();
+        let (note, failure) = b.phase_settlement_note("l0", &raw, now_millis());
+        assert!(failure.is_some());
+        b.settle(&relation.attempt_id.to_string(), &note).unwrap();
+        let a = &g.stages[0].attempts[0];
+        assert_eq!(a.session_id, Some(sid));
+        assert_ne!(a.state, "succeeded");
+        assert!(a.error.as_ref().unwrap().contains("phase_time_exhausted"));
+        assert_eq!(raw["partial"], false);
+        assert_eq!(note["source_session"], raw["source_session"]);
+        assert_eq!(g.budget.as_ref().unwrap().deadline_token, token);
+        assert!(g.start("l1", epoch()).is_err());
+        g.validate().unwrap();
+    }
+}
