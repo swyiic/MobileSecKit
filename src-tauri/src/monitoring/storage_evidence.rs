@@ -424,10 +424,7 @@ fn fitting_dex_images(bytes: &[u8]) -> DexCandidateScan {
             stop_reason = Some("rejected_candidate_limit");
             break;
         }
-        let Some(rel) = bytes[search..]
-            .windows(4)
-            .position(|window| window == b"dex\n")
-        else {
+        let Some(rel) = memchr::memmem::find(&bytes[search..], b"dex\n") else {
             scanned_through = bytes.len();
             break;
         };
@@ -495,12 +492,8 @@ fn inspect_runtime_bytes_with_class_budget(bytes: &[u8], _class_budget: &mut usi
     } = fitting_dex_images(bytes);
     let file_bytes = bytes.len();
     let unscanned_tail = file_bytes.saturating_sub(scanned_through);
-    let elf_magic = bytes
-        .get(..scanned_through)
-        .unwrap_or(&[])
-        .windows(4)
-        .filter(|b| *b == b"\x7fELF")
-        .count();
+    let elf_magic =
+        memchr::memmem::find_iter(bytes.get(..scanned_through).unwrap_or(&[]), b"\x7fELF").count();
     let mut objects = Vec::new();
     for (offset, len) in images {
         let slice = &bytes[offset..offset.saturating_add(len)];
@@ -1099,5 +1092,53 @@ mod tests {
             result["hash_budget_bytes"].as_u64().unwrap()
         );
         fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod memmem_candidate_equivalence {
+    #[test]
+    fn byte_search_matches_windows_at_every_boundary() {
+        for needle in [b"dex\n".as_slice(), b"\x7fELF".as_slice()] {
+            for len in 0..128 {
+                for offset in 0..=len {
+                    let mut bytes = vec![0_u8; len];
+                    if offset + needle.len() <= len {
+                        bytes[offset..offset + needle.len()].copy_from_slice(needle);
+                    }
+                    assert_eq!(
+                        memchr::memmem::find(&bytes, needle),
+                        bytes.windows(4).position(|w| w == needle)
+                    );
+                    let old: Vec<_> = bytes
+                        .windows(4)
+                        .enumerate()
+                        .filter_map(|(i, w)| (w == needle).then_some(i))
+                        .collect();
+                    let new: Vec<_> = memchr::memmem::find_iter(&bytes, needle).collect();
+                    assert_eq!(new, old);
+                }
+            }
+        }
+    }
+    #[test]
+    fn adjacent_and_false_prefixes_preserve_all_matches() {
+        for needle in [b"dex\n".as_slice(), b"\x7fELF".as_slice()] {
+            let mut bytes = Vec::new();
+            for _ in 0..80 {
+                bytes.extend_from_slice(&needle[..3]);
+                bytes.extend_from_slice(needle);
+                bytes.extend_from_slice(needle);
+            }
+            let old: Vec<_> = bytes
+                .windows(4)
+                .enumerate()
+                .filter_map(|(i, w)| (w == needle).then_some(i))
+                .collect();
+            assert_eq!(
+                memchr::memmem::find_iter(&bytes, needle).collect::<Vec<_>>(),
+                old
+            );
+        }
     }
 }
