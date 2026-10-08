@@ -1060,7 +1060,7 @@ async fn run_group_stage_at(
             &g,
             g.stages.iter().find(|s| s.key == stage_key).unwrap(),
         ) {
-        Some("sealed_loss_only_snapshot".to_owned())
+        Some("sealed_partial_snapshot".to_owned())
     } else if continue_after_partial && dump_sources_absent {
         Some("source_absent_independent_start".to_owned())
     } else {

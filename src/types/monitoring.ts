@@ -462,7 +462,7 @@ export interface KernSightCaptureGroup {
     attempts:KernSightCaptureAttempt[]}>
 }
 export interface KernSightGroupStageResult {
-  continuationPolicy?: "sealed_loss_only_snapshot" | "source_absent_independent_start" | null
+  continuationPolicy?: "sealed_partial_snapshot" | "source_absent_independent_start" | null
   group:KernSightCaptureGroup;result:KernSightCaptureResult|null;error:string|null;continueAfterPartial?:boolean}
 
 export interface KernSightCaptureGroupTrash {

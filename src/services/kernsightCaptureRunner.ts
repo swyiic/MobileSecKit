@@ -26,7 +26,7 @@ export async function runCaptureGroupPlan(initial: KernSightCaptureGroup, backen
     const state = latest?.attempts[latest.attempts.length - 1]?.state
     const next = group.stages[group.stages.findIndex(stage => stage.key === key) + 1]
     const allowedPartial = key !== 'session' && (state === 'partial' || state === 'unavailable') && reply.continueAfterPartial === true
-      && ((next?.key === 'dump' && reply.continuationPolicy === 'sealed_loss_only_snapshot')
+      && ((next?.key === 'dump' && reply.continuationPolicy === 'sealed_partial_snapshot')
         || (next?.launchAfterAttach === true && (state !== 'unavailable' || reply.continuationPolicy === 'source_absent_independent_start')))
     if (reply.error && !allowedPartial) throw new Error(reply.error)
     if (key !== 'session' && state !== 'succeeded' && !allowedPartial) {

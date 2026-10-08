@@ -137,12 +137,12 @@ test('even a mistaken continuation flag cannot run the snapshot after partial L1
 })
 
  test('typed sealed coverage partial reaches snapshot and independent Linker without upgrading state',async()=>{
-  const g=initial(false),h=harness(g,{l1:{state:'partial',continueAfterPartial:true,continuationPolicy:'sealed_loss_only_snapshot'}});
+  const g=initial(false),h=harness(g,{l1:{state:'partial',continueAfterPartial:true,continuationPolicy:'sealed_partial_snapshot'}});
   const done=await runCaptureGroupPlan(g,h.backend,h.hooks);
   assert.deepEqual(h.calls.map(c=>c[1]),['l0','l1','dump','linker']);assert.equal(done.stages[1].attempts[0].state,'partial');
  });
  test('typed original source absence skips unavailable Dump and permits independent Linker',async()=>{
-  const g=initial(false),h=harness(g,{l1:{state:'partial',continueAfterPartial:true,continuationPolicy:'sealed_loss_only_snapshot'},dump:{state:'unavailable',continueAfterPartial:true,continuationPolicy:'source_absent_independent_start'}});
+  const g=initial(false),h=harness(g,{l1:{state:'partial',continueAfterPartial:true,continuationPolicy:'sealed_partial_snapshot'},dump:{state:'unavailable',continueAfterPartial:true,continuationPolicy:'source_absent_independent_start'}});
   const done=await runCaptureGroupPlan(g,h.backend,h.hooks);
   assert.deepEqual(h.calls.map(c=>c[1]),['l0','l1','dump','linker']);assert.equal(done.stages[2].attempts[0].state,'unavailable');
  });

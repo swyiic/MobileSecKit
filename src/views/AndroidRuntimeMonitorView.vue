@@ -1249,7 +1249,7 @@ const capturePolicyHint = computed(() => {
   if (captureForm.plan === 'auto' && !autoTimeAllocation.value?.valid) return autoTimeAllocation.value ? `总期限不足：至少 ${autoTimeAllocation.value.minimumSeconds}s，传输需至少 30s，未启动。请显式调整新父会话。` : '采集窗口或总期限无效，未启动。'
   if (!captureValid.value) return 'Inspect / Sched / Dump / 自动采集必须填写包名；时长 1–300 秒；父会话不支持额外密钥、私有存储、通用内存窗口或 Hide debug。'
   if (captureForm.plan === 'dump') return 'L2 dump --launch：force-stop 后由 dump 自己拉起 App，SIGSTOP 拷堆 DEX/SO/CE·DE。不是 eBPF 会话，不要同时挂 Inspect。'
-  if (captureForm.plan === 'auto' && captureForm.autoSessionMode === 'startup_replay') return '启动重采保留各能力自己的启动窗口：L0 → 重启 L1 → 该实例快照 → 重启 Linker。三个 session 不能冒充同一进程生命周期。已确认排空、封存、身份和预算结算的仅丢样 partial 可继续快照，快照会重新核验原实例；原来源已消失时标为不可执行，再检查独立 Linker。缺证明、取消、清理未知或其它失败停止；已有证据仍尝试在原期限内保存，父流程保留 partial。'
+  if (captureForm.plan === 'auto' && captureForm.autoSessionMode === 'startup_replay') return '启动重采保留各能力自己的启动窗口：L0 → 重启 L1 → 该实例快照 → 重启 Linker。三个 session 不能冒充同一进程生命周期。已确认生产者退出、封存、身份和预算结算的覆盖 partial 可继续独立快照；丢样和未读尾部仍保留为缺口，快照会重新核验原实例；原来源已消失时标为不可执行，再检查独立 Linker。缺证明、取消、清理未知或其它失败停止；已有证据仍尝试在原期限内保存，父流程保留 partial。'
   if (captureForm.plan === 'auto') return `统一 session：首次冷启动 → L0 ${captureForm.autoL0Seconds}s → L0+L1 ${captureForm.autoL1Seconds}s → Linker ${captureForm.autoLinkerSeconds}s → 最终驻留快照。后续阶段不重启 App，主进程退出或代际变化则停止。界面显示计划等待，实际起止和失败由 agent 阶段记录核对。按业务顺序逐步操作；阶段成功不代表所有动态代码已覆盖。Memory all 仍是高流量选项。`
   if (captureForm.hideDebug) return 'Hide debug 会暂时断开 ADB；设备端 watchdog 在会话结束后恢复调试，MobileE 会等待重连。'
   if (captureForm.inspectMode === 'tls') return 'TLS Inspect 保留 bounded 明文 preview 与 SHA-256；AArch32 uprobe 在当前 GKI 可能返回 ENOTSUP。'

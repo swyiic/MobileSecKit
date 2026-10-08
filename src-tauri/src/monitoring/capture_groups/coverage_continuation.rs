@@ -69,25 +69,35 @@ pub(super) fn proof(
     }
     let drain = unique_record(result, "kernsight.capture-drain/v1")?;
     let poll = unique_record(result, "kernsight.perf-poll-budget/v1")?;
-    if drain["producers_stopped"] != true
-        || drain["queues_observed_empty"] != true
-        || drain["unknown_tail"] != false
-        || drain["lost_samples"].as_u64()? == 0
-        || drain["rounds"].as_u64()? == 0
-        || poll["scope_failures"] != 0
-        || poll["perf_read_failures"] != 0
-        || poll["unread_tail_possible"] != false
-        || poll["coverage_partial"] != true
-    {
+    if !safe_closed_coverage(&drain, &poll) {
         return None;
     }
     Some(
         serde_json::json!({"schema":"mobilee.coverage-continuation/v1",
         "relation":relation,"sessionId":session,"token":lifecycle["token"],
         "source":"owned capture result plus fresh matched sealed spool",
-        "coverage":"loss_only","drain":drain,"poll":poll,
+        "coverage":if drain["unknown_tail"] == true || poll["unread_tail_possible"] == true {"incomplete_tail"}else{"loss_only"},"drain":drain,"poll":poll,
         "acceptedEvents":accepted,"committedEvents":accepted,"sealed":true}),
     )
+}
+// Queue coverage is independent of closed-producer and original-source safety.
+// Require explicit, internally consistent diagnostics; never infer absent fields.
+fn safe_closed_coverage(drain: &Value, poll: &Value) -> bool {
+    drain["schema"] == "kernsight.capture-drain/v1"
+        && poll["schema"] == "kernsight.perf-poll-budget/v1"
+        && drain["producers_stopped"] == true
+        && drain["queues_observed_empty"].as_bool().is_some()
+        && drain["unknown_tail"].as_bool()
+            == drain["queues_observed_empty"].as_bool().map(|empty| !empty)
+        && drain["rounds"].as_u64().is_some_and(|n| n > 0)
+        && drain["lost_samples"].as_u64().is_some()
+        && poll["scope_failures"] == 0
+        && poll["perf_read_failures"] == 0
+        && poll["unread_tail_possible"].as_bool().is_some()
+        && poll["coverage_partial"] == true
+        && (drain["lost_samples"].as_u64().is_some_and(|n| n > 0)
+            || drain["unknown_tail"] == true
+            || poll["unread_tail_possible"] == true)
 }
 pub(super) fn authorize_phase(proof: Option<Value>, safe: bool) -> Option<Value> {
     if !safe {
@@ -117,17 +127,13 @@ pub(super) fn verified(group: &Group, stage: &Stage) -> bool {
         && p["sessionId"] == serde_json::json!(a.session_id)
         && p["token"] == n["token"]
         && p["sealed"] == true
-        && p["coverage"] == "loss_only"
+        && matches!(
+            p["coverage"].as_str(),
+            Some("loss_only" | "incomplete_tail")
+        )
         && p["acceptedEvents"].as_u64().is_some()
         && p["acceptedEvents"] == p["committedEvents"]
-        && p["drain"]["producers_stopped"] == true
-        && p["drain"]["queues_observed_empty"] == true
-        && p["drain"]["unknown_tail"] == false
-        && p["drain"]["lost_samples"].as_u64().is_some_and(|n| n > 0)
-        && p["poll"]["scope_failures"] == 0
-        && p["poll"]["perf_read_failures"] == 0
-        && p["poll"]["unread_tail_possible"] == false
-        && p["poll"]["coverage_partial"] == true
+        && safe_closed_coverage(&p["drain"], &p["poll"])
         && n["stop_command_attempted"] == false
         && n["stop_request_recorded"] == false
         && n["startup"]["timing"]["launcher_status"] == "completed"
@@ -337,14 +343,45 @@ mod tests {
         assert_eq!(g.stages[2].attempts[0].state, "unavailable");
     }
     #[test]
+    fn sealed_unread_tail_allows_independent_snapshot_but_preserves_partial() {
+        let (g, r, mut result, n, m, source) = fixture();
+        let mut rows: Vec<Value> = result
+            .stderr
+            .lines()
+            .filter_map(|l| serde_json::from_str(l).ok())
+            .collect();
+        rows[0]["queues_observed_empty"] = json!(false);
+        rows[0]["unknown_tail"] = json!(true);
+        rows[1]["unread_tail_possible"] = json!(true);
+        result.stderr = rows
+            .iter()
+            .map(Value::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        let p = proof(&g, &r, result.session_id.unwrap(), &result, &n, &m, &source).unwrap();
+        assert_eq!(p["coverage"], "incomplete_tail");
+        assert_eq!(p["drain"]["unknown_tail"], true);
+        rows[0]["producers_stopped"] = json!(false);
+        result.stderr = rows
+            .iter()
+            .map(Value::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(proof(&g, &r, result.session_id.unwrap(), &result, &n, &m, &source).is_none());
+        rows[0]["producers_stopped"] = json!(true);
+        rows[0].as_object_mut().unwrap().remove("unknown_tail");
+        result.stderr = rows
+            .iter()
+            .map(Value::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(proof(&g, &r, result.session_id.unwrap(), &result, &n, &m, &source).is_none());
+    }
+    #[test]
     fn missing_conflicting_or_unsafe_counter_and_identity_facts_fail_closed() {
         let (g, r, result, n, m, source) = fixture();
         let session = result.session_id.unwrap();
-        for field in [
-            "scope_failures",
-            "perf_read_failures",
-            "unread_tail_possible",
-        ] {
+        for field in ["scope_failures", "perf_read_failures"] {
             let mut bad = copy_result(&result);
             let mut rows: Vec<Value> = bad
                 .stderr
