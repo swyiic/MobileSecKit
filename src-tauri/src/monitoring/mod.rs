@@ -6,6 +6,7 @@ mod delivery_linker_intake;
 mod dex_class_index;
 mod dump_policy;
 mod elf_runtime;
+mod perf_loss;
 mod runtime_paths;
 mod session_budget;
 pub(crate) mod session_deadline;
@@ -1470,12 +1471,14 @@ async fn get_kernsight_session_report_scoped(
         .await?;
     let mut builder = SessionReportBuilder::default();
     let mut linker = LinkerObservations::default();
+    let mut perf_loss = perf_loss::PerfLoss::default();
     loop {
         match connection.receive().await? {
             Message::EventBatch(batch) if batch.session_id == session_id => {
                 for event in &batch.events {
                     builder.record(event);
                     linker.record(event);
+                    perf_loss.record(event);
                 }
             }
             Message::ReplayComplete(complete)
@@ -1496,6 +1499,7 @@ async fn get_kernsight_session_report_scoped(
     compact_session_report_for_ui(&mut report);
     let mut report = serde_json::to_value(report).map_err(|error| error.to_string())?;
     linker.augment(&mut report);
+    perf_loss.augment(&mut report);
     Ok(KernSightSessionReport {
         session_id,
         report_schema: "mobilee.kernsight-session-report/v1".into(),
@@ -4488,6 +4492,7 @@ async fn append_device_sessions_to_package_evidence(
 
     let mut aggregate = SessionReportBuilder::default();
     let mut aggregate_linker = LinkerObservations::default();
+    let mut aggregate_perf_loss = perf_loss::PerfLoss::default();
     let mut included_ids = Vec::new();
     let mut matched_ids = Vec::new();
     let mut failures = Vec::new();
@@ -4536,8 +4541,10 @@ async fn append_device_sessions_to_package_evidence(
             }
         };
         let mut builder = SessionReportBuilder::default();
+        let mut perf_loss = perf_loss::PerfLoss::default();
         for event in &events {
             builder.record(event);
+            perf_loss.record(event);
         }
         let report = builder.finish();
         let belongs_to_package = report
@@ -4569,6 +4576,7 @@ async fn append_device_sessions_to_package_evidence(
             linker.record(event);
         }
         linker.augment(&mut report);
+        perf_loss.augment(&mut report);
         let session_dir = sessions_root.join(session_id.to_string());
         let report_bytes =
             session_budget::measure_json(&session_dir.join("session-report.json"), &report)
@@ -4604,6 +4612,7 @@ async fn append_device_sessions_to_package_evidence(
         for event in &events {
             aggregate.record(event);
             aggregate_linker.record(event);
+            aggregate_perf_loss.record(event);
         }
         matched_ids.push(session_id.to_string());
     }
@@ -4613,6 +4622,7 @@ async fn append_device_sessions_to_package_evidence(
     let mut aggregate_value =
         serde_json::to_value(aggregate_report).map_err(|error| error.to_string())?;
     aggregate_linker.augment(&mut aggregate_value);
+    aggregate_perf_loss.augment(&mut aggregate_value);
     if let Some(object) = aggregate_value.as_object_mut() {
         object.insert(
             "execution_complete".into(),

@@ -10,6 +10,9 @@ const MAX_ERROR_EXCERPT_BYTES: usize = 4096;
 #[serde(rename_all = "camelCase")]
 pub struct CaptureDiagnostic {
     pub schema: String,
+    /// Display-only original counter records; never authorize continuation.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub coverage_records: Vec<Value>,
     /// Original output retained in the parent file, within its terminal byte reserve.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub raw_output: Option<RawOutput>,
@@ -190,6 +193,26 @@ fn error_excerpt(source: &str, text: &str) -> (Option<String>, bool) {
     (Some(format!("{prefix}{retained}{suffix}")), truncated)
 }
 
+fn coverage_records(result: Option<&KernSightCaptureResult>) -> Vec<Value> {
+    let mut records = Vec::new();
+    for schema in [
+        "kernsight.capture-drain/v1",
+        "kernsight.perf-poll-budget/v1",
+    ] {
+        if let Some(record) = result
+            .into_iter()
+            .flat_map(|r| r.stderr.lines())
+            .rev()
+            .filter(|line| line.len() <= 2048)
+            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+            .find(|v| v["schema"] == schema && serde_json::to_vec(v).is_ok_and(|b| b.len() <= 2048))
+        {
+            records.push(record);
+        }
+    }
+    records
+}
+
 pub(super) fn collect(
     attempt: &Attempt,
     result: Option<&KernSightCaptureResult>,
@@ -242,6 +265,7 @@ pub(super) fn collect(
         text.len() + format!("[{name}]\n").len() > MAX_CAPTURE_DIAGNOSTIC_BYTES
     });
     Some(CaptureDiagnostic {
+        coverage_records: coverage_records(result),
         schema: DIAGNOSTIC_SCHEMA.into(),
         raw_output: result.map(raw_output),
         raw_output_attempt_id: None,
@@ -259,6 +283,22 @@ pub(super) fn collect(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn coverage_counters_survive_large_unretained_output_as_display_only_records() {
+        let drain = serde_json::json!({"schema":"kernsight.capture-drain/v1", "producers_stopped":true,"queues_observed_empty":true,"unknown_tail":false,"lost_samples":123});
+        let poll = serde_json::json!({"schema":"kernsight.perf-poll-budget/v1", "unread_tail_possible":false,"scope_failures":0,"perf_read_failures":0,"coverage_partial":true});
+        let stderr = format!(
+            "{}\n{drain}\n{poll}\nError: capture coverage partial",
+            "x".repeat(100000)
+        );
+        let a = attempt();
+        let diagnostic = collect(&a, Some(&output("", &stderr))).unwrap();
+        assert_eq!(diagnostic.coverage_records, vec![drain, poll]);
+        assert!(diagnostic.raw_tail_truncated);
+        assert_eq!(a.state, "failed");
+        assert!(collect(&a, None).is_none());
+    }
 
     fn attempt() -> Attempt {
         serde_json::from_value(serde_json::json!({
