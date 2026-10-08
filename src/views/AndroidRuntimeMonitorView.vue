@@ -1645,6 +1645,11 @@ async function completePurge(report: KernSightGroupPurgeReport, plan: KernSightG
     return
   }
   if (report.localState === 'completed' && ['completed', 'not_required'].includes(report.deviceState)) purgeTarget.value = null
+  else if (purgeTarget.value?.parentId === plan.parentId && purgeTarget.value.serial === plan.serial && purgeTarget.value.package === plan.package) {
+    // Preserve the exact durable authorization if the local row disappears and
+    // its failure panel remounts; never create a new deletion scope on retry.
+    purgeTarget.value = { ...purgeTarget.value, retryPlanId: report.id }
+  }
   purgeReports.value = [...purgeReports.value.filter(item => item.id !== report.id), report]
   purgeMessage.value = `${purgeReportLabel(report)} · 父会话 ${report.parentId} · 本地 ${report.localState} / 手机 ${report.deviceState}。${report.error || ''}`
   if (report.localState === 'completed') {

@@ -1,8 +1,9 @@
-//! Identity-bound, bounded cleanup of exact device files selected in a preview.
+//! Identity-bound cleanup of exact exclusively owned session directories.
 //!
-//! No package-name discovery, recursive deletion, wildcard deletion, capture stop,
-//! or app-private access. Control records and empty directories are retained so a
-//! disconnected/partially completed operation can be verified and retried.
+//! No package-name discovery, parent-wide cleanup, capture stop, or private access.
+//! Exact spool UUID/attempt dump boundaries, small ownership receipts, stable device
+//! identity, inactive controllers and filesystem boundaries authorize bounded batch
+//! unlink. Original APKs, external shared inodes/CAS and control records remain.
 use super::*;
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use sha2::{Digest, Sha256};
@@ -18,6 +19,8 @@ const STAT_FORMAT: &str = "%f:%d:%i:%h:%s:%b:%Y:%Z";
 #[serde(rename_all = "camelCase")]
 pub struct DeviceSnapshot {
     pub parent_id: Uuid,
+    #[serde(default)]
+    directory_scope: bool,
     pub serial: String,
     /// Resolved transport only; original manifest serial and fingerprint remain unchanged.
     #[serde(default)]
@@ -49,6 +52,8 @@ pub struct DeviceRoot {
     evidence: BTreeMap<String, String>,
     entries: Vec<Entry>,
     absent: bool,
+    #[serde(default)]
+    missing_owner_files: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -282,6 +287,7 @@ fn expected_roots(group: &Group) -> Result<Vec<DeviceRoot>, String> {
                     evidence: BTreeMap::new(),
                     entries: vec![],
                     absent: false,
+                    missing_owner_files: vec![],
                 });
                 continue;
             }
@@ -298,6 +304,7 @@ fn expected_roots(group: &Group) -> Result<Vec<DeviceRoot>, String> {
                     evidence: BTreeMap::new(),
                     entries: vec![],
                     absent: false,
+                    missing_owner_files: vec![],
                 });
                 if root.relation != *relation {
                     return Err("共享 spool 的 controller 归属冲突".into());
@@ -325,6 +332,7 @@ fn expected_roots(group: &Group) -> Result<Vec<DeviceRoot>, String> {
                             evidence: BTreeMap::new(),
                             entries: vec![],
                             absent: false,
+                            missing_owner_files: vec![],
                         },
                     )
                     .is_some()
@@ -353,7 +361,17 @@ async fn adb(serial: &str, script: String) -> Result<crate::RawOutput, String> {
     } else {
         (Duration::from_secs(30), "会话设备身份/终态核对")
     };
-    let command = format!("su -c {}", crate::shell_quote(&script));
+    // Toybox timeout creates a process group by default; TERM then KILL also
+    // bounds find/rm children if the host future is cancelled or USB disconnects.
+    let bounded = if script.starts_with("# me-purge:remove-directory\n") {
+        format!(
+            "timeout -s TERM -k 2 10 sh -c {}",
+            crate::shell_quote(&script)
+        )
+    } else {
+        script
+    };
+    let command = format!("su -c {}", crate::shell_quote(&bounded));
     crate::run_device_adb_with_timeout(serial, &["shell", &command], timeout, operation)
         .await
         .map_err(|error| {
@@ -366,6 +384,12 @@ async fn adb(serial: &str, script: String) -> Result<crate::RawOutput, String> {
         })
 }
 fn checked_output(output: crate::RawOutput, limit: usize) -> Result<String, String> {
+    if output.code == Some(83) {
+        return Err(
+            "该主会话设备清理仍在进行；取消后等待有界 worker 退出，再原位重试，不启动并行删除"
+                .into(),
+        );
+    }
     if output.code == Some(81) {
         return Err(
             "设备 mountinfo 不可读/格式未知/超预算，无法排除 bind mount，清理已阻止".into(),
@@ -521,6 +545,7 @@ where
     }
     Ok(proofs)
 }
+#[cfg(test)]
 fn inventory_script(path: &str) -> Result<String, String> {
     let q = crate::shell_quote(path);
     // All untrusted paths remain argv values. Validate the allowlisted ASCII
@@ -546,6 +571,7 @@ printf 'MEEND|0\n'
         bound = MAX_WIRE + 1
     ))
 }
+#[cfg(test)]
 fn parse_batch_inventory(path: &str, text: &str) -> Result<Option<Vec<Entry>>, String> {
     let mut before = BTreeMap::new();
     let mut after = BTreeMap::new();
@@ -605,6 +631,7 @@ fn parse_batch_inventory(path: &str, text: &str) -> Result<Option<Vec<Entry>>, S
     legacy.push_str("MEEND|0\n");
     parse_inventory(path, &legacy)
 }
+#[cfg(test)]
 fn parse_inventory(path: &str, text: &str) -> Result<Option<Vec<Entry>>, String> {
     if text.trim() == "MEABSENT" {
         return Ok(None);
@@ -686,6 +713,7 @@ fn parse_inventory(path: &str, text: &str) -> Result<Option<Vec<Entry>>, String>
     }
     Ok(Some(entries.into_values().collect()))
 }
+#[cfg(test)]
 fn evidence_script(path: &str) -> Result<String, String> {
     Ok(format!(
         "# me-purge:evidence\n{}head -c {} {}",
@@ -736,6 +764,7 @@ fn validate_evidence(group: &Group, root: &DeviceRoot) -> Result<(), String> {
     }
     Ok(())
 }
+#[cfg(test)]
 fn summarize(root: &mut DeviceRoot) -> Result<(), String> {
     root.files = 0;
     root.logical_bytes = 0;
@@ -788,6 +817,7 @@ fn snapshot(
     }
     Ok(DeviceSnapshot {
         parent_id: group.id,
+        directory_scope: false,
         serial: group.serial.clone(),
         transport_serial: None,
         fingerprint,
@@ -805,11 +835,12 @@ fn snapshot(
 /// binds confirmation to it; never execute a client-supplied file list.
 pub async fn inspect(group: &Group) -> Result<DeviceSnapshot, String> {
     let transport = resolve_transport(&group.serial).await?;
-    let mut snapshot = inspect_with(group, |script| adb(&transport, script)).await?;
+    let mut snapshot = inspect_directories_with(group, |script| adb(&transport, script)).await?;
     valid_transport(&group.serial, &transport, &snapshot.identity_evidence)?;
     snapshot.transport_serial = Some(transport);
     Ok(snapshot)
 }
+#[cfg(test)]
 async fn inspect_with<F, Fut>(group: &Group, mut rpc: F) -> Result<DeviceSnapshot, String>
 where
     F: FnMut(String) -> Fut,
@@ -895,11 +926,13 @@ fn shared_namespace(root: &str, path: &str) -> bool {
 /// closed; an offline retry can never grow its deletion scope automatically.
 pub async fn inspect_remaining(original: &DeviceSnapshot) -> Result<DeviceSnapshot, String> {
     let transport = resolve_transport(&original.serial).await?;
-    let mut snapshot = remaining_with(original, |script| adb(&transport, script)).await?;
+    let mut snapshot =
+        remaining_directories_with(original, |script| adb(&transport, script)).await?;
     valid_transport(&original.serial, &transport, &snapshot.identity_evidence)?;
     snapshot.transport_serial = Some(transport);
     Ok(snapshot)
 }
+#[cfg(test)]
 async fn remaining_with<F, Fut>(
     original: &DeviceSnapshot,
     mut rpc: F,
@@ -968,6 +1001,20 @@ where
     )
 }
 pub(super) fn preview_entries(snapshot: &DeviceSnapshot) -> Vec<super::purge_local::Entry> {
+    if snapshot.directory_scope {
+        return snapshot
+            .roots
+            .iter()
+            .filter(|root| !root.absent && root.kind != "controlOnly")
+            .map(|root| super::purge_local::Entry {
+                path: root.path.clone(),
+                kind: "exclusive_session_directory".into(),
+                logical_bytes: 0,
+                allocated_bytes: None,
+                files: 0,
+            })
+            .collect();
+    }
     snapshot
         .roots
         .iter()
@@ -1023,6 +1070,15 @@ pub(super) fn validate_snapshot(snapshot: &DeviceSnapshot) -> Result<(), String>
         {
             return Err("设备快照路径/关系冲突".into());
         }
+        if !root.missing_owner_files.is_empty()
+            && (!snapshot.directory_scope
+                || root
+                    .missing_owner_files
+                    .iter()
+                    .any(|name| !root.evidence.contains_key(name)))
+        {
+            return Err("缺失归属恢复没有独立原目录证明".into());
+        }
         if root.kind == "controlOnly" && (!root.entries.is_empty() || !root.evidence.is_empty()) {
             return Err("无 payload 的 control-only 快照不能携带删除范围".into());
         }
@@ -1047,6 +1103,7 @@ pub(super) fn validate_snapshot(snapshot: &DeviceSnapshot) -> Result<(), String>
     }
     Ok(())
 }
+#[cfg(test)]
 fn remove_script(
     root: &DeviceRoot,
     entry: &Entry,
@@ -1080,12 +1137,448 @@ fn remove_script(
         canonical_checks(parent, false)?, crate::shell_quote(parent), parent_entry.device, parent_entry.inode, STAT_FORMAT, crate::shell_quote(&entry.stamp())))
 }
 
+fn directory_lock(root: &DeviceRoot) -> Result<String, String> {
+    let base = if let Some((base, _)) = root.path.split_once("/spool/") {
+        base
+    } else {
+        root.path
+            .split_once("/captures/")
+            .ok_or("独占目录不在 runtime 边界")?
+            .0
+    };
+    let path = format!(
+        "{base}/captures/{}/.me-purge-device.lock",
+        root.relation.parent_id
+    );
+    if !clean_path(&path) {
+        return Err("清理锁路径未知".into());
+    }
+    Ok(path)
+}
+const DIRECTORY_ENTRY_CAP: usize = 65_536;
+fn directory_scope_script(root: &DeviceRoot, allow_missing_owner: bool) -> Result<String, String> {
+    let path = crate::shell_quote(&root.path);
+    let names = if root.session_id.is_some() {
+        "capture-relation.json session.json"
+    } else {
+        "capture-relation.json"
+    };
+    Ok(format!(
+        r#"# me-purge:directory-scope
+{mount}
+{canonical}
+[ ! -e {lock} ] && [ ! -L {lock} ] || exit 83
+if [ ! -e {path} ]; then printf 'MESCOPEABSENT\n'; exit 0; fi
+[ -d {path} ] && [ ! -L {path} ] || exit 73
+me_scope_stamp=$(stat -c '{stat}' {path}) || exit 74
+printf 'MESCOPE|%s\n' "$me_scope_stamp"
+for me_owner in {names}; do
+    me_owner_path={path}/$me_owner
+    if [ ! -e "$me_owner_path" ]; then
+        [ {allow_missing_owner} = 1 ] || exit 74
+        printf 'MEMISSING|%s\n' "$me_owner"
+        continue
+    fi
+    [ -f "$me_owner_path" ] && [ ! -L "$me_owner_path" ] || exit 74
+    me_owner_stamp=$(stat -c '{stat}' "$me_owner_path") || exit 74
+    [ "$(stat -c '%h' "$me_owner_path")" = 1 ] || exit 74
+    [ "$(stat -c '%s' "$me_owner_path")" -le {max_record} ] || exit 74
+    printf 'MEEVIDENCE|%s|' "$me_owner"
+    head -c {max_record_plus} "$me_owner_path" | base64 | tr -d '\r\n'
+    printf '\n'
+    [ "$me_owner_stamp" = "$(stat -c '{stat}' "$me_owner_path")" ] || exit 74
+done
+[ "$me_scope_stamp" = "$(stat -c '{stat}' {path})" ] || exit 74
+printf 'MESCOPEEND\n'
+"#,
+        mount = mount_checks(&root.path)?,
+        canonical = canonical_checks(&root.path, true)?,
+        stat = STAT_FORMAT,
+        max_record = MAX_RECORD,
+        max_record_plus = MAX_RECORD + 1,
+        lock = crate::shell_quote(&directory_lock(root)?),
+        allow_missing_owner = if allow_missing_owner { 1 } else { 0 }
+    ))
+}
+fn parse_directory_scope(group: &Group, root: &mut DeviceRoot, text: &str) -> Result<(), String> {
+    root.entries.clear();
+    root.evidence.clear();
+    root.missing_owner_files.clear();
+    root.files = 0;
+    root.logical_bytes = 0;
+    root.allocated_bytes = None;
+    if text.trim() == "MESCOPEABSENT" {
+        root.absent = true;
+        return Ok(());
+    }
+    if text.len() > 3 * MAX_RECORD || !text.trim_end().ends_with("MESCOPEEND") {
+        return Err("独占目录归属响应不完整/超限".into());
+    }
+    let mut lines = text.lines();
+    let stamp = lines
+        .next()
+        .and_then(|line| line.strip_prefix("MESCOPE|"))
+        .ok_or("独占目录身份缺失")?;
+    let fields = stamp.split(':').collect::<Vec<_>>();
+    if fields.len() != 8 {
+        return Err("独占目录 stat 格式未知".into());
+    }
+    let number = |index: usize| {
+        fields[index]
+            .parse::<u64>()
+            .map_err(|_| "独占目录 stat 数值未知".to_string())
+    };
+    let mode = u32::from_str_radix(fields[0], 16).map_err(|_| "独占目录类型未知")?;
+    if mode & 0xf000 != 0x4000 {
+        return Err("独占目录不是普通目录".into());
+    }
+    root.entries.push(Entry {
+        path: root.path.clone(),
+        mode,
+        device: number(1)?,
+        inode: number(2)?,
+        links: number(3)?,
+        size: number(4)?,
+        blocks: number(5)?,
+        modified: fields[6].parse().map_err(|_| "目录mtime未知")?,
+        changed: fields[7].parse().map_err(|_| "目录ctime未知")?,
+        preserve: true,
+        sha256: None,
+    });
+    for line in lines.filter(|line| *line != "MESCOPEEND") {
+        if let Some(name) = line.strip_prefix("MEMISSING|") {
+            if !["capture-relation.json", "session.json"].contains(&name)
+                || root.missing_owner_files.iter().any(|old| old == name)
+            {
+                return Err("缺失归属文件范围未知".into());
+            }
+            root.missing_owner_files.push(name.into());
+            continue;
+        }
+        let record = line
+            .strip_prefix("MEEVIDENCE|")
+            .ok_or("独占目录归属格式未知")?;
+        let (name, data) = record.split_once('|').ok_or("独占目录归属格式未知")?;
+        if !["capture-relation.json", "session.json"].contains(&name)
+            || root.evidence.contains_key(name)
+        {
+            return Err("重复/未知独占目录归属文件".into());
+        }
+        let bytes = STANDARD.decode(data).map_err(|_| "独占目录归属编码未知")?;
+        if bytes.len() > MAX_RECORD {
+            return Err("独占目录归属文件超限".into());
+        }
+        root.evidence.insert(
+            name.into(),
+            String::from_utf8(bytes).map_err(|_| "独占目录归属内容未知")?,
+        );
+    }
+    if root.missing_owner_files.is_empty() && !root.evidence.is_empty() {
+        validate_evidence(group, root)?;
+    }
+    root.absent = false;
+    Ok(())
+}
+async fn inspect_directories_with<F, Fut>(
+    group: &Group,
+    mut rpc: F,
+) -> Result<DeviceSnapshot, String>
+where
+    F: FnMut(String) -> Fut,
+    Fut: Future<Output = Result<crate::RawOutput, String>>,
+{
+    let mut roots = expected_roots(group)?;
+    let evidence = checked_output(rpc(identity_script()).await?, 8192)?;
+    let fingerprint = parse_identity(&group.serial, &evidence)?;
+    let proofs = check_lifecycles(group, &roots, &mut rpc).await?;
+    for root in &mut roots {
+        if root.kind == "controlOnly" {
+            continue;
+        }
+        let text = checked_output(
+            rpc(directory_scope_script(root, false)?).await?,
+            3 * MAX_RECORD,
+        )?;
+        parse_directory_scope(group, root, &text)?;
+    }
+    let mut snapshot = snapshot(group, fingerprint, evidence, roots, proofs)?;
+    snapshot.directory_scope = true;
+    snapshot.allocated_bytes = None;
+    snapshot.preserved=vec!["仅清理明确拥有的 spool UUID 与 attempt dump 目录；不解析证据内容，不估算文件数/释放字节。原安装 APK、App 私有路径、外部共享 CAS、其它会话及 control 保留；本目录内硬链接仅移除此路径，外部 inode 不受影响".into()];
+    validate_snapshot(&snapshot)?;
+    Ok(snapshot)
+}
+async fn remaining_directories_with<F, Fut>(
+    original: &DeviceSnapshot,
+    mut rpc: F,
+) -> Result<DeviceSnapshot, String>
+where
+    F: FnMut(String) -> Fut,
+    Fut: Future<Output = Result<crate::RawOutput, String>>,
+{
+    validate_snapshot(original)?;
+    let mut current = original.clone();
+    current.directory_scope = true;
+    current.allocated_bytes = None;
+    let identity = checked_output(rpc(identity_script()).await?, 8192)?;
+    current.fingerprint = parse_identity(&original.serial, &identity)?;
+    current.identity_evidence = identity;
+    current.terminal_proofs = check_lifecycles(&original.group, &original.roots, &mut rpc).await?;
+    for root in &mut current.roots {
+        if root.kind == "controlOnly" {
+            continue;
+        }
+        let reply = checked_output(
+            rpc(directory_scope_script(root, true)?).await?,
+            3 * MAX_RECORD,
+        )?;
+        parse_directory_scope(&original.group, root, &reply)?;
+    }
+    if current.fingerprint != original.fingerprint
+        || current.identity_evidence.trim() != original.identity_evidence.trim()
+    {
+        return Err("配对设备身份已改变".into());
+    }
+    for (before, after) in original.roots.iter().zip(&mut current.roots) {
+        if before.path != after.path || before.relation != after.relation {
+            return Err("独占目录范围已改变".into());
+        }
+        if after.absent || after.kind == "controlOnly" {
+            continue;
+        }
+        let old = before
+            .entries
+            .iter()
+            .find(|entry| entry.path == before.path && entry.directory())
+            .ok_or("原确认目录不存在，不能纳入后来创建的目录")?;
+        let new = after.entries.first().ok_or("当前独占目录身份未知")?;
+        if old.device != new.device || old.inode != new.inode {
+            return Err("独占目录 inode 已替换，原确认作废".into());
+        }
+        for name in &after.missing_owner_files {
+            after.evidence.insert(
+                name.clone(),
+                before
+                    .evidence
+                    .get(name)
+                    .ok_or("缺失归属文件未在原确认快照中，不能恢复")?
+                    .clone(),
+            );
+        }
+        validate_evidence(&original.group, after)?;
+        for (name, value) in &after.evidence {
+            if before.evidence.get(name) != Some(value) {
+                return Err("独占目录归属/终态已变化".into());
+            }
+        }
+    }
+    current.transport_serial = original.transport_serial.clone();
+    Ok(current)
+}
+fn remove_directory_script(root: &DeviceRoot, identity: &str) -> Result<String, String> {
+    if root.kind == "controlOnly" || root.absent {
+        return Err("没有可删除的独占目录".into());
+    }
+    let (parent, name) = root.path.rsplit_once('/').ok_or("独占目录父路径未知")?;
+    let entry = root
+        .entries
+        .first()
+        .filter(|entry| entry.path == root.path && entry.directory())
+        .ok_or("独占目录 inode 身份未知")?;
+    let dir = crate::shell_quote(&format!("./{name}"));
+    let owner_checks = root
+        .evidence
+        .iter()
+        .map(|(name, bytes)| {
+            let path = crate::shell_quote(&format!("./{name}"));
+            if root.missing_owner_files.contains(name) {
+                format!("[ ! -e {path} ] && [ ! -L {path} ] || exit 76\n")
+            } else {
+                format!(
+                    "[ \"$(head -c {} {path})\" = {} ] || exit 76\n",
+                    MAX_RECORD + 1,
+                    crate::shell_quote(bytes.trim_end())
+                )
+            }
+        })
+        .collect::<String>();
+    Ok(format!(
+        r#"# me-purge:remove-directory
+[ "$({identity_command})" = {identity} ] || exit 80
+{canonical}
+{mount}
+{lock_canonical}
+me_lock={lock}
+mkdir -m 700 -- "$me_lock" || exit 83
+me_lock_stamp=$(stat -c '%d:%i' "$me_lock") || exit 76
+(
+    cd -P "$me_lock" || exit 76
+    [ "$(pwd -P)" = "$me_lock" ] && [ "$(stat -c '%d:%i' .)" = "$me_lock_stamp" ] || exit 76
+    set -C
+    printf '%s\n' "$$" > ./worker.pid
+) || exit 76
+me_release_lock() (
+    trap - EXIT HUP INT TERM
+    me_lock_parent=${{me_lock%/*}}; me_lock_name=${{me_lock##*/}}
+    [ ! -L "$me_lock" ] || exit 0
+    cd -P "$me_lock" || exit 0
+    [ "$(pwd -P)" = "$me_lock" ] && [ "$(stat -c '%d:%i' .)" = "$me_lock_stamp" ] || exit 0
+    [ ! -L ./worker.pid ] && [ "$(cat ./worker.pid)" = "$$" ] || exit 0
+    rm -- ./worker.pid || exit 0
+    cd -P "$me_lock_parent" || exit 0
+    [ "$(pwd -P)" = "$me_lock_parent" ] || exit 0
+    [ ! -L "./$me_lock_name" ] && [ "$(stat -c '%d:%i' "./$me_lock_name")" = "$me_lock_stamp" ] || exit 0
+    rmdir -- "./$me_lock_name"
+)
+trap 'me_release_lock' EXIT
+trap 'exit 124' HUP INT TERM
+cd -P {parent} || exit 75
+[ ! -L {dir} ] || exit 76
+if [ ! -e {dir} ]; then printf 'MEDIRECTORYABSENT\n'; exit 0; fi
+[ "$(stat -c '%d:%i' {dir})" = '{device}:{inode}' ] || exit 76
+me_remove_pinned() (
+    trap - EXIT HUP INT TERM
+    me_expected="$1"; me_child="$2"; me_device="$3"; me_inode="$4"; me_top="$5"
+    cd -P "$me_child" || exit 75
+    [ "$(pwd -P)" = "$me_expected" ] || exit 76
+    [ "$(stat -c '%d:%i' .)" = "$me_device:$me_inode" ] || exit 76
+    {mount}
+    if [ "$me_top" = 1 ]; then
+{owner_checks}
+    fi
+    set --
+    for me_entry in ./* ./.[!.]* ./..?*; do
+        if [ ! -e "$me_entry" ] && [ ! -L "$me_entry" ]; then continue; fi
+        [ ! -L "$me_entry" ] || exit 76
+        me_base=${{me_entry#./}}
+        case "$me_base" in objects|.objects|cas|.cas) exit 76;; esac
+        if [ -d "$me_entry" ]; then
+            me_stamp=$(stat -c '%d:%i' "$me_entry") || exit 76
+            me_sub_device=${{me_stamp%:*}}; me_sub_inode=${{me_stamp#*:}}
+            [ "$me_sub_device" = "$me_device" ] || exit 76
+            me_remove_pinned "$me_expected/$me_base" "$me_entry" "$me_sub_device" "$me_sub_inode" 0 || exit 78
+            [ ! -L "$me_entry" ] && [ "$(stat -c '%d:%i' "$me_entry")" = "$me_stamp" ] || exit 76
+            rmdir -- "$me_entry" || exit 78
+        elif [ -f "$me_entry" ]; then
+            if [ "$me_top" = 1 ]; then case "$me_base" in capture-relation.json|session.json) continue;; esac; fi
+            set -- "$@" "$me_entry"
+        else exit 76; fi
+    done
+    [ "$#" = 0 ] || rm -- "$@" || exit 78
+    if [ "$me_top" = 1 ]; then
+{owner_checks}
+        for me_owner_name in capture-relation.json session.json; do
+            me_owner=./$me_owner_name
+            [ ! -L "$me_owner" ] || exit 76
+            if [ -e "$me_owner" ]; then [ -f "$me_owner" ] || exit 76; rm -- "$me_owner" || exit 78; fi
+        done
+    fi
+)
+me_unsafe=$(find {dir} -xdev \( -type l -o -type b -o -type c -o -type p -o -type s -o -name objects -o -name .objects -o -name cas -o -name .cas \) -print | head -c 1) || exit 76
+[ -z "$me_unsafe" ] || exit 76
+me_entries=$(find {dir} -xdev -print | head -n {count_limit} | wc -l) || exit 76
+[ "$me_entries" -le {entry_cap} ] || exit 76
+me_remove_pinned {absolute_root} {dir} '{device}' '{inode}' 1 || exit 78
+[ ! -L {dir} ] && [ "$(stat -c '%d:%i' {dir})" = '{device}:{inode}' ] || exit 76
+rmdir -- {dir} || exit 78
+[ ! -e {dir} ] && [ ! -L {dir} ] || exit 79
+printf 'MEDIRECTORYREMOVED\n'
+"#,
+        identity_command = identity_script(),
+        identity = crate::shell_quote(identity.trim()),
+        canonical = canonical_checks(parent, false)?,
+        mount = mount_checks(&root.path)?,
+        parent = crate::shell_quote(parent),
+        absolute_root = crate::shell_quote(&root.path),
+        lock = crate::shell_quote(&directory_lock(root)?),
+        lock_canonical = canonical_checks(
+            directory_lock(root)?
+                .rsplit_once('/')
+                .ok_or("锁父目录未知")?
+                .0,
+            false
+        )?,
+        device = entry.device,
+        inode = entry.inode,
+        count_limit = DIRECTORY_ENTRY_CAP + 1,
+        entry_cap = DIRECTORY_ENTRY_CAP
+    ))
+}
+async fn execute_directories_with<F, Fut>(
+    original: &DeviceSnapshot,
+    mut rpc: F,
+) -> Result<DeviceOutcome, String>
+where
+    F: FnMut(String) -> Fut,
+    Fut: Future<Output = Result<crate::RawOutput, String>>,
+{
+    let current = remaining_directories_with(original, &mut rpc).await?;
+    let mut result = DeviceOutcome {
+        status: "completed".into(),
+        logical_bytes_removed: 0,
+        allocated_bytes_removed: None,
+        removed_files: 0,
+        already_absent_files: 0,
+        errors: vec![],
+    };
+    for root in &current.roots {
+        if root.absent || root.kind == "controlOnly" {
+            continue;
+        }
+        if let Err(error) =
+            check_lifecycles(&current.group, std::slice::from_ref(root), &mut rpc).await
+        {
+            result.errors.push(error);
+            break;
+        }
+        let reply = rpc(remove_directory_script(root, &current.identity_evidence)?)
+            .await
+            .and_then(|output| checked_output(output, 4096));
+        match reply.as_deref().map(str::trim) {
+            Ok("MEDIRECTORYREMOVED" | "MEDIRECTORYABSENT") => {}
+            Ok(_) => {
+                result
+                    .errors
+                    .push("独占目录删除回执未知，须原位重试核验".into());
+                break;
+            }
+            Err(error) => {
+                result.errors.push(error.to_string());
+                break;
+            }
+        }
+    }
+    if result.errors.is_empty() {
+        for root in &current.roots {
+            if root.kind == "controlOnly" {
+                continue;
+            }
+            let path = crate::shell_quote(&root.path);
+            let script=format!("# me-purge:verify-directory-absent\n{}{}[ ! -e {path} ] && [ ! -L {path} ] || exit 79\nprintf 'MEDIRECTORYABSENT\\n'",mount_checks(&root.path)?,canonical_checks(&root.path,true)?);
+            let reply = rpc(script)
+                .await
+                .and_then(|output| checked_output(output, 4096));
+            if !matches!(reply.as_deref().map(str::trim), Ok("MEDIRECTORYABSENT")) {
+                result
+                    .errors
+                    .push("原确认独占目录未全部核验不存在；保留 partial 与原位重试记录".into());
+                break;
+            }
+        }
+    }
+    if !result.errors.is_empty() {
+        result.status = "partial".into();
+    }
+    Ok(result)
+}
+
 /// Called only after explicit confirmation of a server-retained preview. Known
 /// partial results are returned, so failures remain visible and retryable.
 pub async fn execute(original: &DeviceSnapshot) -> Result<DeviceOutcome, String> {
     let transport = resolve_transport(&original.serial).await?;
-    execute_with(original, |script| adb(&transport, script)).await
+    execute_directories_with(original, |script| adb(&transport, script)).await
 }
+#[cfg(test)]
 async fn execute_with<F, Fut>(
     original: &DeviceSnapshot,
     mut rpc: F,
@@ -1169,6 +1662,255 @@ where
         outcome.status = "partial".into();
     }
     Ok(outcome)
+}
+
+#[cfg(test)]
+mod directory_tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+    use std::process::Command;
+    fn fixture_root() -> (PathBuf, DeviceRoot, PathBuf) {
+        let base = std::env::temp_dir().join(format!("me-owned-directory-{}", Uuid::new_v4()));
+        let parent = base.join("parent");
+        let actual = parent.join("owned");
+        std::fs::create_dir_all(actual.join("nested")).unwrap();
+        std::fs::write(actual.join("capture-relation.json"), "fixture owner").unwrap();
+        std::fs::write(actual.join("nested/payload"), "fixture payload").unwrap();
+        std::fs::write(base.join("external-original.apk"), "outside inode").unwrap();
+        std::fs::hard_link(
+            base.join("external-original.apk"),
+            actual.join("nested/shared-link"),
+        )
+        .unwrap();
+        let metadata = std::fs::metadata(&actual).unwrap();
+        use std::os::unix::fs::MetadataExt;
+        let root = DeviceRoot {
+            path: "/data/local/tmp/ksight-fixture/spool/owned".into(),
+            kind: "sessionSpool".into(),
+            logical_bytes: 0,
+            allocated_bytes: None,
+            files: 0,
+            relation: Relation {
+                parent_id: Uuid::new_v4(),
+                stage_id: Uuid::new_v4(),
+                attempt_id: Uuid::new_v4(),
+                attempt: 1,
+                stage_key: "l0".into(),
+            },
+            session_id: Some(Uuid::new_v4()),
+            evidence: [("capture-relation.json".into(), "fixture owner".into())]
+                .into_iter()
+                .collect(),
+            entries: vec![Entry {
+                path: "/data/local/tmp/ksight-fixture/spool/owned".into(),
+                mode: 0x41c0,
+                device: metadata.dev(),
+                inode: metadata.ino(),
+                links: metadata.nlink(),
+                size: metadata.len(),
+                blocks: metadata.blocks(),
+                modified: metadata.mtime(),
+                changed: metadata.ctime(),
+                preserve: true,
+                sha256: None,
+            }],
+            absent: false,
+            missing_owner_files: vec![],
+        };
+        (base, root, actual)
+    }
+    fn run_fixture(base: &Path, root: &DeviceRoot, actual: &Path) -> std::process::Output {
+        let parent = root.path.rsplit_once('/').unwrap().0;
+        let mut script = remove_directory_script(root, "fixture identity").unwrap();
+        assert!(!script.contains("sha256sum") && !script.contains("rm -rf"));
+        assert!(script.contains("me_remove_pinned") && script.contains("65536"));
+        script = script.replace(&identity_script(), "printf 'fixture identity'");
+        let actual = actual.canonicalize().unwrap();
+        let lock = directory_lock(root).unwrap();
+        script = script.replace(
+            &canonical_checks(lock.rsplit_once('/').unwrap().0, false).unwrap(),
+            "# fixture lock ancestor adapter\n",
+        );
+        script = script.replace(
+            &crate::shell_quote(&lock),
+            &crate::shell_quote(
+                base.canonicalize()
+                    .unwrap()
+                    .join("worker.lock")
+                    .to_str()
+                    .unwrap(),
+            ),
+        );
+
+        // The device mount/ancestor guards are independently exercised by the
+        // existing mount/symlink tests. Here substitute only their platform
+        // adapter; execute the exact pinned-cwd/batched unlink body on real files.
+        script = script.replace(
+            &mount_checks(&root.path).unwrap(),
+            "# fixture mount boundary adapter\n",
+        );
+        script = script.replace(
+            &crate::shell_quote(&root.path),
+            &crate::shell_quote(actual.to_str().unwrap()),
+        );
+        script = script.replace(
+            &canonical_checks(parent, false).unwrap(),
+            "# fixture canonical ancestor adapter\n",
+        );
+        script = script.replace(
+            &crate::shell_quote(parent),
+            &crate::shell_quote(actual.parent().unwrap().to_str().unwrap()),
+        );
+        script = script.replace(
+            "'./owned'",
+            &crate::shell_quote(&format!(
+                "./{}",
+                actual.file_name().unwrap().to_str().unwrap()
+            )),
+        );
+        let tools = base.join("tools");
+        std::fs::create_dir_all(&tools).unwrap();
+        let stat = tools.join("stat");
+        std::fs::write(&stat,r#"#!/usr/bin/env python3
+import os,sys
+fmt=sys.argv[2]
+for path in sys.argv[3:]:
+ s=os.lstat(path);v={'f':format(s.st_mode,'x'),'d':str(s.st_dev),'i':str(s.st_ino),'h':str(s.st_nlink),'s':str(s.st_size),'b':str(s.st_blocks),'Y':str(int(s.st_mtime)),'Z':str(int(s.st_ctime))}
+ for k,x in v.items():fmt=fmt.replace('%'+k,x)
+ print(fmt)
+"#).unwrap();
+        std::fs::set_permissions(stat, std::fs::Permissions::from_mode(0o755)).unwrap();
+        Command::new("sh")
+            .args(["-c", &script])
+            .env(
+                "PATH",
+                format!("{}:{}", tools.display(), std::env::var("PATH").unwrap()),
+            )
+            .output()
+            .unwrap()
+    }
+    #[test]
+    fn actual_batch_directory_unlink_preserves_external_hardlink_and_neighbor() {
+        let (base, root, actual) = fixture_root();
+        let before = std::fs::read(base.join("external-original.apk")).unwrap();
+        std::fs::create_dir(actual.parent().unwrap().join("other-session")).unwrap();
+        let result = run_fixture(&base, &root, &actual);
+        assert!(
+            result.status.success(),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&result.stdout).trim(),
+            "MEDIRECTORYREMOVED"
+        );
+        assert!(!actual.exists());
+        assert_eq!(
+            std::fs::read(base.join("external-original.apk")).unwrap(),
+            before
+        );
+        assert!(actual.parent().unwrap().join("other-session").exists());
+    }
+    #[test]
+    fn partial_payload_failure_preserves_owner_and_retry_and_lock_blocks_overlap() {
+        let (base, root, actual) = fixture_root();
+        let tools = base.join("tools");
+        std::fs::create_dir_all(&tools).unwrap();
+        let shim = tools.join("rm");
+        std::fs::write(&shim, "#!/bin/sh\nexit 1\n").unwrap();
+        std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(!run_fixture(&base, &root, &actual).status.success());
+        assert_eq!(
+            std::fs::read_to_string(actual.join("capture-relation.json")).unwrap(),
+            "fixture owner"
+        );
+        std::fs::remove_file(&shim).unwrap();
+        // Failed cleanup retains its exclusive lock, blocking a second worker.
+        assert!(!run_fixture(&base, &root, &actual).status.success());
+        assert!(actual.join("nested/payload").exists());
+        // Only the synthetic fixture's known stopped lock is removed here.
+        std::fs::remove_dir_all(base.join("worker.lock")).unwrap();
+        assert!(run_fixture(&base, &root, &actual).status.success());
+        assert_eq!(
+            std::fs::read(base.join("external-original.apk")).unwrap(),
+            b"outside inode"
+        );
+    }
+    #[test]
+    fn symlink_cas_inode_replacement_and_owner_change_block_every_batch_unlink() {
+        for scenario in ["symlink", "cas", "replacement", "owner"] {
+            let (base, root, actual) = fixture_root();
+            match scenario {
+                "symlink" => std::os::unix::fs::symlink(
+                    base.join("external-original.apk"),
+                    actual.join("link"),
+                )
+                .unwrap(),
+                "cas" => std::fs::create_dir(actual.join("cas")).unwrap(),
+                "replacement" => {
+                    std::fs::rename(&actual, base.join("previous-owned")).unwrap();
+                    std::fs::create_dir(&actual).unwrap();
+                    std::fs::write(actual.join("capture-relation.json"), "fixture owner").unwrap();
+                }
+                "owner" => {
+                    std::fs::write(actual.join("capture-relation.json"), "foreign owner").unwrap()
+                }
+                _ => unreachable!(),
+            }
+            let result = run_fixture(&base, &root, &actual);
+            assert!(!result.status.success(), "{scenario}");
+            assert!(actual.exists());
+            assert_eq!(
+                std::fs::read(base.join("external-original.apk")).unwrap(),
+                b"outside inode"
+            );
+            if scenario != "replacement" {
+                assert!(actual.join("nested/payload").exists());
+            }
+        }
+    }
+    #[tokio::test]
+    #[ignore = "explicit read-only recovery of an already confirmed fixed directory snapshot"]
+    async fn physical_confirmed_scope_recovery_preserves_missing_legacy_owner_binding() {
+        let journal = std::env::var("ME_PURGE_CONFIRMED_JOURNAL").unwrap();
+        let report = std::env::var("ME_PURGE_READONLY_REPORT_PATH").unwrap();
+        let original = std::fs::read(&journal).unwrap();
+        let value: Value = serde_json::from_slice(&original).unwrap();
+        assert_eq!(value["started"], true);
+        assert_eq!(value["device_attempted"], true);
+        let snapshot: DeviceSnapshot = serde_json::from_value(value["device"].clone()).unwrap();
+        let started = std::time::Instant::now();
+        let current = inspect_remaining(&snapshot).await.unwrap();
+        validate_snapshot(&current).unwrap();
+        assert_eq!(
+            snapshot
+                .roots
+                .iter()
+                .map(|r| r.path.clone())
+                .collect::<Vec<_>>(),
+            current
+                .roots
+                .iter()
+                .map(|r| r.path.clone())
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(original, std::fs::read(journal).unwrap());
+        std::fs::write(report,serde_json::to_vec_pretty(&serde_json::json!({"elapsedSeconds":started.elapsed().as_secs_f64(),"snapshot":current,"executed":false,"originalJournalUnchanged":true})).unwrap()).unwrap();
+    }
+    #[tokio::test]
+    #[ignore = "explicit read-only physical directory scope; never executes deletion"]
+    async fn physical_directory_preview_does_not_read_payload_or_write_history() {
+        let source = std::env::var("ME_PURGE_READONLY_GROUP_PATH").unwrap();
+        let output = std::env::var("ME_PURGE_READONLY_REPORT_PATH").unwrap();
+        let bytes = std::fs::read(&source).unwrap();
+        let group: Group = serde_json::from_slice(&bytes).unwrap();
+        let started = std::time::Instant::now();
+        let snapshot = inspect(&group).await.unwrap();
+        assert!(snapshot.directory_scope);
+        assert!(snapshot.roots.iter().all(|root| root.entries.len() <= 1));
+        assert_eq!(bytes, std::fs::read(source).unwrap());
+        std::fs::write(output,serde_json::to_vec_pretty(&serde_json::json!({"elapsedSeconds":started.elapsed().as_secs_f64(),"snapshot":snapshot,"executed":false,"originalMetadataUnchanged":true})).unwrap()).unwrap();
+    }
 }
 
 #[cfg(test)]

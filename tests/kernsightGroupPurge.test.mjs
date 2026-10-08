@@ -4,7 +4,7 @@ import { readFileSync } from 'node:fs'
 import ts from 'typescript'
 const source = readFileSync(new URL('../src/services/kernsightGroupPurge.ts', import.meta.url), 'utf8')
 const code = ts.transpileModule(source, {compilerOptions:{target:ts.ScriptTarget.ES2022,module:ts.ModuleKind.ES2022}}).outputText
-const {purgeConfirmationBlockReason, canConfirmPurge, createPurgeRequestGate, purgePlanMatches, purgeTargetKey, bundleRemovedByPurge, purgeReportLabel} = await import(`data:text/javascript;base64,${Buffer.from(code).toString('base64')}`)
+const {createPurgeOperation, purgeConfirmationBlockReason, canConfirmPurge, createPurgeRequestGate, purgePlanMatches, purgeTargetKey, bundleRemovedByPurge, purgeReportLabel} = await import(`data:text/javascript;base64,${Buffer.from(code).toString('base64')}`)
 const target = {parentId:'parent-a',serial:'serial-a',package:'org.example.fixture',importedRoots:['/local/one','/local/two']}
 const plan = {schema:'mobilee.group-purge-plan/v1',id:'plan-a',...target,createdUnixMs:1000,expiresUnixMs:301000,confirmationToken:'one-use-random-token',confirmationText:'永久清理 parent-a',localEntries:[],device:{status:'ready',entries:[],warnings:[]},warnings:[],localOnly:false}
 const confirm = (p=plan,t=target,now=2000,busy=false)=>canConfirmPurge(p,t,now,busy)
@@ -80,7 +80,7 @@ test('one paired yes/no confirmation automatically selects all known roots and n
  const vue=readFileSync(new URL('../src/components/KernSightGroupPurge.vue',import.meta.url),'utf8')
  assert.match(vue,/const selectedRoots = \[\.\.\.target.importedRoots\]/)
  assert.match(vue,/const requestedLocalOnly = false/)
- assert.match(vue,/prepareKernSightGroupPurgeRetry\(retryPlanId, requestedLocalOnly\)/)
+ assert.match(vue,/prepareKernSightGroupPurgeRetry\(retryPlanId, requestedLocalOnly, requestId\)/)
  assert.match(vue,/!purgePlanMatches\(result, target\) \|\| result.localOnly !== requestedLocalOnly/)
  assert.doesNotMatch(vue,/type="checkbox"|v-model="localOnly"|v-model="roots"|type="text"/)
  assert.match(vue,/>否<\/button>/)
@@ -99,10 +99,44 @@ test('every safety denial has a nearby reason without granting confirmation',()=
  assert.match(why(null),/尚无/)
  assert.match(why(plan,target,2000,{...state,active:false}),/未激活/)
  assert.match(why(plan,target,2000,{...state,busy:true}),/尚未结束/)
- assert.match(why(plan,target,2000,{...state,preparing:true}),/2 分钟/)
+ assert.match(why(plan,target,2000,{...state,preparing:true}),/最长20秒/)
  assert.match(why(plan,target,2000,{...state,executing:true}),/正在执行/)
  for(const p of [{...plan,confirmationToken:''},{...plan,parentId:'foreign'},{...plan,expiresUnixMs:NaN},{...plan,createdUnixMs:3000},{...plan,expiresUnixMs:1999},{...plan,device:{status:'offline',warnings:['fixture reason']}}]) {
   assert.equal(confirm(p),false);assert.ok(why(p).length)
  }
  assert.match(why({...plan,device:{status:'blocked',warnings:['device inspect timeout']}}),/device inspect timeout/)
+})
+
+test('operation deadline cancels backend before releasing result and ignores late execute success',async()=>{
+ let finishRun, finishAbort, stopped=0
+ const run=new Promise(resolve=>{finishRun=resolve})
+ const abort=new Promise(resolve=>{finishAbort=resolve})
+ const op=createPurgeOperation(()=>run,reason=>{assert.equal(reason,'timeout');stopped++;return abort},10)
+ let settled=false;op.result.then(()=>{settled=true})
+ await new Promise(resolve=>setTimeout(resolve,20));assert.equal(stopped,1);assert.equal(settled,false)
+ finishRun('late success');await Promise.resolve();assert.equal(settled,false)
+ finishAbort('durable interrupted');assert.equal(await op.result,'durable interrupted')
+})
+test('repeated cancellation is single flight, and failed cancellation never claims completion',async()=>{
+ let count=0, finishAbort
+ const op=createPurgeOperation(()=>new Promise(()=>{}),()=>{count++;return new Promise(resolve=>{finishAbort=resolve})},1000)
+ const a=op.cancel('user'), b=op.cancel('unmount');assert.equal(a,b)
+ await Promise.resolve();assert.equal(count,1);finishAbort('interrupted');assert.equal(await op.result,'interrupted')
+ const unknown=createPurgeOperation(()=>new Promise(()=>{}),async()=>{throw Error('backend outcome unknown')},1000)
+ const failed=assert.rejects(unknown.result,/outcome unknown/)
+ await assert.rejects(unknown.cancel(),/outcome unknown/);await failed
+})
+
+test('started resume reads original plan and never rotates its consumed nonce',()=>{
+ const vue=readFileSync(new URL('../src/components/KernSightGroupPurge.vue',import.meta.url),'utf8')
+ assert.match(vue,/if \(prior && prior.state !== 'prepared'\) return monitoringBackend.kernSightGroupPurgePlan\(retryPlanId\)/)
+ assert.match(vue,/continuing \? monitoringBackend.resumeKernSightGroupPurge\(approvedPlan.id\)/)
+ assert.match(vue,/plan.value = \{ \.\.\.approvedPlan, confirmationToken: '' \}/)
+})
+
+test('immediate cancel prevents an invoke that has not started from being issued later',async()=>{
+ let invokes=0,aborts=0
+ const operation=createPurgeOperation(async()=>{invokes++;return 'unsafe late invoke'},async()=>{aborts++;return 'cancelled'},1000)
+ await operation.cancel('unmount')
+ assert.equal(await operation.result,'cancelled');assert.equal(invokes,0);assert.equal(aborts,1)
 })

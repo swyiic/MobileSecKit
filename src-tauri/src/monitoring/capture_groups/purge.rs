@@ -7,6 +7,7 @@ use std::fs::{self, OpenOptions};
 const SCHEMA: &str = "mobilee.capture-group-purge/v1";
 const TTL_MS: u64 = 5 * 60 * 1000;
 const JOURNAL_LIMIT: u64 = 64 * 1024 * 1024;
+const METADATA_TOTAL_LIMIT: u64 = 32 * 1024 * 1024;
 static ACTIVE_PLAN: Mutex<Option<Uuid>> = Mutex::new(None);
 struct ActivePlan;
 impl Drop for ActivePlan {
@@ -17,6 +18,125 @@ impl Drop for ActivePlan {
     }
 }
 static EXECUTION_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+const PREPARE_SECONDS: u64 = 20;
+const EXECUTE_SECONDS: u64 = 30;
+struct Operation {
+    cancelled: tokio::sync::watch::Sender<bool>,
+    deadline: std::time::Instant,
+}
+static CANCELLED_PREPARATIONS: Mutex<BTreeMap<Uuid, std::time::Instant>> =
+    Mutex::new(BTreeMap::new());
+static OPERATIONS: Mutex<BTreeMap<Uuid, Operation>> = Mutex::new(BTreeMap::new());
+struct OperationGuard(Uuid);
+impl Drop for OperationGuard {
+    fn drop(&mut self) {
+        if let Ok(mut operations) = OPERATIONS.lock() {
+            operations.remove(&self.0);
+        }
+    }
+}
+fn register_operation(
+    id: Uuid,
+    seconds: u64,
+) -> Result<(OperationGuard, tokio::sync::watch::Receiver<bool>), String> {
+    // Keep the tombstone lock until insertion: cancellation cannot slip between
+    // the cancelled check and registration of its active receiver.
+    let mut tombstones = CANCELLED_PREPARATIONS.lock().map_err(|e| e.to_string())?;
+    tombstones.retain(|_, until| *until > std::time::Instant::now());
+    if tombstones.contains_key(&id) {
+        return Err("该预览请求已取消；拒绝迟到请求".into());
+    }
+    let mut operations = OPERATIONS.lock().map_err(|e| e.to_string())?;
+    if operations.contains_key(&id) {
+        return Err("该清理操作已经运行".into());
+    }
+    let (cancelled, receiver) = tokio::sync::watch::channel(false);
+    operations.insert(
+        id,
+        Operation {
+            cancelled,
+            deadline: std::time::Instant::now() + std::time::Duration::from_secs(seconds),
+        },
+    );
+    Ok((OperationGuard(id), receiver))
+}
+fn check_operation(id: Uuid) -> Result<(), String> {
+    let operations = OPERATIONS.lock().map_err(|e| e.to_string())?;
+    if let Some(operation) = operations.get(&id) {
+        if *operation.cancelled.borrow() {
+            return Err("清理已取消；保留原清单".into());
+        }
+        if std::time::Instant::now() >= operation.deadline {
+            return Err("清理整体期限已到；保留原清单".into());
+        }
+    }
+    Ok(())
+}
+async fn supervise<T>(
+    id: Uuid,
+    seconds: u64,
+    future: impl std::future::Future<Output = Result<T, String>>,
+) -> Result<T, String> {
+    let (_guard, mut cancelled) = register_operation(id, seconds)?;
+    tokio::select! {
+        biased;
+        _ = cancelled.changed() => Err("清理已取消；保留原清单".into()),
+        result = tokio::time::timeout(std::time::Duration::from_secs(seconds), future) => {
+            let result = result.map_err(|_| "清理整体期限已到；保留原清单".to_string())?;
+            check_operation(id)?;
+            result
+        },
+    }
+}
+#[tauri::command]
+pub fn cancel_kernsight_group_purge_preparation(request_id: Uuid) -> Result<(), String> {
+    {
+        let mut cancelled = CANCELLED_PREPARATIONS.lock().map_err(|e| e.to_string())?;
+        cancelled.retain(|_, until| *until > std::time::Instant::now());
+        if cancelled.len() >= 4096 && !cancelled.contains_key(&request_id) {
+            return Err("取消请求登记已满；未丢弃已有取消标记".into());
+        }
+        cancelled.insert(
+            request_id,
+            std::time::Instant::now() + std::time::Duration::from_secs(60),
+        );
+    }
+    signal_cancel(request_id)
+}
+fn signal_cancel(request_id: Uuid) -> Result<(), String> {
+    if let Some(operation) = OPERATIONS
+        .lock()
+        .map_err(|e| e.to_string())?
+        .get(&request_id)
+    {
+        operation.cancelled.send_replace(true);
+    }
+    Ok(())
+}
+fn interrupted_at(root: &Path, id: Uuid, reason: String) -> Result<Report, String> {
+    let _guard = IO_LOCK.lock().map_err(|e| e.to_string())?;
+    let mut journal = read_journal(root, id)?;
+    if journal.report.state != "completed" && journal.started {
+        journal.report.state = "partial".into();
+        journal.report.error = Some(reason);
+        journal.report.updated_unix_ms = now_millis();
+        write_journal(root, &journal)?;
+    }
+    Ok(journal.report)
+}
+#[tauri::command]
+pub fn cancel_kernsight_group_purge(
+    app: tauri::AppHandle,
+    plan_id: Uuid,
+) -> Result<Report, String> {
+    signal_cancel(plan_id)?;
+    interrupted_at(
+        &root(&app)?,
+        plan_id,
+        "清理执行已中断；未知完成前缀不计释放量，原范围可恢复".into(),
+    )
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -134,10 +254,13 @@ fn write_journal(root: &Path, j: &Journal) -> Result<(), String> {
     result
 }
 fn read_journal(root: &Path, id: Uuid) -> Result<Journal, String> {
+    read_journal_bounded(root, id, JOURNAL_LIMIT)
+}
+fn read_journal_bounded(root: &Path, id: Uuid, limit: u64) -> Result<Journal, String> {
     let p = journal_path(root, id);
     local::safe_path(&p)?;
-    let j: Journal =
-        serde_json::from_str(&read_bounded_text(&p, JOURNAL_LIMIT)?).map_err(|e| e.to_string())?;
+    let j: Journal = serde_json::from_str(&read_bounded_text(&p, limit.min(JOURNAL_LIMIT))?)
+        .map_err(|e| e.to_string())?;
     if j.plan.schema != SCHEMA
         || j.plan.id != id
         || j.report.id != id
@@ -189,27 +312,61 @@ fn read_journal(root: &Path, id: Uuid) -> Result<Journal, String> {
     }
     Ok(j)
 }
-fn list_journals(root: &Path) -> Result<Vec<Journal>, String> {
-    let dir = root.join("purges");
-    if !dir.try_exists().map_err(|e| e.to_string())? {
-        return Ok(vec![]);
-    }
-    local::safe_path(&dir)?;
-    let mut out = vec![];
-    for entry in fs::read_dir(dir).map_err(|e| e.to_string())? {
-        let p = entry.map_err(|e| e.to_string())?.path();
-        if p.extension().and_then(|s| s.to_str()) != Some("json") {
+fn metadata_inventory(
+    root: &Path,
+    directories: &[&str],
+    check: &dyn Fn() -> Result<(), String>,
+) -> Result<BTreeMap<PathBuf, u64>, String> {
+    let mut files = BTreeMap::new();
+    let mut total = 0u64;
+    for directory in directories {
+        check()?;
+        let dir = root.join(directory);
+        if !dir.try_exists().map_err(|e| e.to_string())? {
             continue;
         }
+        local::safe_path(&dir)?;
+        for entry in fs::read_dir(&dir).map_err(|e| e.to_string())? {
+            check()?;
+            let p = entry.map_err(|e| e.to_string())?.path();
+            if p.extension().and_then(|s| s.to_str()) != Some("json") {
+                continue;
+            }
+            local::safe_path(&p)?;
+            let metadata = fs::symlink_metadata(&p).map_err(|e| e.to_string())?;
+            if !metadata.is_file() {
+                return Err("归属 metadata 不是普通文件".into());
+            }
+            total = total
+                .checked_add(metadata.len())
+                .ok_or("归属 metadata 字节溢出")?;
+            if total > METADATA_TOTAL_LIMIT || files.len() >= 4096 {
+                return Err("归属 metadata 总量超限；未扫描证据内容".into());
+            }
+            files.insert(p, metadata.len());
+        }
+    }
+    check()?;
+    Ok(files)
+}
+fn list_journals(root: &Path) -> Result<Vec<Journal>, String> {
+    list_journals_checked(root, &|| Ok(()))
+}
+fn list_journals_checked(
+    root: &Path,
+    check: &dyn Fn() -> Result<(), String>,
+) -> Result<Vec<Journal>, String> {
+    let files = metadata_inventory(root, &["purges"], check)?;
+    let mut out = vec![];
+    for (p, size) in files {
+        check()?;
         let id = p
             .file_stem()
             .and_then(|s| s.to_str())
             .and_then(|s| Uuid::parse_str(s).ok())
             .ok_or("未知清理日志名")?;
-        out.push(read_journal(root, id)?);
-        if out.len() > 4096 {
-            return Err("清理日志超过安全读取上限".into());
-        }
+        out.push(read_journal_bounded(root, id, size)?);
+        check()?;
     }
     Ok(out)
 }
@@ -224,8 +381,13 @@ pub(super) fn ensure_not_purging(root: &Path, id: Uuid) -> Result<(), String> {
     }
     Ok(())
 }
-fn ensure_no_other_started(root: &Path, id: Uuid, allowed: Option<Uuid>) -> Result<(), String> {
-    if list_journals(root)?.iter().any(|j| {
+fn ensure_no_other_started(
+    root: &Path,
+    id: Uuid,
+    allowed: Option<Uuid>,
+    check: &dyn Fn() -> Result<(), String>,
+) -> Result<(), String> {
+    if list_journals_checked(root, check)?.iter().any(|j| {
         j.group.id == id && j.started && j.report.state != "completed" && Some(j.plan.id) != allowed
     }) {
         return Err("该父会话已进入永久清理流程；不能恢复/重启采集，请查看清理记录".into());
@@ -239,7 +401,13 @@ fn raw_group(p: &Path) -> Result<Group, String> {
     g.validate()?;
     Ok(g)
 }
-fn chosen_group(root: &Path, id: Uuid, sources: &[String]) -> Result<Group, String> {
+fn chosen_group(
+    root: &Path,
+    id: Uuid,
+    sources: &[String],
+    check: &dyn Fn() -> Result<(), String>,
+) -> Result<Group, String> {
+    check()?;
     if id.is_nil() {
         return Err("父会话身份无效".into());
     }
@@ -249,7 +417,7 @@ fn chosen_group(root: &Path, id: Uuid, sources: &[String]) -> Result<Group, Stri
     } else if let Some(source) = sources.first() {
         local::read_group_candidate(&Path::new(source).join("capture-group.json"))?
     } else {
-        let journals = list_journals(root)?
+        let journals = list_journals_checked(root, check)?
             .into_iter()
             .filter(|j| j.group.id == id)
             .collect::<Vec<_>>();
@@ -276,20 +444,46 @@ fn chosen_group(root: &Path, id: Uuid, sources: &[String]) -> Result<Group, Stri
     local::ensure_purge_candidate(&g)?;
     Ok(g)
 }
-fn check_shared_ownership(root: &Path, g: &Group, sources: &[String]) -> Result<(), String> {
+fn check_shared_ownership(
+    root: &Path,
+    g: &Group,
+    sources: &[String],
+    check: &dyn Fn() -> Result<(), String>,
+) -> Result<(), String> {
+    let inventory = metadata_inventory(root, &["", "trash", "purges"], check)?;
     let ids = g.session_ids();
     let selected_sources = sources.iter().map(PathBuf::from).collect::<Vec<_>>();
-    for entry in fs::read_dir(root).map_err(|e| e.to_string())? {
-        let p = entry.map_err(|e| e.to_string())?.path();
-        if p.extension().and_then(|s| s.to_str()) != Some("json") {
-            continue;
-        }
-        let other = raw_group(&p)?;
+    for (p, size) in inventory.iter().filter(|(p, _)| p.parent() == Some(root)) {
+        check()?;
+        let other: Group = serde_json::from_str(&read_bounded_text(p, (*size).min(1024 * 1024))?)
+            .map_err(|e| e.to_string())?;
+        other.validate()?;
         if other.id != g.id && !ids.is_disjoint(&other.session_ids()) {
             return Err("子 session 被另一个父会话引用；不能永久清理".into());
         }
     }
-    for entry in trash::list_at(root)? {
+    for (p, size) in inventory
+        .iter()
+        .filter(|(p, _)| p.parent() == Some(root.join("trash").as_path()))
+    {
+        check()?;
+        let id = p
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .and_then(|s| Uuid::parse_str(s).ok())
+            .ok_or("未知回收站记录名")?;
+        let entry: trash::TrashEntry =
+            serde_json::from_str(&read_bounded_text(p, (*size).min(2 * 1024 * 1024))?)
+                .map_err(|e| e.to_string())?;
+        entry.group.validate()?;
+        if entry.schema != "mobilee.capture-group-trash/v1"
+            || entry.group.id != id
+            || entry.imported_roots.len() > 128
+            || entry.retained_session_ids.len() > 16384
+            || entry.retained_session_ids.iter().any(Uuid::is_nil)
+        {
+            return Err("回收站归属记录无效".into());
+        }
         if entry.group.id == g.id {
             continue;
         }
@@ -312,7 +506,17 @@ fn check_shared_ownership(root: &Path, g: &Group, sources: &[String]) -> Result<
             }
         }
     }
-    for j in list_journals(root)? {
+    for (p, size) in inventory
+        .iter()
+        .filter(|(p, _)| p.parent() == Some(root.join("purges").as_path()))
+    {
+        check()?;
+        let id = p
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .and_then(|s| Uuid::parse_str(s).ok())
+            .ok_or("未知清理日志名")?;
+        let j = read_journal_bounded(root, id, *size)?;
         if j.group.id != g.id
             && j.local.imported_roots.iter().any(|foreign| {
                 selected_sources
@@ -397,33 +601,54 @@ pub async fn prepare_kernsight_group_purge(
     parent_id: Uuid,
     imported_roots: Vec<String>,
     local_only: bool,
+    request_id: Option<Uuid>,
 ) -> Result<Plan, String> {
-    prepare_at(root(&app)?, parent_id, imported_roots, local_only).await
+    let request_id = request_id.unwrap_or_else(Uuid::new_v4);
+    supervise(
+        request_id,
+        PREPARE_SECONDS,
+        prepare_at_checked(
+            root(&app)?,
+            parent_id,
+            imported_roots,
+            local_only,
+            Some(request_id),
+        ),
+    )
+    .await
 }
+#[cfg(test)]
 async fn prepare_at(
     root: PathBuf,
     parent_id: Uuid,
     imported_roots: Vec<String>,
     local_only: bool,
 ) -> Result<Plan, String> {
+    prepare_at_checked(root, parent_id, imported_roots, local_only, None).await
+}
+async fn prepare_at_checked(
+    root: PathBuf,
+    parent_id: Uuid,
+    imported_roots: Vec<String>,
+    local_only: bool,
+    operation_id: Option<Uuid>,
+) -> Result<Plan, String> {
+    let check = || operation_id.map_or(Ok(()), check_operation);
+    check()?;
     let (group, local) = {
         let _guard = IO_LOCK.lock().map_err(|e| e.to_string())?;
         create_durable_directory(&root)?;
         local::safe_path(&root)?;
-        ensure_no_other_started(&root, parent_id, None)?;
-        let g = chosen_group(&root, parent_id, &imported_roots)?;
-        let local = if local_only {
-            local::inspect(&root, &g, &imported_roots)?
-        } else {
-            local::inspect_candidate(&root, &g, &imported_roots)?
-        };
-        check_shared_ownership(&root, &g, &local.imported_roots)?;
+        ensure_no_other_started(&root, parent_id, None, &check)?;
+        let g = chosen_group(&root, parent_id, &imported_roots, &check)?;
+        let local = local::inspect_checked(&root, &g, &imported_roots, local_only, &check)?;
+        check_shared_ownership(&root, &g, &local.imported_roots, &check)?;
         (g, local)
     };
     let prior_device_done = {
         let _guard = IO_LOCK.lock().map_err(|e| e.to_string())?;
         let encoded = serde_json::to_value(&group).map_err(|e| e.to_string())?;
-        list_journals(&root)?.iter().any(|j| {
+        list_journals_checked(&root, &check)?.iter().any(|j| {
             j.group.id == group.id
                 && j.report.state == "completed"
                 && ["completed", "not_required"].contains(&j.report.device_state.as_str())
@@ -500,8 +725,9 @@ async fn prepare_at(
     };
     let _guard = IO_LOCK.lock().map_err(|e| e.to_string())?;
     // Device lookup can take time; re-check all local files before publishing the preview.
-    local::verify(&j.local)?;
-    ensure_no_other_started(&root, parent_id, None)?;
+    local::verify_checked(&j.local, &check)?;
+    check()?;
+    ensure_no_other_started(&root, parent_id, None, &check)?;
     write_journal(&root, &j)?;
     Ok(j.plan)
 }
@@ -519,7 +745,7 @@ fn reports_at(root: &Path, active: Option<Uuid>) -> Result<Vec<Report>, String> 
         if j.report.state == "running" && active != Some(j.plan.id) {
             j.report.state = "partial".into();
             j.report.error =
-                Some("上次清理执行中断，已保存的精确清单仍保留；请重新预览剩余范围并确认".into());
+                Some("上次清理执行中断，已确认的精确清单仍保留；可恢复原范围，无需再次确认".into());
             j.report.updated_unix_ms = now_millis();
             write_journal(&root, &j)?;
         }
@@ -533,10 +759,26 @@ pub async fn prepare_kernsight_group_purge_retry(
     app: tauri::AppHandle,
     plan_id: Uuid,
     local_only: Option<bool>,
+    request_id: Option<Uuid>,
 ) -> Result<Plan, String> {
+    let request_id = request_id.unwrap_or_else(Uuid::new_v4);
+    supervise(
+        request_id,
+        PREPARE_SECONDS,
+        prepare_retry_at(root(&app)?, plan_id, local_only, request_id),
+    )
+    .await
+}
+async fn prepare_retry_at(
+    root: PathBuf,
+    plan_id: Uuid,
+    local_only: Option<bool>,
+    operation_id: Uuid,
+) -> Result<Plan, String> {
+    let check = || check_operation(operation_id);
+    check()?;
     let local_only = local_only.unwrap_or(false);
     let _execution = EXECUTION_LOCK.lock().await;
-    let root = root(&app)?;
     let mut j = {
         let _guard = IO_LOCK.lock().map_err(|e| e.to_string())?;
         read_journal(&root, plan_id)?
@@ -549,7 +791,7 @@ pub async fn prepare_kernsight_group_purge_retry(
     } else {
         local::ensure_purge_candidate(&j.group)?;
     }
-    local::verify(&j.local)?;
+    local::verify_checked(&j.local, &check)?;
     if local_only && j.report.device_state != "completed" && j.report.device_state != "not_required"
     {
         j.plan.device = DevicePreview {
@@ -580,10 +822,11 @@ pub async fn prepare_kernsight_group_purge_retry(
         };
     }
     j.plan.local_only = local_only;
+    check()?;
     plan_from(&mut j);
     let _guard = IO_LOCK.lock().map_err(|e| e.to_string())?;
-    ensure_no_other_started(&root, j.group.id, Some(j.plan.id))?;
-    check_shared_ownership(&root, &j.group, &j.local.imported_roots)?;
+    ensure_no_other_started(&root, j.group.id, Some(j.plan.id), &check)?;
+    check_shared_ownership(&root, &j.group, &j.local.imported_roots, &check)?;
     write_journal(&root, &j)?;
     Ok(j.plan)
 }
@@ -594,10 +837,62 @@ pub async fn execute_kernsight_group_purge(
     plan_id: Uuid,
     confirmation_token: String,
 ) -> Result<Report, String> {
-    let _execution = EXECUTION_LOCK.lock().await;
-    execute_at(root(&app)?, plan_id, &confirmation_token).await
+    run_execution(root(&app)?, plan_id, Some(confirmation_token)).await
 }
+#[tauri::command]
+pub fn get_kernsight_group_purge_plan(
+    app: tauri::AppHandle,
+    plan_id: Uuid,
+) -> Result<Plan, String> {
+    let _guard = IO_LOCK.lock().map_err(|e| e.to_string())?;
+    Ok(read_journal(&root(&app)?, plan_id)?.plan)
+}
+#[tauri::command]
+pub async fn resume_kernsight_group_purge(
+    app: tauri::AppHandle,
+    plan_id: Uuid,
+) -> Result<Report, String> {
+    resume_at(root(&app)?, plan_id).await
+}
+async fn resume_at(root: PathBuf, id: Uuid) -> Result<Report, String> {
+    run_execution(root, id, None).await
+}
+async fn run_execution(
+    root: PathBuf,
+    id: Uuid,
+    confirmation: Option<String>,
+) -> Result<Report, String> {
+    // Registration failure must not mutate another live operation's journal.
+    let (_operation, mut cancelled) = register_operation(id, EXECUTE_SECONDS)?;
+    let result = tokio::select! {
+        biased;
+        _ = cancelled.changed() => Err("清理已取消；保留原清单".to_string()),
+        result = tokio::time::timeout(std::time::Duration::from_secs(EXECUTE_SECONDS), async {
+            let _execution = EXECUTION_LOCK.lock().await;
+            execute_inner(root.clone(), id, confirmation.as_deref()).await
+        }) => result.unwrap_or_else(|_| Err("清理整体期限已到；保留原清单".into())),
+    };
+    match result {
+        Ok(report) => Ok(report),
+        Err(error) => {
+            let report = interrupted_at(&root, id, error.clone())?;
+            if report.state == "partial" {
+                Ok(report)
+            } else {
+                Err(error)
+            }
+        }
+    }
+}
+#[cfg(test)]
 async fn execute_at(root: PathBuf, id: Uuid, confirmation: &str) -> Result<Report, String> {
+    execute_inner(root, id, Some(confirmation)).await
+}
+async fn execute_inner(
+    root: PathBuf,
+    id: Uuid,
+    confirmation: Option<&str>,
+) -> Result<Report, String> {
     *ACTIVE_PLAN.lock().map_err(|e| e.to_string())? = Some(id);
     let _active_guard = ActivePlan;
     let mut j = {
@@ -606,17 +901,22 @@ async fn execute_at(root: PathBuf, id: Uuid, confirmation: &str) -> Result<Repor
         if j.report.state == "completed" {
             return Ok(j.report);
         }
-        if confirmation != j.plan.confirmation_token || j.plan.confirmation_token.is_empty() {
-            return Err("永久清理确认文本不匹配；未执行".into());
+        if let Some(confirmation) = confirmation {
+            if confirmation != j.plan.confirmation_token || j.plan.confirmation_token.is_empty() {
+                return Err("永久清理确认文本不匹配；未执行".into());
+            }
+            if now_millis() > j.plan.expires_unix_ms || now_millis() < j.plan.created_unix_ms {
+                return Err("清理预览已过期；请重新预览并确认".into());
+            }
+        } else if !j.started || !j.plan.confirmation_token.is_empty() {
+            return Err("恢复只接受已经确认并消耗 nonce 的原清理日志".into());
         }
-        if now_millis() > j.plan.expires_unix_ms || now_millis() < j.plan.created_unix_ms {
-            return Err("清理预览已过期；请重新预览并确认".into());
-        }
+        check_operation(id)?;
         if !j.plan.local_only && !["ready", "not_required"].contains(&j.plan.device.status.as_str())
         {
             return Err("手机未连接或归属/终态未确认；未执行配对清理".into());
         }
-        ensure_no_other_started(&root, j.group.id, Some(id))?;
+        ensure_no_other_started(&root, j.group.id, Some(id), &|| check_operation(id))?;
         if j.plan.local_only {
             local::ensure_inactive(&j.group)?;
         } else {
@@ -628,8 +928,11 @@ async fn execute_at(root: PathBuf, id: Uuid, confirmation: &str) -> Result<Repor
                 purge_device::validate_snapshot(j.device.as_ref().ok_or("缺独立已封存手机证明")?)?;
             }
         }
-        local::verify(&j.local)?;
-        check_shared_ownership(&root, &j.group, &j.local.imported_roots)?;
+        local::verify_checked(&j.local, &|| check_operation(id))?;
+        check_shared_ownership(&root, &j.group, &j.local.imported_roots, &|| {
+            check_operation(id)
+        })?;
+        check_operation(id)?;
         j.started = true;
         j.plan.confirmation_token.clear();
         j.report.state = "running".into();
@@ -651,7 +954,7 @@ async fn execute_at(root: PathBuf, id: Uuid, confirmation: &str) -> Result<Repor
         match result {
             Ok(outcome) if outcome.errors.is_empty() && outcome.status == "completed" => {
                 j.report.device_state = "completed".into();
-                j.report.warnings.push(format!("手机确认移除 {} 个文件路径；保留归属/生命周期控制记录及共享内容，不把逻辑字节声称为释放空间",outcome.removed_files));
+                j.report.warnings.push("手机已核验原授权目录清理完成；保留控制记录与全局共享内容，文件数量和释放字节未计量".into());
             }
             Ok(outcome) => {
                 j.report.device_state = "failed".into();
@@ -674,10 +977,12 @@ async fn execute_at(root: PathBuf, id: Uuid, confirmation: &str) -> Result<Repor
     // No async device work while holding IO_LOCK. The durable started marker
     // prevents new producer stages and exports while this transaction is active.
     let _guard = IO_LOCK.lock().map_err(|e| e.to_string())?;
-    if let Err(e) = local::verify(&j.local) {
+    check_operation(id)?;
+    if let Err(e) = local::verify_checked(&j.local, &|| check_operation(id)) {
         j.report.local_state = "failed".into();
         j.report.error = Some(e);
     } else {
+        check_operation(id)?;
         // Persist authorization of this fixed complete local range once before
         // unlink. Checkpoint completed prefixes in bounded batches; a crash can
         // undercount physical removals, never invent them or lose the inventory.
@@ -686,6 +991,11 @@ async fn execute_at(root: PathBuf, id: Uuid, confirmation: &str) -> Result<Repor
         }
         write_journal(&root, &j)?;
         for index in 0..j.local.items.len() {
+            if let Err(error) = check_operation(id) {
+                j.report.local_state = "interrupted".into();
+                j.report.error = Some(error);
+                break;
+            }
             if j.local.items[index].removed {
                 continue;
             }
@@ -719,6 +1029,10 @@ async fn execute_at(root: PathBuf, id: Uuid, confirmation: &str) -> Result<Repor
             j.report.local_state = "completed".into();
         }
     }
+    if let Err(error) = check_operation(id) {
+        j.report.error = Some(error);
+        j.report.local_state = "interrupted".into();
+    }
     j.report.updated_unix_ms = now_millis();
     j.report.state = if j.report.local_state == "completed"
         && ["completed", "not_required"].contains(&j.report.device_state.as_str())
@@ -740,6 +1054,140 @@ async fn execute_at(root: PathBuf, id: Uuid, confirmation: &str) -> Result<Repor
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn cancellation_drops_pending_future_without_execution_lock() {
+        let id = Uuid::new_v4();
+        let task = tokio::spawn(supervise(
+            id,
+            20,
+            std::future::pending::<Result<(), String>>(),
+        ));
+        tokio::task::yield_now().await;
+        cancel_kernsight_group_purge_preparation(id).unwrap();
+        assert!(task.await.unwrap().unwrap_err().contains("取消"));
+        assert!(!OPERATIONS.lock().unwrap().contains_key(&id));
+    }
+    #[test]
+    fn cancelled_preparation_rejects_late_registration() {
+        let id = Uuid::new_v4();
+        cancel_kernsight_group_purge_preparation(id).unwrap();
+        assert!(register_operation(id, 20).is_err());
+    }
+    #[tokio::test]
+    async fn duplicate_execution_cannot_rewrite_live_journal() {
+        let f = Fixture::new();
+        let g = f.group();
+        let plan = prepare_at(f.0.clone(), g.id, vec![], true).await.unwrap();
+        let mut j = read_journal(&f.0, plan.id).unwrap();
+        j.started = true;
+        j.plan.confirmation_token.clear();
+        j.report.state = "running".into();
+        write_journal(&f.0, &j).unwrap();
+        let (_guard, _receiver) = register_operation(plan.id, 30).unwrap();
+        assert!(resume_at(f.0.clone(), plan.id).await.is_err());
+        assert_eq!(read_journal(&f.0, plan.id).unwrap().report.state, "running");
+        assert!(path(&f.0, g.id).exists());
+    }
+    #[tokio::test]
+    async fn elapsed_deadline_drops_pending_future() {
+        let id = Uuid::new_v4();
+        assert!(
+            supervise(id, 0, std::future::pending::<Result<(), String>>())
+                .await
+                .unwrap_err()
+                .contains("期限")
+        );
+        assert!(!OPERATIONS.lock().unwrap().contains_key(&id));
+    }
+    #[tokio::test]
+    async fn cancelled_resume_waiting_on_execution_lock_is_durable_without_unlink() {
+        let f = Fixture::new();
+        let g = f.group();
+        let p = prepare_at(f.0.clone(), g.id, vec![], true).await.unwrap();
+        let mut j = read_journal(&f.0, p.id).unwrap();
+        j.started = true;
+        j.plan.confirmation_token.clear();
+        j.report.state = "partial".into();
+        write_journal(&f.0, &j).unwrap();
+        let before = serde_json::to_value(&j.local).unwrap();
+        let lock = EXECUTION_LOCK.lock().await;
+        let root = f.0.clone();
+        let id = p.id;
+        let task = tokio::spawn(async move { resume_at(root, id).await });
+        tokio::task::yield_now().await;
+        signal_cancel(id).unwrap();
+        let report = tokio::time::timeout(std::time::Duration::from_secs(1), task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(report.state, "partial");
+        assert_eq!(report.removed_local_files, 0);
+        assert_eq!(
+            before,
+            serde_json::to_value(&read_journal(&f.0, id).unwrap().local).unwrap()
+        );
+        assert!(path(&f.0, g.id).exists());
+        drop(lock);
+    }
+    #[tokio::test]
+    async fn resume_rejects_unconfirmed_preview_and_preserves_scope() {
+        let f = Fixture::new();
+        let g = f.group();
+        let p = prepare_at(f.0.clone(), g.id, vec![], true).await.unwrap();
+        assert!(resume_at(f.0.clone(), p.id).await.is_err());
+        assert!(path(&f.0, g.id).exists());
+        let mut j = read_journal(&f.0, p.id).unwrap();
+        j.started = true;
+        j.plan.confirmation_token.clear();
+        j.report.state = "partial".into();
+        j.plan.expires_unix_ms = 0;
+        write_journal(&f.0, &j).unwrap();
+        let before = serde_json::to_value(&j.local).unwrap();
+        let report = resume_at(f.0.clone(), p.id).await.unwrap();
+        assert_eq!(report.state, "completed");
+        let after = read_journal(&f.0, p.id).unwrap();
+        assert_eq!(
+            before["entries"],
+            serde_json::to_value(&after.local).unwrap()["entries"]
+        );
+    }
+    #[tokio::test]
+    #[ignore = "explicit authorized original-journal resume; performs real deletion"]
+    async fn physical_authorized_original_journal_resume() {
+        let root = PathBuf::from(std::env::var("ME_PURGE_RESUME_ROOT").expect("AppData root"));
+        let id = Uuid::parse_str(&std::env::var("ME_PURGE_RESUME_PLAN").expect("plan")).unwrap();
+        assert_eq!(id.to_string(), "1d66c2cf-9266-49c6-acfe-cdd0211467b9");
+        let j = read_journal(&root, id).unwrap();
+        assert_eq!(
+            j.group.id.to_string(),
+            "409f90ab-842b-4fc1-99bb-16a47893cf31"
+        );
+        assert_eq!(j.group.serial, "35251JEGR12568");
+        assert!(j.started && j.plan.confirmation_token.is_empty());
+        let report = resume_at(root, id).await.unwrap();
+        fs::write(
+            std::env::var("ME_PURGE_RESUME_REPORT").expect("report"),
+            serde_json::to_vec_pretty(&report).unwrap(),
+        )
+        .unwrap();
+    }
+    #[test]
+    fn oversized_aggregate_metadata_is_rejected_before_json_parse() {
+        let f = Fixture::new();
+        fs::create_dir_all(f.0.join("purges")).unwrap();
+        let p = f.0.join("purges").join(format!("{}.json", Uuid::new_v4()));
+        File::create(&p)
+            .unwrap()
+            .set_len(METADATA_TOTAL_LIMIT + 1)
+            .unwrap();
+        assert!(list_journals(&f.0).unwrap_err().contains("总量超限"));
+        assert!(
+            metadata_inventory(&f.0, &["purges"], &|| Err("cancel checkpoint".into()))
+                .unwrap_err()
+                .contains("checkpoint")
+        );
+    }
     struct Fixture(PathBuf);
     impl Fixture {
         fn new() -> Self {

@@ -10,6 +10,7 @@ const makePlan=(args,extra={})=>{const stamp=Date.now();return {schema:'mobilee.
 const makeReport=(plan,extra={})=>({id:plan.id,parentId:plan.parentId,serial:plan.serial,package:plan.package,importedRoots:plan.localEntries.filter(x=>x.kind==='imported_root').map(x=>x.path),retainedSessionIds:['owned-phone-child'],updatedUnixMs:Date.now(),state:'completed',localState:'completed',deviceState:'completed',removedLocalFiles:plan.localEntries.reduce((n,x)=>n+x.files,0),removedLocalAllocatedBytes:null,warnings:[],error:null,...extra})
 let lastPlan;const checks=[];const record=(name)=>{checks.push({name,passed:true});console.log('PASS '+name)}
 const h=await launchMe({serve:process.env.ME_PURGE_EXISTING_SERVER!=='1',handler:async(command,args)=>{
+ if(command==='cancel_kernsight_group_purge_preparation')return null
  if(command==='list_kernsight_groups')return groups
  if(command==='list_kernsight_group_purges')return reports
  if(command==='prepare_kernsight_group_purge'){
@@ -22,10 +23,12 @@ const h=await launchMe({serve:process.env.ME_PURGE_EXISTING_SERVER!=='1',handler
  if(command==='prepare_kernsight_group_purge_retry'){
   const report=reports.find(x=>x.id===args.planId);lastPlan=makePlan({parentId:report.parentId,importedRoots:[],localOnly:args.localOnly},{id:report.id,...(report.localState==='completed'?{localEntries:[]}:{})});return lastPlan
  }
+ if(command==='get_kernsight_group_purge_plan'){assert.equal(args.planId,lastPlan.id);return {...lastPlan,confirmationToken:'',expiresUnixMs:Date.now()-1}}
+ if(command==='resume_kernsight_group_purge'){assert.equal(args.planId,lastPlan.id);const report=makeReport(lastPlan);reports=[report];return report}
  if(command==='execute_kernsight_group_purge'){
   assert.equal(args.confirmationToken,lastPlan.confirmationToken)
   if(mode==='execute-fail')throw new Error('mock interrupted after journal write')
-  const report=makeReport(lastPlan,mode==='offline'?{state:'partial',deviceState:'pending'}:{})
+  const report=makeReport(lastPlan,mode==='offline'?{state:'partial',deviceState:'pending'}:mode==='fallback'?{state:'partial',localState:'completed',deviceState:'failed',error:'fixture phone interrupted'}:{})
   reports=[report];groups=groups.filter(x=>x.id!==lastPlan.parentId)
   if(mode==='delayed-execute')return await new Promise(resolve=>{resolveExecute=()=>resolve(report)})
   return report
@@ -70,6 +73,7 @@ try{
  await restore();mode='execute-fail';await open();await preview();await execute().click();await dialog().getByRole('alert').first().waitFor();assert.match(await dialog().getByRole('alert').first().innerText(),/未确认/);assert.equal(await page.locator('.ks-capture-group').count(),2);await cancel();mode='ready';await open();await preview();record('Unconfirmed failure preserves normal sessions; subsequent cleanup requires a fresh preview')
  for(const width of [720,390]){await page.setViewportSize({width,height:900});const b=await dialog().evaluate(el=>({client:el.clientWidth,scroll:el.scrollWidth,left:el.getBoundingClientRect().left,right:el.getBoundingClientRect().right}));assert.ok(b.scroll<=b.client+1,JSON.stringify(b));assert.ok(b.left>=0&&b.right<=width,JSON.stringify(b));await dialog().screenshot({path:out+`/preview-${width}.png`})}record('Fresh preview is bounded at 720px and 390px')
  mode='delayed-execute';await execute().evaluate(el=>{el.click();el.click();el.click()});await page.waitForTimeout(80);assert.equal(executeCount(),2);assert.equal(await dialog().getByRole('button',{name:'正在清理并核验…',exact:true}).isDisabled(),true);resolveExecute();await page.waitForTimeout(150);assert.equal(await dialog().count(),0);assert.equal(await page.locator('.ks-capture-group').count(),1);assert.equal(await page.locator('.ks-purge-journal').count(),0);record('Repeated explicit clicks execute once; normal neighboring session remains without history area')
- assert.equal(errors.length,0,errors.join('\n'));const unsafe=calls.filter(x=>/^(cleanup_|start_|run_kernsight|dump_|cancel_|trash_|restore_)/.test(x.command));assert.deepEqual(unsafe,[])
+ await restore();mode='ready';await open();await preview();const beforeFallbackPrepare=calls.filter(c=>c.command==='prepare_kernsight_group_purge').length;mode='fallback';await execute().click();await page.getByRole('button',{name:'继续已确认清理',exact:true}).waitFor();assert.equal(await page.locator('.ks-capture-group').count(),1);assert.ok(calls.some(c=>c.command==='get_kernsight_group_purge_plan'));assert.equal(calls.filter(c=>c.command==='prepare_kernsight_group_purge').length,beforeFallbackPrepare);assert.match(await dialog().innerText(),/fixture phone interrupted/);const beforeResumeExecute=executeCount();await page.getByRole('button',{name:'继续已确认清理',exact:true}).click();await page.waitForTimeout(150);assert.equal(executeCount(),beforeResumeExecute);assert.ok(calls.some(c=>c.command==='resume_kernsight_group_purge'));assert.equal(await dialog().count(),0);record('Removed local row remounts fallback from original consumed-nonce plan; resume never prepares broader scope or asks confirmation again')
+ assert.equal(errors.length,0,errors.join('\n'));const unsafe=calls.filter(x=>/^(cleanup_|start_|run_kernsight|dump_|cancel_kernsight_group$|trash_|restore_)/.test(x.command));assert.deepEqual(unsafe,[])
  writeFileSync(out+'/browser-results.json',JSON.stringify({passed:true,checks,errors,commands:[...new Set(calls.map(x=>x.command))],executionCalls:executeCount(),note:'All Tauri IPC mocked. Chromium runs on assistant cloud computer; no phone or real user data touched.'},null,2));console.log(JSON.stringify({passed:true,checks:checks.length,out}))
 }catch(error){await page.screenshot({path:out+'/failure.png',fullPage:true});writeFileSync(out+'/failure.txt',String(error)+'\n'+JSON.stringify({calls,errors},null,2));throw error}finally{await close()}

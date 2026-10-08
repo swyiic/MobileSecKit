@@ -31,7 +31,7 @@ export function purgeConfirmationBlockReason(plan: KernSightGroupPurgePlan | nul
   if (state.executing) return '正在执行清理并核验结果，请勿重复操作。'
   if (!state.active) return '当前页面未激活；返回此页面后会自动核对清理范围。'
   if (state.busy) return '采集、拉取、导入或归属核对尚未结束；结束后自动核对清理范围。'
-  if (state.preparing) return '正在自动核对文件、设备身份与会话归属；大会话可能需要约 2 分钟，完成后才可确认删除。'
+  if (state.preparing) return '正在自动核对文件、设备身份与会话归属；后台核对最长20秒，完成后才可确认删除。'
   if (!plan) return '尚无有效清理范围；请点击“重新核对并重试”。'
   if (!target || !purgePlanMatches(plan, target)) return '预览身份与此主会话不一致；未执行删除，请重新核对。'
   if (!plan.confirmationToken) return '此次确认凭证已失效；未执行删除，请重新核对。'
@@ -70,4 +70,30 @@ export function bundleRemovedByPurge(bundle: KernSightLocalEvidenceBundle, plan:
   return report.localState === 'completed' && report.parentId === plan.parentId && report.serial === plan.serial && report.package === plan.package
     && group?.id === plan.parentId && group.serial === plan.serial && group.package === plan.package
     && report.importedRoots.includes(bundle.root)
+}
+
+/** A deadline requests backend cancellation; a late invoke cannot undo that decision. */
+export function createPurgeOperation<T>(run: () => Promise<T>, abort: (reason: 'timeout' | 'user' | 'unmount' | 'superseded') => Promise<T>, timeoutMs: number) {
+  let settled = false
+  let stopping: Promise<T> | null = null
+  let cancelled = false
+  let resolve!: (value: T) => void
+  let reject!: (reason: unknown) => void
+  const result = new Promise<T>((yes, no) => { resolve = yes; reject = no })
+  const finish = (value: T) => { if (!settled) { settled = true; clearTimeout(timer); resolve(value) } }
+  const fail = (reason: unknown) => { if (!settled) { settled = true; clearTimeout(timer); reject(reason) } }
+  const cancel = (reason: 'timeout' | 'user' | 'unmount' | 'superseded' = 'user'): Promise<T> => {
+    if (stopping) return stopping
+    if (settled) return result
+    cancelled = true
+    clearTimeout(timer)
+    // Do not release the result merely because its clock expired: abort must
+    // reconcile the durable backend outcome (or explicitly reject as unknown).
+    stopping = Promise.resolve().then(() => abort(reason))
+    stopping.then(finish, fail)
+    return stopping
+  }
+  const timer = setTimeout(() => { void cancel('timeout').catch(() => {}) }, timeoutMs)
+  Promise.resolve().then(() => cancelled ? result : run()).then(value => { if (!cancelled) finish(value) }, reason => { if (!cancelled) fail(reason) })
+  return { result, cancel, cancelled: () => cancelled }
 }

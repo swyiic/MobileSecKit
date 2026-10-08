@@ -22,6 +22,8 @@ pub(super) struct Fingerprint {
     ino: u64,
     links: u64,
     allocated: Option<u64>,
+    // Legacy content digest is retained for journal compatibility, not recomputed.
+    #[serde(default)]
     sha256: String,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -184,33 +186,19 @@ fn same_fingerprint(a: &Fingerprint, b: &Fingerprint) -> bool {
         && a.dev == b.dev
         && a.ino == b.ino
         && a.allocated == b.allocated
-        && a.sha256 == b.sha256
 }
-fn fingerprint_file(mut file: File) -> Result<Fingerprint, String> {
+// File identity is metadata-only. Ownership comes from bounded parent/relation
+// records and exact paths, never from parsing or hashing evidence payloads.
+fn fingerprint_file(file: File) -> Result<Fingerprint, String> {
     let before = file.metadata().map_err(|e| e.to_string())?;
     if !before.is_file() {
         return Err("清理对象不是普通文件".into());
     }
-    let mut f = metadata_fingerprint(&before);
-    let mut hash = Sha256::new();
-    let mut buf = [0; 65536];
-    let mut total = 0u64;
-    loop {
-        let n = std::io::Read::read(&mut file, &mut buf).map_err(|e| e.to_string())?;
-        if n == 0 {
-            break;
-        }
-        total = total.checked_add(n as u64).ok_or("清理文件大小溢出")?;
-        if total > f.bytes {
-            return Err("清理对象在读取时增长；请重新预览".into());
-        }
-        hash.update(&buf[..n]);
+    let fingerprint = metadata_fingerprint(&before);
+    if !same_metadata(&file.metadata().map_err(|e| e.to_string())?, &fingerprint) {
+        return Err("清理对象元数据改变；请重新预览".into());
     }
-    if total != f.bytes || !same_metadata(&file.metadata().map_err(|e| e.to_string())?, &f) {
-        return Err("清理对象在读取时变更；请重新预览".into());
-    }
-    f.sha256 = format!("{:x}", hash.finalize());
-    Ok(f)
+    Ok(fingerprint)
 }
 
 // Scope is the named evidence tree only, never paths mentioned in reports.
@@ -331,8 +319,15 @@ fn reject_nested_mounts(_root: &Path) -> Result<(), String> {
     Err("此平台不能核实清理挂载边界".into())
 }
 
-fn walk(root: &Path, dir: &Path, out: &mut Vec<PathBuf>) -> Result<(), String> {
+fn walk(
+    root: &Path,
+    dir: &Path,
+    out: &mut Vec<PathBuf>,
+    check: &dyn Fn() -> Result<(), String>,
+) -> Result<(), String> {
+    check()?;
     for item in fs::read_dir(dir).map_err(|e| e.to_string())? {
+        check()?;
         let p = item.map_err(|e| e.to_string())?.path();
         if out.len() >= FILE_CAP {
             return Err("本地清理清单超出 100000 文件上限".into());
@@ -349,7 +344,7 @@ fn walk(root: &Path, dir: &Path, out: &mut Vec<PathBuf>) -> Result<(), String> {
             return Err("证据目录越出原始来源".into());
         }
         if m.is_dir() {
-            walk(root, &p, out)?;
+            walk(root, &p, out, check)?;
         } else {
             out.push(p);
         }
@@ -358,21 +353,23 @@ fn walk(root: &Path, dir: &Path, out: &mut Vec<PathBuf>) -> Result<(), String> {
 }
 
 pub(super) fn inspect(root: &Path, g: &Group, sources: &[String]) -> Result<Snapshot, String> {
-    inspect_at(root, g, sources, true)
+    inspect_checked(root, g, sources, true, &|| Ok(()))
 }
 pub(super) fn inspect_candidate(
     root: &Path,
     g: &Group,
     sources: &[String],
 ) -> Result<Snapshot, String> {
-    inspect_at(root, g, sources, false)
+    inspect_checked(root, g, sources, false, &|| Ok(()))
 }
-fn inspect_at(
+pub(super) fn inspect_checked(
     root: &Path,
     g: &Group,
     sources: &[String],
     strict: bool,
+    check: &dyn Fn() -> Result<(), String>,
 ) -> Result<Snapshot, String> {
+    check()?;
     if strict {
         ensure_inactive(g)?;
     } else {
@@ -420,6 +417,7 @@ fn inspect_at(
     }
     let app_root = safe_path(root)?;
     for source in sources {
+        check()?;
         let original_source = source.clone();
         let source = safe_path(Path::new(source))?;
         if !source.is_dir()
@@ -477,27 +475,14 @@ fn inspect_at(
         if !imported.session_ids().is_subset(&g.session_ids()) {
             return Err("导入来源含未在原父清单确认的子会话；请先对齐清单".into());
         }
-        let report_path = if source.join("dump-report.json").is_file() {
-            source.join("dump-report.json")
-        } else {
-            source.join("bounded-code-report.json")
-        };
-        safe_path(&report_path)?;
-        let report: Value =
-            serde_json::from_str(&read_bounded_text(&report_path, 64 * 1024 * 1024)?)
-                .map_err(|e| e.to_string())?;
-        if report["package"]
-            .as_str()
-            .or_else(|| report["identity"]["package"].as_str())
-            != Some(g.package.as_str())
-        {
-            return Err("证据报告包身份不符".into());
-        }
+        // The exact parent/stage/attempt ownership above authorizes the named
+        // tree. Large dump/session reports are evidence, not cleanup predicates.
         let mut files = vec![];
-        walk(&source, &source, &mut files)?;
+        walk(&source, &source, &mut files, check)?;
         files.sort();
         let mut retained = 0;
         for p in files {
+            check()?;
             let rel = p
                 .strip_prefix(&source)
                 .map_err(|e| e.to_string())?
@@ -547,6 +532,7 @@ fn inspect_at(
     out.warnings.push(
         "只删除清单内路径；外部原始 APK、应用私有文件、导出归档及共享内容池不在范围内".into(),
     );
+    check()?;
     if out.items.iter().any(|i| i.fingerprint.links > 1) {
         out.warnings.push(
             "存在硬链接共享内容：仅移除所选路径，不修改其他引用；共享部分不计为释放空间".into(),
@@ -676,12 +662,13 @@ pub(super) fn validate_snapshot(
             || !seen.insert(p)
             || entry.files != 1
             || entry.logical_bytes != item.fingerprint.bytes
-            || item.fingerprint.sha256.len() != 64
-            || !item
-                .fingerprint
-                .sha256
-                .bytes()
-                .all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c))
+            || (!item.fingerprint.sha256.is_empty()
+                && (item.fingerprint.sha256.len() != 64
+                    || !item
+                        .fingerprint
+                        .sha256
+                        .bytes()
+                        .all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c))))
         {
             return Err("清理日志文件越界/身份冲突".into());
         }
@@ -696,6 +683,13 @@ pub(super) fn validate_snapshot(
 }
 
 pub(super) fn verify(snapshot: &Snapshot) -> Result<(), String> {
+    verify_checked(snapshot, &|| Ok(()))
+}
+pub(super) fn verify_checked(
+    snapshot: &Snapshot,
+    check: &dyn Fn() -> Result<(), String>,
+) -> Result<(), String> {
+    check()?;
     for root in snapshot
         .items
         .iter()
@@ -703,9 +697,11 @@ pub(super) fn verify(snapshot: &Snapshot) -> Result<(), String> {
         .map(|i| i.root.as_str())
         .collect::<BTreeSet<_>>()
     {
+        check()?;
         reject_nested_mounts(Path::new(root))?;
     }
     for item in snapshot.items.iter().filter(|i| !i.removed) {
+        check()?;
         let file = match secure::open_file(Path::new(&item.root), &item.relative) {
             Ok(file) => file,
             Err(_)
@@ -723,6 +719,7 @@ pub(super) fn verify(snapshot: &Snapshot) -> Result<(), String> {
             return Err(format!("清理预览已过期，文件变更：{}", item.relative));
         }
     }
+    check()?;
     Ok(())
 }
 
@@ -810,7 +807,7 @@ mod secure {
             libc::openat(
                 parent.as_raw_fd(),
                 name.as_ptr(),
-                libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK,
             )
         };
         if fd < 0 {
@@ -831,7 +828,7 @@ mod secure {
             libc::openat(
                 parent.as_raw_fd(),
                 name.as_ptr(),
-                libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK,
             )
         };
         if fd < 0 {
@@ -989,6 +986,116 @@ mod tests {
         assert!(ensure_inactive(&g).is_err());
         g.state = "unknown".into();
         assert!(ensure_inactive(&g).is_err());
+    }
+    #[test]
+    fn inspection_and_verification_poll_cancellation_between_items() {
+        let f = Fixture::new();
+        let g = f.group();
+        let source = f.evidence(&g, "source");
+        let calls = std::cell::Cell::new(0usize);
+        let check = || {
+            calls.set(calls.get() + 1);
+            if calls.get() > 3 {
+                Err("fixture cancelled".into())
+            } else {
+                Ok(())
+            }
+        };
+        assert!(inspect_checked(
+            &f.0.join("managed"),
+            &g,
+            &[source.to_string_lossy().into_owned()],
+            true,
+            &check
+        )
+        .unwrap_err()
+        .contains("cancelled"));
+        let snap = inspect(
+            &f.0.join("managed"),
+            &g,
+            &[source.to_string_lossy().into_owned()],
+        )
+        .unwrap();
+        calls.set(0);
+        assert!(verify_checked(&snap, &check)
+            .unwrap_err()
+            .contains("cancelled"));
+        assert!(source.join("runtime/bounded-fixture.code").exists());
+    }
+    #[test]
+    fn large_sparse_and_unparseable_payloads_are_metadata_only_and_legacy_digest_is_compatible() {
+        let f = Fixture::new();
+        let g = f.group();
+        let source = f.evidence(&g, "source");
+        let file = File::create(source.join("runtime/large.code")).unwrap();
+        file.set_len(3 * 1024 * 1024 * 1024).unwrap();
+        fs::write(
+            source.join("dump-report.json"),
+            b"not JSON; cleanup ownership is the parent manifest",
+        )
+        .unwrap();
+        fs::write(
+            source.join("session-report.json"),
+            b"not JSON session evidence",
+        )
+        .unwrap();
+        let mut snap = inspect(
+            &f.0.join("managed"),
+            &g,
+            &[source.to_string_lossy().into_owned()],
+        )
+        .unwrap();
+        assert!(snap
+            .items
+            .iter()
+            .all(|item| item.fingerprint.sha256.is_empty()));
+        let large = snap
+            .items
+            .iter()
+            .find(|i| i.relative == "runtime/large.code")
+            .unwrap();
+        assert_eq!(large.fingerprint.bytes, 3 * 1024 * 1024 * 1024);
+        for item in &mut snap.items {
+            item.fingerprint.sha256 = "a".repeat(64);
+        }
+        validate_snapshot(&f.0.join("managed"), &g, &snap).unwrap();
+        verify(&snap).unwrap();
+        assert!(source.join("runtime/large.code").exists());
+    }
+    #[test]
+    fn changed_metadata_or_replacement_inode_is_rejected_without_reading_payload() {
+        let f = Fixture::new();
+        let g = f.group();
+        let source = f.evidence(&g, "source");
+        let snap = inspect(
+            &f.0.join("managed"),
+            &g,
+            &[source.to_string_lossy().into_owned()],
+        )
+        .unwrap();
+        let path = source.join("runtime/bounded-fixture.code");
+        let original =
+            secure::open_file(&safe_path(&source).unwrap(), "runtime/bounded-fixture.code")
+                .unwrap();
+        let replacement = source.join("runtime/replacement.code");
+        fs::write(&replacement, b"synthetic evidence only").unwrap();
+        fs::rename(&replacement, &path).unwrap();
+        assert!(verify(&snap).is_err());
+        assert!(path.exists());
+        drop(original);
+        let fresh = inspect(
+            &f.0.join("managed"),
+            &g,
+            &[source.to_string_lossy().into_owned()],
+        )
+        .unwrap();
+        File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_len(999)
+            .unwrap();
+        assert!(verify(&fresh).is_err());
     }
     #[test]
     fn content_change_same_size_invalidates_preview() {

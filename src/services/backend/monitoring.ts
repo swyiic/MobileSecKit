@@ -22,10 +22,14 @@ import type {
 
 export const monitoringBackend = {
   localKernSightEvidencePresent: (path: string) => invoke<boolean>('local_kernsight_evidence_present', { path }),
-  prepareKernSightGroupPurge: (parentId: string, importedRoots: string[], localOnly: boolean) => invoke<KernSightGroupPurgePlan>('prepare_kernsight_group_purge', { parentId, importedRoots, localOnly }),
+  prepareKernSightGroupPurge: (parentId: string, importedRoots: string[], localOnly: boolean, requestId?: string) => invoke<KernSightGroupPurgePlan>('prepare_kernsight_group_purge', { parentId, importedRoots, localOnly, requestId }),
   executeKernSightGroupPurge: (planId: string, confirmationToken: string) => invoke<KernSightGroupPurgeReport>('execute_kernsight_group_purge', { planId, confirmationToken }),
+  cancelKernSightGroupPurgePreparation: (requestId: string) => invoke<void>('cancel_kernsight_group_purge_preparation', { requestId }),
+  cancelKernSightGroupPurge: (planId: string) => invoke<KernSightGroupPurgeReport>('cancel_kernsight_group_purge', { planId }),
+  kernSightGroupPurgePlan: (planId: string) => invoke<KernSightGroupPurgePlan>('get_kernsight_group_purge_plan', { planId }),
+  resumeKernSightGroupPurge: (planId: string) => invoke<KernSightGroupPurgeReport>('resume_kernsight_group_purge', { planId }),
   listKernSightGroupPurges: () => invoke<KernSightGroupPurgeReport[]>('list_kernsight_group_purges'),
-  prepareKernSightGroupPurgeRetry: (planId: string, localOnly = false) => invoke<KernSightGroupPurgePlan>('prepare_kernsight_group_purge_retry', { planId, localOnly }),
+  prepareKernSightGroupPurgeRetry: (planId: string, localOnly = false, requestId?: string) => invoke<KernSightGroupPurgePlan>('prepare_kernsight_group_purge_retry', { planId, localOnly, requestId }),
   kernSightGroupSessionReport:(parentId:string,serial:string,packageName:string,sessionId:string)=>invoke<KernSightSessionReportDocument>('get_kernsight_group_session_report',{parentId,serial,package:packageName,sessionId}),
   localKernSightChildReport:(root:string,parentId:string,sessionId:string)=>invoke<KernSightSessionReportDocument>('get_local_kernsight_child_report',{root,parentId,sessionId}),
   beginKernSightGroup:(request:KernSightCaptureRequest,durations:number[],startupReplay:boolean)=>invoke<KernSightCaptureGroup>(captureGroupIPC(request),{request,durations,startupReplay}),
