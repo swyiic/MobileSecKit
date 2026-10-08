@@ -10,6 +10,12 @@ const MAX_ERROR_EXCERPT_BYTES: usize = 4096;
 #[serde(rename_all = "camelCase")]
 pub struct CaptureDiagnostic {
     pub schema: String,
+    /// Original output retained in the parent file, within its terminal byte reserve.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub raw_output: Option<RawOutput>,
+    /// Unified siblings reference the controller's single retained output.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub raw_output_attempt_id: Option<Uuid>,
     /// A matched lifecycle receipt or display-only output from this command.
     pub source: Option<String>,
     pub record: Option<Value>,
@@ -19,6 +25,52 @@ pub struct CaptureDiagnostic {
     pub raw_tail_truncated: bool,
     pub error_excerpt_truncated: bool,
     pub structured_record_omitted: bool,
+}
+
+// At most half of the existing 64KiB terminal reserve is used by raw logs.
+const RAW_OUTPUT_JSON_LIMIT: usize = 32 * 1024;
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RawOutput {
+    pub stdout: String,
+    pub stderr: String,
+    pub complete: bool,
+}
+fn raw_output(result: &KernSightCaptureResult) -> RawOutput {
+    let mut output = RawOutput {
+        stdout: result.stdout.clone(),
+        stderr: result.stderr.clone(),
+        complete: true,
+    };
+    // Keep the beginning of stderr: final lifecycle JSON must not hide the first cause.
+    while serde_json::to_vec(&output).map_or(usize::MAX, |v| v.len()) > RAW_OUTPUT_JSON_LIMIT {
+        output.complete = false;
+        let text = if !output.stdout.is_empty() {
+            &mut output.stdout
+        } else {
+            &mut output.stderr
+        };
+        let mut end = text.len() * 3 / 4;
+        while !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        text.truncate(end);
+    }
+    output
+}
+
+pub(super) fn partial_stage_error(
+    stage: &str,
+    reason: &str,
+    parent_remaining_ms: u64,
+    original: Option<&str>,
+) -> String {
+    let mut text = format!("阶段 {stage} 覆盖 partial（{reason}）；父预算剩余 {parent_remaining_ms}ms；已保存证据可拉取");
+    if let Some(original) = original.filter(|s| !s.is_empty()) {
+        text.push_str("；");
+        text.push_str(original);
+    }
+    text
 }
 
 fn valid_failure_shape(record: &Value) -> bool {
@@ -191,6 +243,8 @@ pub(super) fn collect(
     });
     Some(CaptureDiagnostic {
         schema: DIAGNOSTIC_SCHEMA.into(),
+        raw_output: result.map(raw_output),
+        raw_output_attempt_id: None,
         source,
         record,
         error_excerpt: excerpt,
@@ -410,6 +464,36 @@ mod tests {
         assert!(diagnostic.error_excerpt.is_none());
         assert_eq!(diagnostic.stderr_bytes, Some(0));
         assert!(!diagnostic.raw_tail_truncated);
+    }
+
+    #[test]
+    fn original_stderr_is_retained_even_when_display_tail_is_truncated() {
+        let stderr = format!("first root cause\n{}", "x".repeat(14_346));
+        let d = collect(&attempt(), Some(&output("", &stderr))).unwrap();
+        assert!(d.raw_tail_truncated);
+        let raw = d.raw_output.unwrap();
+        assert!(raw.complete);
+        assert_eq!(raw.stderr, stderr);
+    }
+    #[test]
+    fn raw_output_is_json_byte_bounded_and_preserves_first_cause() {
+        let stderr = format!("first root cause\n{}", "身份🙂\n".repeat(40_000));
+        let raw = raw_output(&output(&"large stdout".repeat(10_000), &stderr));
+        assert!(!raw.complete);
+        assert!(raw.stderr.starts_with("first root cause"));
+        assert!(serde_json::to_vec(&raw).unwrap().len() <= RAW_OUTPUT_JSON_LIMIT);
+    }
+    #[test]
+    fn phase_error_is_not_replaced_by_a_generic_parent_reason() {
+        let text = partial_stage_error(
+            "l1",
+            "parent_deadline_exhausted",
+            465_199,
+            Some("phase_time_exhausted: l1 crossed its original lease"),
+        );
+        assert!(text.contains("阶段 l1"));
+        assert!(text.contains("父预算剩余 465199ms"));
+        assert!(text.contains("phase_time_exhausted"));
     }
 
     #[test]

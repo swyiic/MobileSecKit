@@ -948,12 +948,14 @@ async fn run_group_stage_at(
                         .find(|a| a.relation == r)
                     {
                         a.state = "partial".into();
-                        a.error = Some(format!(
-                            "采集覆盖 partial（{}）；已保存证据可拉取",
+                        a.error = Some(diagnostics::partial_stage_error(
+                            &stage.key,
                             note["reason"]
                                 .as_str()
                                 .or_else(|| note["host_time_fence"].as_str())
-                                .unwrap_or("原因未确认")
+                                .unwrap_or("原因未确认"),
+                            deadline.remaining_ms().unwrap_or(0),
+                            error.as_deref(),
                         ));
                     }
                     g.refresh();
@@ -2211,12 +2213,21 @@ pub async fn run_kernsight_unified_group(
                 }
             }
         }
+        let mut raw_output_owner = None;
         for attempt in g.stages[..3]
             .iter_mut()
             .flat_map(|s| s.attempts.iter_mut())
             .filter(|a| relations.contains(&a.relation))
         {
             retain_capture_diagnostic(attempt, result.as_ref());
+            if let Some(diagnostic) = attempt.capture_diagnostic.as_mut() {
+                if let Some(owner) = raw_output_owner {
+                    diagnostic.raw_output = None;
+                    diagnostic.raw_output_attempt_id = Some(owner);
+                } else {
+                    raw_output_owner = Some(attempt.relation.attempt_id);
+                }
+            }
         }
         save(&root, &g)?;
     }
