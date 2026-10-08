@@ -126,9 +126,9 @@ async function prepare() {
       if (operation.cancelled()) return null
       if (prior && prior.state !== 'prepared') return monitoringBackend.kernSightGroupPurgePlan(retryPlanId)
     }
-    return retryPlanId
-      ? monitoringBackend.prepareKernSightGroupPurgeRetry(retryPlanId, requestedLocalOnly, requestId)
-      : monitoringBackend.prepareKernSightGroupPurge(target.parentId, selectedRoots, requestedLocalOnly, requestId)
+    // A prepared/unknown plan has no consumed authorization. Cancellation may
+    // tombstone its execute IPC, so generate a fresh plan and require its own Yes.
+    return monitoringBackend.prepareKernSightGroupPurge(target.parentId, selectedRoots, requestedLocalOnly, requestId)
   }, async reason => {
     await boundedStop(monitoringBackend.cancelKernSightGroupPurgePreparation(requestId))
     if (mounted && gate.current(ticket)) error.value = reason === 'timeout' ? '范围核对超过30秒，已请求后台停止并确认；未执行删除，可重新核对。' : '范围核对已取消；未执行删除。'

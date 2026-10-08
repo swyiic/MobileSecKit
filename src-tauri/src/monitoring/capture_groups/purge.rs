@@ -27,6 +27,8 @@ struct Operation {
 }
 static CANCELLED_PREPARATIONS: Mutex<BTreeMap<Uuid, std::time::Instant>> =
     Mutex::new(BTreeMap::new());
+static CANCELLED_EXECUTIONS: Mutex<BTreeMap<Uuid, std::time::Instant>> =
+    Mutex::new(BTreeMap::new());
 static OPERATIONS: Mutex<BTreeMap<Uuid, Operation>> = Mutex::new(BTreeMap::new());
 struct OperationGuard(Uuid);
 impl Drop for OperationGuard {
@@ -47,6 +49,12 @@ fn register_operation(
     if tombstones.contains_key(&id) {
         return Err("该预览请求已取消；拒绝迟到请求".into());
     }
+    register_active_operation(id, seconds)
+}
+fn register_active_operation(
+    id: Uuid,
+    seconds: u64,
+) -> Result<(OperationGuard, tokio::sync::watch::Receiver<bool>), String> {
     let mut operations = OPERATIONS.lock().map_err(|e| e.to_string())?;
     if operations.contains_key(&id) {
         return Err("该清理操作已经运行".into());
@@ -125,12 +133,26 @@ fn interrupted_at(root: &Path, id: Uuid, reason: String) -> Result<Report, Strin
     }
     Ok(journal.report)
 }
+fn cancel_execution(id: Uuid) -> Result<(), String> {
+    // Serialize cancellation with execution registration, including the period
+    // before a late IPC has registered its receiver. Keep this past preview TTL.
+    let mut tombstones = CANCELLED_EXECUTIONS.lock().map_err(|e| e.to_string())?;
+    tombstones.retain(|_, until| *until > std::time::Instant::now());
+    if tombstones.len() >= 4096 && !tombstones.contains_key(&id) {
+        return Err("执行取消登记已满；未丢弃已有标记".into());
+    }
+    tombstones.insert(
+        id,
+        std::time::Instant::now() + std::time::Duration::from_millis(TTL_MS + 60_000),
+    );
+    signal_cancel(id)
+}
 #[tauri::command]
 pub fn cancel_kernsight_group_purge(
     app: tauri::AppHandle,
     plan_id: Uuid,
 ) -> Result<Report, String> {
-    signal_cancel(plan_id)?;
+    cancel_execution(plan_id)?;
     interrupted_at(
         &root(&app)?,
         plan_id,
@@ -863,7 +885,26 @@ async fn run_execution(
     confirmation: Option<String>,
 ) -> Result<Report, String> {
     // Registration failure must not mutate another live operation's journal.
-    let (_operation, mut cancelled) = register_operation(id, EXECUTE_SECONDS)?;
+    let (_operation, mut cancelled) = {
+        let mut tombstones = CANCELLED_EXECUTIONS.lock().map_err(|e| e.to_string())?;
+        tombstones.retain(|_, until| *until > std::time::Instant::now());
+        if confirmation.is_some() && tombstones.contains_key(&id) {
+            return Err("原执行已取消；拒绝迟到的确认请求".into());
+        }
+        if confirmation.is_none() {
+            let _guard = IO_LOCK.lock().map_err(|e| e.to_string())?;
+            let journal = read_journal(&root, id)?;
+            if !journal.started || !journal.plan.confirmation_token.is_empty() {
+                return Err("恢复只接受已确认的原范围".into());
+            }
+        }
+        // Register first: a duplicate resume cannot clear a live cancellation.
+        let registration = register_active_operation(id, EXECUTE_SECONDS)?;
+        if confirmation.is_none() {
+            tombstones.remove(&id);
+        }
+        registration
+    };
     let result = tokio::select! {
         biased;
         _ = cancelled.changed() => Err("清理已取消；保留原清单".to_string()),
@@ -1066,6 +1107,40 @@ mod tests {
         cancel_kernsight_group_purge_preparation(id).unwrap();
         assert!(task.await.unwrap().unwrap_err().contains("取消"));
         assert!(!OPERATIONS.lock().unwrap().contains_key(&id));
+    }
+    #[tokio::test]
+    async fn cancellation_before_execution_registration_blocks_late_nonce_but_allows_confirmed_resume(
+    ) {
+        let f = Fixture::new();
+        let g = f.group();
+        let plan = prepare_at(f.0.clone(), g.id, vec![], true).await.unwrap();
+        cancel_execution(plan.id).unwrap();
+        assert!(
+            run_execution(f.0.clone(), plan.id, Some(plan.confirmation_token.clone()))
+                .await
+                .is_err()
+        );
+        assert!(path(&f.0, g.id).exists());
+        let mut journal = read_journal(&f.0, plan.id).unwrap();
+        assert!(!journal.started);
+        assert!(resume_at(f.0.clone(), plan.id).await.is_err());
+        journal.started = true;
+        journal.plan.confirmation_token.clear();
+        journal.report.state = "partial".into();
+        write_journal(&f.0, &journal).unwrap();
+        // Preparation cancellation uses a distinct request namespace and must
+        // not block an explicitly resumed, previously confirmed transaction.
+        cancel_kernsight_group_purge_preparation(plan.id).unwrap();
+        assert_eq!(
+            resume_at(f.0.clone(), plan.id).await.unwrap().state,
+            "completed"
+        );
+        assert!(read_journal(&f.0, plan.id)
+            .unwrap()
+            .plan
+            .confirmation_token
+            .is_empty());
+        assert!(!path(&f.0, g.id).exists());
     }
     #[test]
     fn cancelled_preparation_rejects_late_registration() {

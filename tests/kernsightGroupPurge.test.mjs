@@ -80,7 +80,7 @@ test('one paired yes/no confirmation automatically selects all known roots and n
  const vue=readFileSync(new URL('../src/components/KernSightGroupPurge.vue',import.meta.url),'utf8')
  assert.match(vue,/const selectedRoots = \[\.\.\.target.importedRoots\]/)
  assert.match(vue,/const requestedLocalOnly = false/)
- assert.match(vue,/prepareKernSightGroupPurgeRetry\(retryPlanId, requestedLocalOnly, requestId\)/)
+ assert.match(vue,/return monitoringBackend.prepareKernSightGroupPurge\(target.parentId, selectedRoots, requestedLocalOnly, requestId\)/)
  assert.match(vue,/!purgePlanMatches\(result, target\) \|\| result.localOnly !== requestedLocalOnly/)
  assert.doesNotMatch(vue,/type="checkbox"|v-model="localOnly"|v-model="roots"|type="text"/)
  assert.match(vue,/>否<\/button>/)
@@ -139,4 +139,13 @@ test('immediate cancel prevents an invoke that has not started from being issued
  const operation=createPurgeOperation(async()=>{invokes++;return 'unsafe late invoke'},async()=>{aborts++;return 'cancelled'},1000)
  await operation.cancel('unmount')
  assert.equal(await operation.result,'cancelled');assert.equal(invokes,0);assert.equal(aborts,1)
+})
+
+test('cancelled unstarted or unknown plan must prepare fresh scope for a new Yes',()=>{
+ const vue=readFileSync(new URL('../src/components/KernSightGroupPurge.vue',import.meta.url),'utf8')
+ assert.doesNotMatch(vue,/monitoringBackend.prepareKernSightGroupPurgeRetry\(/)
+ assert.match(vue,/if \(prior && prior.state !== 'prepared'\) return monitoringBackend.kernSightGroupPurgePlan\(retryPlanId\)/)
+ assert.match(vue,/return monitoringBackend.prepareKernSightGroupPurge\(target.parentId, selectedRoots, requestedLocalOnly, requestId\)/)
+ const parent=readFileSync(new URL('../src/views/AndroidRuntimeMonitorView.vue',import.meta.url),'utf8')
+ assert.match(parent,/retryPlanId: report.state === 'prepared' \? undefined : report.id/)
 })
