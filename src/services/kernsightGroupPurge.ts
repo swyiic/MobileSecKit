@@ -17,9 +17,9 @@ export function purgePlanMatches(plan: KernSightGroupPurgePlan, target: PurgeTar
 }
 
 /** UI defense in depth. The backend independently validates the stored plan and its token. */
-export function canConfirmPurge(plan: KernSightGroupPurgePlan | null, target: PurgeTarget | null, acknowledged: boolean, typedConfirmation: string, now: number, busy = false): boolean {
-  return Boolean(plan && target && !busy && acknowledged && typedConfirmation === plan.confirmationText
-    && purgePlanMatches(plan, target) && plan.confirmationToken && plan.confirmationText
+export function canConfirmPurge(plan: KernSightGroupPurgePlan | null, target: PurgeTarget | null, now: number, busy = false): boolean {
+  return Boolean(plan && target && !busy
+    && purgePlanMatches(plan, target) && plan.confirmationToken
     && Number.isFinite(plan.createdUnixMs) && Number.isFinite(plan.expiresUnixMs)
     && plan.createdUnixMs <= now && now < plan.expiresUnixMs
     && plan.expiresUnixMs - plan.createdUnixMs <= 300_000

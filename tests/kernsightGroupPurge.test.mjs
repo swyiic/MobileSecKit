@@ -7,19 +7,17 @@ const code = ts.transpileModule(source, {compilerOptions:{target:ts.ScriptTarget
 const {canConfirmPurge, createPurgeRequestGate, purgePlanMatches, purgeTargetKey, bundleRemovedByPurge, purgeReportLabel} = await import(`data:text/javascript;base64,${Buffer.from(code).toString('base64')}`)
 const target = {parentId:'parent-a',serial:'serial-a',package:'org.example.fixture',importedRoots:['/local/one','/local/two']}
 const plan = {schema:'mobilee.group-purge-plan/v1',id:'plan-a',...target,createdUnixMs:1000,expiresUnixMs:301000,confirmationToken:'one-use-random-token',confirmationText:'永久清理 parent-a',localEntries:[],device:{status:'ready',entries:[],warnings:[]},warnings:[],localOnly:false}
-const confirm = (p=plan,t=target,ack=true,typed=p?.confirmationText,now=2000,busy=false)=>canConfirmPurge(p,t,ack,typed,now,busy)
+const confirm = (p=plan,t=target,now=2000,busy=false)=>canConfirmPurge(p,t,now,busy)
 const report = {id:'plan-a',...target,state:'completed',localState:'completed',deviceState:'completed',removedLocalFiles:1,removedLocalAllocatedBytes:null,updatedUnixMs:2000,warnings:[],error:null,importedRoots:['/local/one']}
 const bundle = (root='/local/one',group=target)=>({root,package:group.package,sessionReport:{mobilee_capture_group:{id:group.parentId,serial:group.serial,package:group.package}}})
-test('fresh exact token and checkbox permit only the bound identity',()=>{
+test('one confirmation permits only a fresh bound identity',()=>{
  assert.equal(confirm(),true)
  for(const field of ['parentId','serial','package']) {assert.equal(confirm(plan,{...target,[field]:'foreign'}),false);assert.equal(purgePlanMatches(plan,{...target,[field]:'foreign'}),false)}
- assert.equal(confirm(plan,target,false),false)
- for(const typed of ['', 'parent-a', '永久清理 parent-b',' 永久清理 parent-a','永久清理 parent-a '])assert.equal(confirm(plan,target,true,typed),false)
- assert.equal(confirm(null),false);assert.equal(confirm(plan,null),false);assert.equal(confirm(plan,target,true,plan.confirmationText,2000,true),false)
+ assert.equal(confirm(null),false);assert.equal(confirm(plan,null),false);assert.equal(confirm(plan,target,2000,true),false)
 })
 test('expired, future and malformed timestamps fail closed at the exact boundary',()=>{
- assert.equal(confirm(plan,target,true,plan.confirmationText,301000),false)
- assert.equal(confirm(plan,target,true,plan.confirmationText,300999),true)
+ assert.equal(confirm(plan,target,301000),false)
+ assert.equal(confirm(plan,target,300999),true)
  for(const p of [{...plan,createdUnixMs:3000},{...plan,expiresUnixMs:302000},{...plan,createdUnixMs:NaN},{...plan,expiresUnixMs:Infinity},{...plan,expiresUnixMs:900}])assert.equal(confirm(p),false)
 })
 test('offline or blocked paired plans cannot execute; local-only requires a separately generated plan',()=>{
@@ -62,20 +60,20 @@ test('frontend IPC keeps irreversible execution separate from preview, retry and
  const vue=readFileSync(new URL('../src/components/KernSightGroupPurge.vue',import.meta.url),'utf8')
  assert.match(vue,/if \(!canExecute.value \|\| !plan.value \|\| !gate.startExecution\(\)\) return/)
  assert.match(vue,/!gate.current\(ticket\) \|\| !props.active/)
- assert.match(vue,/不可恢复确认/)
+ assert.match(vue,/不需要输入文字/)
  assert.match(vue,/不是已释放空间/)
  const app=readFileSync(new URL('../src/App.vue',import.meta.url),'utf8')
  assert.match(app,/:active="activeTab === 'android-runtime'"/)
 })
 
-test('retry keeps readable confirmation text but execution passes only the new preview nonce',()=>{
+test('retry execution passes only the new preview nonce',()=>{
  const retry={...plan,confirmationToken:'fresh-retry-nonce'}
  assert.equal(confirm(retry),true)
- assert.equal(confirm(retry,target,true,plan.confirmationToken),false)
+ assert.equal(confirm(retry,target,2000,true),false)
  const vue=readFileSync(new URL('../src/components/KernSightGroupPurge.vue',import.meta.url),'utf8')
  assert.match(vue,/executeKernSightGroupPurge\(approvedPlan.id, approvedPlan.confirmationToken\)/)
  assert.doesNotMatch(vue,/executeKernSightGroupPurge\([^\n]+typedConfirmation/)
- assert.match(vue,/plan.confirmationText/)
+ assert.match(vue,/nextTick\(prepare\)/)
 })
 
 test('retry explicitly selects local-only scope and rejects a differently scoped returned plan',()=>{
