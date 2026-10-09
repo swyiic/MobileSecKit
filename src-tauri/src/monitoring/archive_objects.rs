@@ -149,7 +149,7 @@ fn write_scoped(root: &Path, output: &Path, offline_retained: bool) -> Result<()
         || root.join("capture-group.json").is_file()
             && serde_json::from_str::<Value>(&read_bounded_text(
                 &root.join("capture-group.json"),
-                65536,
+                capture_groups::MAX_CAPTURE_GROUP_BYTES,
             )?)
             .map_err(|e| e.to_string())?["state"]
                 == "partial";
@@ -575,6 +575,39 @@ mod tests {
         std::fs::create_dir_all(&root).unwrap();
         std::fs::write(root.join("dump-report.json"),serde_json::to_vec(&serde_json::json!({"package":"org.example.fixture","dump_id":Uuid::new_v4(),"artifacts":[]})).unwrap()).unwrap();
         root
+    }
+    #[test]
+    fn diagnostic_parent_above_64k_preserves_partial_and_enforces_canonical_bound() {
+        let root = fixture();
+        let parent =
+            serde_json::to_vec(&json!({"state":"partial","diagnostics":"x".repeat(80000)}))
+                .unwrap();
+        std::fs::write(root.join("capture-group.json"), &parent).unwrap();
+        let output = root.with_extension("mee");
+        write(&root, &output).unwrap();
+        let mut zip = ZipArchive::new(File::open(&output).unwrap()).unwrap();
+        let mut manifest = String::new();
+        zip.by_name("manifest.json")
+            .unwrap()
+            .read_to_string(&mut manifest)
+            .unwrap();
+        assert_eq!(
+            serde_json::from_str::<Value>(&manifest).unwrap()["coverage"]["status"],
+            "partial"
+        );
+        assert_eq!(
+            std::fs::read(root.join("capture-group.json")).unwrap(),
+            parent
+        );
+        drop(zip);
+        std::fs::write(
+            root.join("capture-group.json"),
+            vec![b' '; capture_groups::MAX_CAPTURE_GROUP_BYTES as usize + 1],
+        )
+        .unwrap();
+        assert!(write(&root, &root.with_extension("oversize.mee")).is_err());
+        std::fs::remove_file(output).unwrap();
+        std::fs::remove_dir_all(root).unwrap();
     }
     #[test]
     fn explicit_local_partial_keeps_byte_caps_and_preserves_expired_capture_limits() {
@@ -1154,6 +1187,45 @@ mod adaptive_stored_tests {
 #[cfg(test)]
 mod retained_closeout_acceptance {
     use super::*;
+    #[tokio::test]
+    #[ignore = "explicit cloned 4353 inputs and fresh output; no device or expired-parent mutation"]
+    async fn real_4353_partial_archive_restore_and_import() {
+        let root = PathBuf::from(std::env::var("ME_4353_CLONE").unwrap());
+        let out = PathBuf::from(std::env::var("ME_4353_OUTPUT").unwrap());
+        assert!(root.is_absolute() && out.is_absolute() && !out.exists());
+        std::fs::create_dir_all(&out).unwrap();
+        let parent = std::fs::read(root.join("capture-group.json")).unwrap();
+        let limits = std::fs::read(root.join("archive-output-limits.json")).unwrap();
+        assert_eq!(parent.len(), 75282);
+        let archive = out.join("4353-retained.mee");
+        assert!(write(&root, &archive).is_err()); // Original lease remains expired.
+        write_local_retained(&root, &archive).unwrap();
+        let mut zip = ZipArchive::new(File::open(&archive).unwrap()).unwrap();
+        let mut text = String::new();
+        zip.by_name("manifest.json")
+            .unwrap()
+            .read_to_string(&mut text)
+            .unwrap();
+        assert_eq!(
+            serde_json::from_str::<Value>(&text).unwrap()["coverage"]["status"],
+            "partial"
+        );
+        drop(zip);
+        let restored = restore_from_export_source(&archive, &root).unwrap();
+        let bundle = import_kernsight_evidence_directory(restored.to_string_lossy().into_owned())
+            .await
+            .unwrap();
+        assert_eq!(bundle.package, "cmb.pb");
+        assert_eq!(
+            std::fs::read(root.join("capture-group.json")).unwrap(),
+            parent
+        );
+        assert_eq!(
+            std::fs::read(root.join("archive-output-limits.json")).unwrap(),
+            limits
+        );
+        std::fs::write(out.join("verification.json"), serde_json::to_vec_pretty(&json!({"scope":"independent cloned retained export; no old-parent resume","package":bundle.package,"parent_bytes":parent.len(),"coverage":"partial","expired_capture_lease_rejected":true,"original_metadata_unchanged":true})).unwrap()).unwrap();
+    }
     #[tokio::test]
     #[ignore = "requires explicit independent cloned retained inputs and fresh output; never accesses device or renews old parent"]
     async fn bounded_real_retained_archive_share_and_production_import() {

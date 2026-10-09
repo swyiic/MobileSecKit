@@ -4392,7 +4392,10 @@ async fn pull_kernsight_package_archive_at(
             Ok(())
         })();
         if let Err(error) = receipt_result {
-            archive_result = Err(format!("归档计量未确认：{error}"));
+            archive_result = Err(match archive_result {
+                Err(cause) => format!("{cause}；归档计量未确认：{error}"),
+                Ok(_) => format!("归档计量未确认：{error}"),
+            });
         }
     }
     if let Err(error) = archive_result {

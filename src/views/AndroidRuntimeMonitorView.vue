@@ -41,6 +41,7 @@
       <button class="import-local" :disabled="importingLocal || purgeExecuting" @click="importLocalEvidence"><span class="material-symbols-outlined">folder_open</span><strong>{{ importingLocal ? '正在索引…' : '导入本地证据' }}</strong><small>选择包含 dump-report.json 的包目录</small></button>
       <button class="import-local" :disabled="importingLocal || purgeExecuting" @click="importEvidenceArchive"><span class="material-symbols-outlined">folder_zip</span><strong>{{ importingLocal ? '正在载入…' : '打开证据' }}</strong><small>.mee · 兼容旧格式</small></button>
       <OperationError :message="operationErrors.import" />
+      <OperationError :message="lastCaptureGroupId ? operationErrors[`save:${lastCaptureGroupId}`] : undefined" />
     </section>
 
     <section v-if="probeError" class="notice error-notice runtime-probe-error" role="alert"><span class="material-symbols-outlined">error</span><span>{{ probeError }}</span><button @click="probeError = ''">关闭</button></section>
@@ -252,6 +253,7 @@
           </template>
           <button v-else class="ghost-button danger-button" :disabled="!canTrashCaptureGroup(group)" :title="canTrashCaptureGroup(group) ? '移除列表记录，可从回收站恢复；不释放磁盘空间' : '采集或拉取期间不可移除，请等待封存'" @click="pendingTrashGroup = group.id">移入回收站</button>
           <button class="ghost-button danger-button" :disabled="!canPurgeCaptureGroup(group)" @click="openPurgePreview(group)">永久清理本地与手机…</button>
+          <OperationError :message="operationErrors[`save:${group.id}`]" />
           <OperationError :message="operationErrors[`capture:${group.id}`] || operationErrors[`restart:${group.id}`] || operationErrors[`pull:${group.id}`] || operationErrors[`cancel:${group.id}`] || operationErrors[`trash:${group.id}`]" />
           <KernSightGroupPurge v-if="purgeTarget?.parentId === group.id" :target="purgeTarget" :busy="purgeBusy" :active="active && workspaceMode === 'evidence'" @close="closePurgePreview" @executing="purgeExecuting = $event" @complete="completePurge" @uncertain="loadPurgeReports" />
           </div>

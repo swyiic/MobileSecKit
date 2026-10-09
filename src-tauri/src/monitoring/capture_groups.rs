@@ -10,6 +10,8 @@ mod purge_device;
 mod purge_local;
 pub mod trash;
 
+pub(super) const MAX_CAPTURE_GROUP_BYTES: u64 = 1024 * 1024;
+
 const SCHEMA: &str = "mobilee.capture-group/v1";
 static IO_LOCK: Mutex<()> = Mutex::new(());
 static EPOCH: OnceLock<Uuid> = OnceLock::new();
@@ -525,8 +527,11 @@ fn save(root: &Path, g: &Group) -> Result<(), String> {
     result
 }
 fn load(root: &Path, id: Uuid) -> Result<Group, String> {
-    let mut g: Group = serde_json::from_str(&read_bounded_text(&path(root, id), 1024 * 1024)?)
-        .map_err(|e| e.to_string())?;
+    let mut g: Group = serde_json::from_str(&read_bounded_text(
+        &path(root, id),
+        MAX_CAPTURE_GROUP_BYTES,
+    )?)
+    .map_err(|e| e.to_string())?;
     if g.id != id {
         return Err("主会话清单与文件身份冲突".into());
     }
@@ -543,8 +548,8 @@ pub fn read_import(root: &Path) -> Result<Option<Group>, String> {
     if !p.exists() {
         return Ok(None);
     }
-    let mut g: Group =
-        serde_json::from_str(&read_bounded_text(&p, 1024 * 1024)?).map_err(|e| e.to_string())?;
+    let mut g: Group = serde_json::from_str(&read_bounded_text(&p, MAX_CAPTURE_GROUP_BYTES)?)
+        .map_err(|e| e.to_string())?;
     g.validate()?;
     let relation_path = root.join("capture-relation.json");
     if relation_path.is_file() {
