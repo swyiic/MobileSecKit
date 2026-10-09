@@ -1,0 +1,173 @@
+{
+  "source": {
+    "parentId": "676bd086-f077-431d-8a97-1a01ed060afd",
+    "sourceSHA256": "1a9c77956ecbcc6d6fa7ac776bfe3ff5ee5cb6a1f1b71ecac422ea42f5754680",
+    "scope": "Only persisted parent stage/terminal facts; no target payload or UI memory snapshot.",
+    "redactedFields": [
+      "device serial",
+      "host temporary evidence root",
+      "capture control tokens"
+    ]
+  },
+  "group": {
+    "id": "676bd086-f077-431d-8a97-1a01ed060afd",
+    "serial": "fixture-device",
+    "package": "cmb.pb",
+    "state": "partial",
+    "unified": false,
+    "stages": [
+      {
+        "id": "86d08798-f38b-4df1-83e5-8a457e988ec4",
+        "key": "l0",
+        "launchAfterAttach": true,
+        "attempts": [
+          {
+            "relation": {
+              "parentId": "676bd086-f077-431d-8a97-1a01ed060afd",
+              "stageId": "86d08798-f38b-4df1-83e5-8a457e988ec4",
+              "attemptId": "6db91291-7460-4117-a089-2c449360b5d3",
+              "attempt": 1,
+              "stageKey": "l0"
+            },
+            "state": "succeeded",
+            "sessionId": "71d099d3-7415-4236-9b47-530ad0123a6e",
+            "remoteLifecycle": {
+              "schema": "kernsight.capture-lifecycle/v1",
+              "relation": {
+                "attempt": 1,
+                "attempt_id": "6db91291-7460-4117-a089-2c449360b5d3",
+                "parent_id": "676bd086-f077-431d-8a97-1a01ed060afd",
+                "schema": "kernsight.capture-relation/v1",
+                "stage_id": "86d08798-f38b-4df1-83e5-8a457e988ec4",
+                "stage_key": "l0",
+                "stage_links": []
+              },
+              "collection_returned": true,
+              "collection_status": "completed",
+              "agent_exited_confirmed": true,
+              "cleanup": "producer_scope_returned",
+              "target_pause": "forbidden",
+              "stop_reason": null
+            },
+            "qualificationFailureRetained": false
+          }
+        ]
+      },
+      {
+        "id": "ce8fbf80-b1ee-43b3-9231-e5621fe3f09e",
+        "key": "l1",
+        "launchAfterAttach": true,
+        "attempts": [
+          {
+            "relation": {
+              "parentId": "676bd086-f077-431d-8a97-1a01ed060afd",
+              "stageId": "ce8fbf80-b1ee-43b3-9231-e5621fe3f09e",
+              "attemptId": "36bf029c-f57f-4091-823f-29b6418d8690",
+              "attempt": 1,
+              "stageKey": "l1"
+            },
+            "state": "partial",
+            "sessionId": "6089e24a-cec6-4f13-bc7a-7a1a5fd2f8c0",
+            "remoteLifecycle": {
+              "schema": "kernsight.capture-lifecycle/v1",
+              "relation": {
+                "attempt": 1,
+                "attempt_id": "36bf029c-f57f-4091-823f-29b6418d8690",
+                "parent_id": "676bd086-f077-431d-8a97-1a01ed060afd",
+                "schema": "kernsight.capture-relation/v1",
+                "stage_id": "ce8fbf80-b1ee-43b3-9231-e5621fe3f09e",
+                "stage_key": "l1",
+                "stage_links": []
+              },
+              "collection_returned": true,
+              "collection_status": "partial",
+              "agent_exited_confirmed": true,
+              "cleanup": "producer_scope_returned",
+              "target_pause": "forbidden",
+              "stop_reason": "perf_poll_backlog_or_scope_gap_at_observation_end"
+            },
+            "qualificationFailureRetained": false
+          }
+        ]
+      },
+      {
+        "id": "c31f1170-5278-4407-9cc7-e84e3a4ea808",
+        "key": "dump",
+        "launchAfterAttach": false,
+        "attempts": [
+          {
+            "relation": {
+              "parentId": "676bd086-f077-431d-8a97-1a01ed060afd",
+              "stageId": "c31f1170-5278-4407-9cc7-e84e3a4ea808",
+              "attemptId": "87e6bc63-2137-4980-ad6a-43597940d2f2",
+              "attempt": 1,
+              "stageKey": "dump"
+            },
+            "state": "partial",
+            "sessionId": null,
+            "remoteLifecycle": {
+              "schema": "kernsight.capture-lifecycle/v1",
+              "relation": {
+                "attempt": 1,
+                "attempt_id": "87e6bc63-2137-4980-ad6a-43597940d2f2",
+                "parent_id": "676bd086-f077-431d-8a97-1a01ed060afd",
+                "schema": "kernsight.capture-relation/v1",
+                "stage_id": "c31f1170-5278-4407-9cc7-e84e3a4ea808",
+                "stage_key": "dump",
+                "stage_links": []
+              },
+              "collection_returned": true,
+              "collection_status": "partial",
+              "agent_exited_confirmed": true,
+              "cleanup": "producer_scope_returned",
+              "target_pause": "forbidden",
+              "stop_reason": "bound_code_copy_partial"
+            },
+            "qualificationFailureRetained": false
+          }
+        ]
+      },
+      {
+        "id": "7576263f-bb3b-45e2-af65-0c53aa4b57c6",
+        "key": "linker",
+        "launchAfterAttach": true,
+        "attempts": [
+          {
+            "relation": {
+              "parentId": "676bd086-f077-431d-8a97-1a01ed060afd",
+              "stageId": "7576263f-bb3b-45e2-af65-0c53aa4b57c6",
+              "attemptId": "d8a9d180-c791-4f9a-a5be-147823f9e1db",
+              "attempt": 1,
+              "stageKey": "linker"
+            },
+            "state": "succeeded",
+            "sessionId": "fb042fdc-62fc-4ca0-8359-7a700af26a81",
+            "remoteLifecycle": {
+              "schema": "kernsight.capture-lifecycle/v1",
+              "relation": {
+                "attempt": 1,
+                "attempt_id": "d8a9d180-c791-4f9a-a5be-147823f9e1db",
+                "parent_id": "676bd086-f077-431d-8a97-1a01ed060afd",
+                "schema": "kernsight.capture-relation/v1",
+                "stage_id": "7576263f-bb3b-45e2-af65-0c53aa4b57c6",
+                "stage_key": "linker",
+                "stage_links": []
+              },
+              "collection_returned": true,
+              "collection_status": "completed",
+              "agent_exited_confirmed": true,
+              "cleanup": "producer_scope_returned",
+              "target_pause": "forbidden",
+              "stop_reason": null
+            },
+            "qualificationFailureRetained": false
+          }
+        ]
+      }
+    ]
+  },
+  "savedEvidence": {
+    "root": "/fixture/evidence/cmb.pb",
+    "authority": "Existing archive/import verification; committed UI reports-parent marker; not a reconstructed current UI snapshot."
+  }
+}

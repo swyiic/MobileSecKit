@@ -77,6 +77,18 @@ export function captureStateLabel(state: string): string {
   return ({ planned: '待执行', running: '采集中', succeeded: '执行结束', partial: '覆盖不足（partial）', failed: '采集失败', interrupted: '已中断', unavailable: '来源不可用（未启动）', cancelled: '已取消', canceled: '已取消' } as Record<string, string>)[state] || state
 }
 
+/** Display durable stage facts without inferring whether later stages ran. */
+export function captureReceiptStateLabel(group: KernSightCaptureGroup, key: string): string {
+  const stages = key === 'session' ? group.stages.filter(stage => stage.key !== 'dump')
+    : group.stages.filter(stage => stage.key === key)
+  if (!stages.length) return '状态未知'
+  return stages.map(stage => {
+    const state = stage.attempts[stage.attempts.length - 1]?.state
+    const label = state ? captureStateLabel(state) : '状态未知'
+    return key === 'session' ? `${captureStageLabel(stage.key)}：${label}` : label
+  }).join(' · ')
+}
+
 /** Saved evidence is usable independently of the source coverage; no state upgrade. */
 export function captureSavedOutcome(group: KernSightCaptureGroup, root: string): string {
   const coverage = group.state === 'partial' ? '覆盖不足（partial），请核对阶段诊断'

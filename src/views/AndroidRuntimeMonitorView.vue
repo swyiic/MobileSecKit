@@ -158,7 +158,7 @@
       <p class="ks-control-boundary"><span class="material-symbols-outlined">info</span>当前按钮使用 MobileE 前台 ADB 执行路径；关闭 MobileE 会中断等待。常驻 daemon 的远程 StartSession / UpdatePolicy 尚未接通，界面不会伪装成后台独立控制。</p>
       <div v-if="autoStageReceipts.length" class="ks-capture-plan">
         <div v-for="receipt in autoStageReceipts" :key="receipt.stage.key">
-          <small>{{ receipt.stage.label }} · {{ receipt.succeeded ? '命令成功，覆盖待核对' : '命令失败/未知，后续停止' }}</small>
+          <small>{{ receipt.stage.label }} · {{ receipt.stateLabel }}</small>
           <button v-if="receipt.result.sessionId" class="ghost-button compact-button" @click="openAutoStageSession(receipt.result.sessionId)">查看会话 {{ shortSession(receipt.result.sessionId) }}</button>
           <strong v-else>包快照产物；不代表完整提取</strong>
         </div>
@@ -506,7 +506,7 @@
 
 <script setup lang="ts">
 import FullValue from '@/components/FullValue.vue'
-import { runCaptureGroupPlan, mergeCaptureResults, captureStateLabel, captureStageLabel, latestGroupSession, captureSavedOutcome } from '@/services/kernsightCaptureRunner'
+import { runCaptureGroupPlan, mergeCaptureResults, captureStateLabel, captureStageLabel, latestGroupSession, captureSavedOutcome, captureReceiptStateLabel } from '@/services/kernsightCaptureRunner'
 import { mergeCaptureGroups,groupSessionIds,captureGroupEdges,captureGroupCanTrash,captureGroupImportIsTrashed,newCaptureFromGroup } from '../services/kernsightCaptureGroups'
 import { packageEvidenceReports, importedSessionId, bundleForSession, linkedEvidenceMatches, createLatestRequest, createKeyedRequests, evidenceCountLabel, executionStatusLabel } from '../services/kernsightWorkspaceState'
 import { memoryCounterLabel, memoryEvidenceLabel } from '../services/kernsightMemoryEvidence'
@@ -672,7 +672,7 @@ const captureForm = reactive({
 })
 const capturePhase = ref('')
 const unifiedSessionAwaiting = ref(false)
-const autoStageReceipts = ref<AutoStageReceipt[]>([])
+const autoStageReceipts = ref<(AutoStageReceipt & { stateLabel: string })[]>([])
 const AUTO_DURATION_KEY = 'mobilee.kernsightAutoDurations'
 
 function clampCaptureSeconds(value: unknown, fallback: number) {
@@ -2013,7 +2013,7 @@ async function executeCaptureGroup(group: KernSightCaptureGroup) {
         results.push(result)
         captureResult.value = mergeCaptureResults(results)
         const stage = current.stages.find(item => item.key === key)
-        autoStageReceipts.value.push({ stage: { key: key as AutoStageReceipt['stage']['key'], label: captureStageLabel(key), launchAfterAttach: stage?.launchAfterAttach || false, durationSeconds: stage?.durationSeconds }, result, succeeded: key === 'session' ? current.stages.filter(item => item.key !== 'dump').every(item => item.attempts[item.attempts.length - 1]?.state === 'succeeded') : stage?.attempts[stage.attempts.length - 1]?.state === 'succeeded' })
+        autoStageReceipts.value.push({ stateLabel: captureReceiptStateLabel(current, key), stage: { key: key as AutoStageReceipt['stage']['key'], label: captureStageLabel(key), launchAfterAttach: stage?.launchAfterAttach || false, durationSeconds: stage?.durationSeconds }, result, succeeded: key === 'session' ? current.stages.filter(item => item.key !== 'dump').every(item => item.attempts[item.attempts.length - 1]?.state === 'succeeded') : stage?.attempts[stage.attempts.length - 1]?.state === 'succeeded' })
       },
     })
   } finally {

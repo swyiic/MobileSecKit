@@ -3,7 +3,7 @@ import test from 'node:test'
 import { readFileSync } from 'node:fs'
 import ts from 'typescript'
 const code = ts.transpileModule(readFileSync(new URL('../src/services/kernsightCaptureRunner.ts', import.meta.url), 'utf8'), { compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.ES2022 } }).outputText
-const { captureSavedOutcome, runCaptureGroupPlan, mergeCaptureResults, latestGroupSession } = await import(`data:text/javascript;base64,${Buffer.from(code).toString('base64')}`)
+const { captureReceiptStateLabel, captureSavedOutcome, runCaptureGroupPlan, mergeCaptureResults, latestGroupSession } = await import(`data:text/javascript;base64,${Buffer.from(code).toString('base64')}`)
 const initial = unified => ({ id: 'parent-a', serial: 'mock', package: 'org.example.app', unified, stages: (unified ? ['l0', 'l1', 'linker', 'dump'] : ['l0', 'l1', 'dump', 'linker']).map(key => ({ key, launchAfterAttach: !unified && key !== 'dump', attempts: [] })) })
 const result = (key, exitCode = 0) => ({ sessionId: key === 'dump' ? null : `session-${key}`, startedUnixMs: 1, finishedUnixMs: 2, stdout: `stdout-${key}`, stderr: exitCode ? `stderr-${key}` : '', commandPreview: key, exitCode })
 function harness(group, states = {}) {
@@ -155,4 +155,41 @@ test('saved partial evidence remains usable and is never described as complete c
   assert.match(message, /覆盖不足（partial）/)
   assert.equal(JSON.stringify(group), before)
   assert.match(captureSavedOutcome({ ...group, state: 'failed' }, '/retained'), /采集未全部完成/)
+})
+
+test('real 676bd086 partial stage receipts do not claim failure or stopped follow-up', () => {
+  const fixture = JSON.parse(readFileSync(new URL('./fixtures/kernsight-parent-676bd086-receipts.json', import.meta.url), 'utf8'))
+  const group = fixture.group
+  const original = JSON.stringify(group)
+  assert.equal(group.id, '676bd086-f077-431d-8a97-1a01ed060afd')
+  for (const key of ['l1', 'dump']) {
+    const attempt = group.stages.find(stage => stage.key === key).attempts.at(-1)
+    assert.equal(attempt.state, 'partial')
+    assert.equal(attempt.remoteLifecycle.collection_returned, true)
+    assert.equal(attempt.remoteLifecycle.collection_status, 'partial')
+    assert.equal(attempt.remoteLifecycle.agent_exited_confirmed, true)
+    assert.equal(attempt.qualificationFailureRetained, false)
+    const label = captureReceiptStateLabel(group, key)
+    assert.match(label, /覆盖不足（partial）/)
+    assert.doesNotMatch(label, /失败|后续停止|命令成功/)
+  }
+  assert.equal(captureReceiptStateLabel(group, 'linker'), '执行结束')
+  const saved = captureSavedOutcome(group, fixture.savedEvidence.root)
+  assert.match(saved, /已保存并导入.*覆盖不足（partial）/)
+  assert.equal(JSON.stringify(group), original)
+})
+
+test('receipt display preserves mixed unified outcomes and unknown or failed facts', () => {
+  const fixture = JSON.parse(readFileSync(new URL('./fixtures/kernsight-parent-676bd086-receipts.json', import.meta.url), 'utf8'))
+  const group = fixture.group
+  const unified = captureReceiptStateLabel(group, 'session')
+  assert.match(unified, /L0 内核观察：执行结束/)
+  assert.match(unified, /L1 TLS \/ JNI \/ Binder：覆盖不足（partial）/)
+  assert.match(unified, /Linker 加载观察：执行结束/)
+  assert.doesNotMatch(unified, /代码快照/)
+  group.stages.find(stage => stage.key === 'l1').attempts.at(-1).state = 'failed'
+  assert.equal(captureReceiptStateLabel(group, 'l1'), '采集失败')
+  group.stages.find(stage => stage.key === 'l1').attempts = []
+  assert.equal(captureReceiptStateLabel(group, 'l1'), '状态未知')
+  assert.equal(captureReceiptStateLabel(group, 'missing'), '状态未知')
 })
