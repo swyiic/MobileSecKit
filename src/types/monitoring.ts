@@ -456,7 +456,7 @@ export interface KernSightCaptureAttempt {
   stageRecords: Array<Record<string, unknown>>
 }
 export interface KernSightCaptureGroup {
-  budget?:{schema:string;limits:{totalBytes:number;maxSeconds:number};deadlineUnixMs:number;reservations:Array<{id:string;kind:string;reservedBytes:number;chargedBytes:number|null;status:string}>}|null
+  budget?:{schema:string;timePlan?:{schema:string;phases:Array<{kind:string;capMs:number;stopAtParentRemainingMs?:number|null;completed?:boolean}>}|null;limits:{totalBytes:number;maxSeconds:number};deadlineUnixMs:number;reservations:Array<{id:string;kind:string;reservedBytes:number;chargedBytes:number|null;status:string}>}|null
   schema:'mobilee.capture-group/v1';id:string;serial:string;package:string;createdUnixMs:number;cancelRequested:boolean;
   state:string;unified?:boolean;base:Record<string,unknown>;
   stages:Array<{id:string;key:string;mode:string;durationSeconds:number;launchAfterAttach:boolean;required:boolean;

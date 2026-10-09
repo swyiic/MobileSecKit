@@ -111,10 +111,12 @@ test('operation errors remain with their row while late completions cannot repla
  const view=readFileSync(new URL('../src/views/AndroidRuntimeMonitorView.vue',import.meta.url),'utf8')
  const functions=view.slice(view.indexOf('function beginOperation('),view.indexOf("const probeError = ref('')"))
  const compiled=ts.transpileModule(functions,{compilerOptions:{target:ts.ScriptTarget.ES2022}}).outputText
- const make=new Function('readableError',`const operationTickets=new Map(); const operationErrors={}; let operationRevision=0; ${compiled}; return {beginOperation,failOperation,operationErrors}`)
+ const make=new Function('readableError',`const operationTickets=new Map(); const operationErrors={}; const operationMessages={}; let operationRevision=0; ${compiled}; return {beginOperation,failOperation,operationErrors,operationMessages}`)
  const tracker=make(String)
  const old=tracker.beginOperation('cancel:old-parent')
+ tracker.operationMessages.start='previous outcome'
  const fresh=tracker.beginOperation('start')
+ assert.equal(tracker.operationMessages.start,'')
  assert.equal(tracker.failOperation('cancel:old-parent',old,'old error'),false)
  assert.equal(tracker.operationErrors['cancel:old-parent'],'old error')
  assert.equal(tracker.failOperation('start',fresh,'new error'),true)
@@ -132,7 +134,7 @@ test('changing parent or leaving the feature invalidates global errors while pre
  const functions=view.slice(view.indexOf('function beginOperation('),view.indexOf("const probeError = ref('')"))
  const compiled=ts.transpileModule(functions+'\n'+watchLine,{compilerOptions:{target:ts.ScriptTarget.ES2022}}).outputText
  let invalidate
- const make=new Function('readableError','watch','props','workspaceMode','selectedPackage','selectedCaptureGroup',`const operationTickets=new Map(); const operationErrors={}; let operationRevision=0; ${compiled}; return {beginOperation,failOperation,operationErrors}`)
+ const make=new Function('readableError','watch','props','workspaceMode','selectedPackage','selectedCaptureGroup',`const operationTickets=new Map(); const operationErrors={}; const operationMessages={}; let operationRevision=0; ${compiled}; return {beginOperation,failOperation,operationErrors,operationMessages}`)
  const tracker=make(String,(_source,changed)=>{invalidate=changed},{active:true,device:{serial:'usb'}},{value:'evidence'},{value:'com.immomo.momo'},{value:'old-parent'})
  for(const key of ['cancel:old-parent','pull:old-parent']) {
   const ticket=tracker.beginOperation(key);invalidate()

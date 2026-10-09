@@ -1,4 +1,5 @@
 mod archive_objects;
+mod batch_transfer;
 mod build_identity;
 pub mod capture_groups;
 #[cfg(test)]
@@ -3666,7 +3667,7 @@ fn reuse_verified_transfer(
         .map_err(|e| e.to_string())?
         .file_type()
         .is_symlink()
-        || storage_evidence::hash_file(source, bytes).as_deref() != Some(hash)
+        || !batch_transfer::verify_local_object(source, destination, bytes, hash)?
     {
         return Ok(false);
     }
@@ -3959,54 +3960,7 @@ async fn pull_kernsight_package_evidence_with_plan(
                     .map_err(|e| e.to_string())?;
             }
         }
-        let mut verified_transfer_objects = known_objects;
-        for row in &plan.rows {
-            let rel = row["path"].as_str().unwrap();
-            let content_key = (
-                row["sha256"].as_str().unwrap().to_owned(),
-                row["bytes"].as_u64().unwrap(),
-            );
-            let destination = local_root.join(rel);
-            if let Some(prior) = verified_transfer_objects.get(&content_key) {
-                if reuse_verified_transfer(prior, &destination, content_key.1, &content_key.0)? {
-                    continue;
-                }
-            }
-            let source = format!("{remote}/{rel}");
-            let cmd = format!("cat {}", crate::shell_quote(&source));
-            let remote_shell = crate::root_shell_command(&cmd);
-            let mut child = Command::new("adb")
-                .args(["-s", &serial, "exec-out", &remote_shell])
-                .stdout(std::process::Stdio::piped())
-                .stderr(std::process::Stdio::null())
-                .kill_on_drop(true)
-                .spawn()
-                .map_err(|e| e.to_string())?;
-            let reader = child.stdout.take().ok_or("无传输管道")?;
-            timeout(
-                Duration::from_secs(120),
-                session_budget::stream_verified(
-                    reader,
-                    &local_root.join(rel),
-                    row["bytes"].as_u64().unwrap(),
-                    row["sha256"].as_str().unwrap(),
-                ),
-            )
-            .await
-            .map_err(|_| {
-                format!(
-                    "逐文件传输期限耗尽，partial 保留于 {}",
-                    local_root.display()
-                )
-            })??;
-            if !child.wait().await.map_err(|e| e.to_string())?.success() {
-                return Err(format!(
-                    "源读取失败，已保存证据保留于 {}",
-                    local_root.display()
-                ));
-            }
-            verified_transfer_objects.insert(content_key, destination);
-        }
+        batch_transfer::transfer(&serial, &remote, &local_root, &plan.rows, known_objects).await?;
         return import_kernsight_evidence_directory(local_root.to_string_lossy().into_owned())
             .await;
     }

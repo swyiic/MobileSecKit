@@ -263,6 +263,134 @@ pub async fn output(command: &mut Command, local_limit: Duration) -> Result<Outp
     supervisor.await.map_err(|e| e.to_string())?
 }
 
+/// Stream a child's stdout while a separate supervisor retains process ownership.
+/// The consumer must finish at EOF; parser errors retain its already written output.
+pub(super) async fn stream_output<T, F, Fut>(
+    mut command: Command,
+    cap: Duration,
+    consume: F,
+) -> Result<T, String>
+where
+    T: Send + 'static,
+    F: FnOnce(tokio::process::ChildStdout) -> Fut + Send + 'static,
+    Fut: Future<Output = Result<T, String>> + Send + 'static,
+{
+    struct Caller(tokio::sync::oneshot::Sender<()>);
+    // Dropping the caller must notify, rather than abort, the owning supervisor.
+    // A Sender's drop wakes the receiver even when no value was sent.
+    let parent = current();
+    if let Some(parent) = &parent {
+        parent.check()?;
+    }
+    let local = tokio::time::Instant::now() + cap;
+    #[cfg(unix)]
+    command.process_group(0);
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .kill_on_drop(true);
+    let mut child = command.spawn().map_err(|e| e.to_string())?;
+    let pid = child.id().ok_or("spawned stream child missing PID")?;
+    let stdout = child.stdout.take().ok_or("missing stream stdout")?;
+    if let Some(parent) = &parent {
+        parent.0.children.fetch_add(1, Ordering::SeqCst);
+    }
+    let (cancel, mut cancelled) = tokio::sync::oneshot::channel();
+    let caller = Caller(cancel);
+    let supervisor = tokio::spawn(async move {
+        let _count = parent.clone().map(Count);
+        let consumer_parent = parent.clone();
+        let mut consumer = tokio::spawn(async move {
+            if let Some(parent) = consumer_parent {
+                CURRENT.scope(parent, consume(stdout)).await
+            } else {
+                consume(stdout).await
+            }
+        });
+        let mut consumer_joined = false;
+        let completed = async {
+            let joined = (&mut consumer).await;
+            consumer_joined = true;
+            let result = joined.map_err(|e| e.to_string())??;
+            let status = child.wait().await.map_err(|e| e.to_string())?;
+            if !status.success() {
+                return Err(format!(
+                    "stream source command failed ({status}); verified output retained"
+                ));
+            }
+            Ok(result)
+        };
+        let result = tokio::select! { biased;
+            reason = async {
+                match &parent {
+                    Some(parent) => parent.stopped().await,
+                    None => std::future::pending().await,
+                }
+            } => Err(reason),
+            _ = &mut cancelled => Err("stream_caller_cancelled".into()),
+            _ = tokio::time::sleep_until(local) => Err("command_timeout".into()),
+            result = completed => result,
+        };
+        match result {
+            Ok(value) => Ok(value),
+            Err(error) => {
+                let mut clean = true;
+                // Never signal a PID after wait() has reaped it; it may be reused.
+                if child.id() == Some(pid) {
+                    #[cfg(unix)]
+                    {
+                        let mut delivered = false;
+                        for _ in 0..10 {
+                            if delivered && consumer.is_finished() {
+                                break;
+                            }
+                            if kill_owned_group(pid) {
+                                delivered = true;
+                            } else {
+                                clean = false;
+                            }
+                            tokio::time::sleep(Duration::from_millis(5)).await;
+                        }
+                    }
+                    #[cfg(not(unix))]
+                    {
+                        clean = false; // Descendant cleanup is unconfirmed off Unix.
+                    }
+                    let _ = child.start_kill();
+                    if !matches!(
+                        tokio::time::timeout(Duration::from_secs(1), child.wait()).await,
+                        Ok(Ok(_))
+                    ) {
+                        clean = false;
+                    }
+                }
+                if !consumer_joined {
+                    consumer.abort();
+                    if tokio::time::timeout(Duration::from_secs(1), &mut consumer)
+                        .await
+                        .is_err()
+                    {
+                        clean = false;
+                    }
+                }
+                if !clean {
+                    if let Some(parent) = &parent {
+                        parent.0.cleanup_failed.store(true, Ordering::SeqCst);
+                    }
+                }
+                Err(format!(
+                    "{error}; owned_host_child_reaped={clean}; remote_cleanup=unconfirmed"
+                ))
+            }
+        }
+    });
+    let result = supervisor.await.map_err(|e| e.to_string())?;
+    // Keep the cancellation sender alive across the complete supervisor await.
+    drop(caller.0);
+    result
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -355,6 +483,231 @@ mod tests {
         assert!(e.contains("parent_deadline_exhausted"));
         assert!(e.contains("owned_host_children_reaped=true"), "{e}");
     }
+    #[cfg(unix)]
+    fn stream_fixture() -> Command {
+        let mut command = Command::new("sh");
+        command.args(["-c", "sleep 30 & printf '%s\\n' $$; wait"]);
+        command
+    }
+    #[cfg(unix)]
+    async fn stream_until_eof(
+        stdout: tokio::process::ChildStdout,
+        started: tokio::sync::oneshot::Sender<u32>,
+    ) -> Result<Vec<u8>, String> {
+        use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
+        let mut reader = BufReader::new(stdout);
+        let mut line = String::new();
+        reader
+            .read_line(&mut line)
+            .await
+            .map_err(|e| e.to_string())?;
+        started
+            .send(
+                line.trim()
+                    .parse()
+                    .map_err(|e: std::num::ParseIntError| e.to_string())?,
+            )
+            .map_err(|_| "fixture receiver closed".to_string())?;
+        let mut bytes = Vec::new();
+        reader
+            .read_to_end(&mut bytes)
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(bytes)
+    }
+    #[cfg(unix)]
+    fn assert_stream_leader_reaped(pid: u32) {
+        let status = std::process::Command::new("kill")
+            .args(["-0", &pid.to_string()])
+            .stderr(Stdio::null())
+            .status()
+            .unwrap();
+        assert!(!status.success(), "owned stream leader was not reaped");
+    }
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn stream_success_preserves_bytes_and_parent_scope() {
+        use tokio::io::AsyncReadExt;
+        let d = Deadline::new(Duration::from_secs(3));
+        let mut command = Command::new("sh");
+        command.args(["-c", "printf 'verified-stream'"]);
+        let bytes = d
+            .run(stream_output(
+                command,
+                Duration::from_secs(2),
+                |mut stdout| async move {
+                    assert!(current().is_some(), "stream consumer lost its parent scope");
+                    let mut bytes = Vec::new();
+                    stdout
+                        .read_to_end(&mut bytes)
+                        .await
+                        .map_err(|e| e.to_string())?;
+                    Ok(bytes)
+                },
+            ))
+            .await
+            .unwrap();
+        assert_eq!(bytes, b"verified-stream");
+        assert_eq!(d.0.children.load(Ordering::SeqCst), 0);
+        assert!(!d.0.cleanup_failed.load(Ordering::SeqCst));
+    }
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn stream_parser_error_kills_and_reaps_its_child() {
+        use tokio::io::{AsyncBufReadExt, BufReader};
+        let d = Deadline::new(Duration::from_secs(3));
+        let (started, pid) = tokio::sync::oneshot::channel();
+        let error = d
+            .run(stream_output(
+                stream_fixture(),
+                Duration::from_secs(2),
+                |stdout| async move {
+                    let mut reader = BufReader::new(stdout);
+                    let mut line = String::new();
+                    reader
+                        .read_line(&mut line)
+                        .await
+                        .map_err(|e| e.to_string())?;
+                    started.send(line.trim().parse::<u32>().unwrap()).unwrap();
+                    Err::<(), _>("fixture SHA mismatch".to_string())
+                },
+            ))
+            .await
+            .unwrap_err();
+        assert!(error.contains("fixture SHA mismatch"));
+        assert!(error.contains("owned_host_child_reaped=true"), "{error}");
+        assert_stream_leader_reaped(pid.await.unwrap());
+        assert_eq!(d.0.children.load(Ordering::SeqCst), 0);
+    }
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn stream_local_timeout_bounds_inherited_pipe_and_wait() {
+        let d = Deadline::new(Duration::from_secs(3));
+        let (started, pid) = tokio::sync::oneshot::channel();
+        let mut command = Command::new("sh");
+        command.args(["-c", "sleep 30 & printf '%s\\n' $$; exit 0"]);
+        let start = Instant::now();
+        let error = d
+            .run(stream_output(
+                command,
+                Duration::from_millis(200),
+                |stdout| stream_until_eof(stdout, started),
+            ))
+            .await
+            .unwrap_err();
+        assert!(error.contains("command_timeout"), "{error}");
+        assert!(error.contains("owned_host_child_reaped=true"), "{error}");
+        assert!(start.elapsed() < Duration::from_secs(2));
+        assert_stream_leader_reaped(pid.await.unwrap());
+        assert_eq!(d.0.children.load(Ordering::SeqCst), 0);
+    }
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn stream_parent_cancel_waits_for_owned_reaping() {
+        let d = Deadline::new(Duration::from_secs(3));
+        let cancel = d.clone();
+        let (started, pid) = tokio::sync::oneshot::channel();
+        let cancellation = tokio::spawn(async move {
+            let pid = pid.await.unwrap();
+            cancel.cancel();
+            pid
+        });
+        let error = d
+            .run(stream_output(
+                stream_fixture(),
+                Duration::from_secs(2),
+                |stdout| stream_until_eof(stdout, started),
+            ))
+            .await
+            .unwrap_err();
+        assert!(error.contains("parent_cancelled"), "{error}");
+        assert!(error.contains("owned_host_children_reaped=true"), "{error}");
+        assert_stream_leader_reaped(cancellation.await.unwrap());
+        assert_eq!(d.0.children.load(Ordering::SeqCst), 0);
+    }
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn stream_caller_drop_notifies_independent_owner() {
+        let root = std::env::temp_dir().join(format!("stream-caller-{}", Uuid::new_v4()));
+        std::fs::create_dir(&root).unwrap();
+        let marker = root.join("should-never-write");
+        let ready = root.join("descendant-ready");
+        let release = root.join("release");
+        let mut command = Command::new("sh");
+        command
+            .arg("-c")
+            .arg("(echo ready > \"$2\"; while [ ! -f \"$3\" ]; do sleep 0.005; done; echo leaked > \"$1\") & printf '%s\\n' $$; wait")
+            .arg("fixture")
+            .arg(&marker)
+            .arg(&ready)
+            .arg(&release);
+        let d = Deadline::new(Duration::from_secs(3));
+        let parent = d.clone();
+        let (started, pid) = tokio::sync::oneshot::channel();
+        let caller = tokio::spawn(async move {
+            CURRENT
+                .scope(
+                    parent,
+                    stream_output(command, Duration::from_secs(2), |stdout| {
+                        stream_until_eof(stdout, started)
+                    }),
+                )
+                .await
+        });
+        let pid = pid.await.unwrap();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !ready.exists() {
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+        })
+        .await
+        .unwrap();
+        caller.abort();
+        assert!(caller.await.unwrap_err().is_cancelled());
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let changed = d.0.changed.notified();
+                tokio::pin!(changed);
+                changed.as_mut().enable();
+                if d.0.children.load(Ordering::SeqCst) == 0 {
+                    break;
+                }
+                changed.await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_stream_leader_reaped(pid);
+        assert!(!d.0.cleanup_failed.load(Ordering::SeqCst));
+        std::fs::write(&release, b"release").unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            !marker.exists(),
+            "owned stream descendant survived caller drop"
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn stream_nonzero_source_exit_does_not_report_success() {
+        use tokio::io::AsyncReadExt;
+        let mut command = Command::new("sh");
+        command.args(["-c", "printf 'verified-prefix'; exit 17"]);
+        let error = stream_output(command, Duration::from_secs(2), |mut stdout| async move {
+            let mut bytes = Vec::new();
+            stdout
+                .read_to_end(&mut bytes)
+                .await
+                .map_err(|e| e.to_string())?;
+            assert_eq!(bytes, b"verified-prefix");
+            Ok(bytes)
+        })
+        .await
+        .unwrap_err();
+        assert!(error.contains("stream source command failed"), "{error}");
+        assert!(error.contains("17"), "{error}");
+    }
+
     #[tokio::test]
     async fn deadline_restart_never_reconstructs_clock_from_unix_time() {
         assert!(Deadline::lookup(None).is_err());
