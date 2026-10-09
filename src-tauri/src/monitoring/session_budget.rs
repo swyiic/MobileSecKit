@@ -452,6 +452,9 @@ pub struct Contract {
     /// Only newly created automatic parents preallocate later work. Legacy receipts stay unchanged.
     #[serde(default)]
     pub planned_allocation: bool,
+    /// New parents only. Missing on retained contracts preserves the prior export plan.
+    #[serde(default)]
+    pub coordinated_exports: bool,
     /// Missing on retained parents: never infer or renew a time plan.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub time_plan: Option<TimePlan>,
@@ -495,11 +498,28 @@ impl Contract {
                 return Err("时间预留缺少新父字节计划".into());
             }
         }
+        if self.coordinated_exports && (!self.planned_allocation || self.time_plan.is_none()) {
+            return Err("协调导出额度缺少新父计划".into());
+        }
         if self.planned_allocation {
             for (kind, expected) in [
                 ("transfer", self.limits.total_bytes / 4),
-                ("archive", self.limits.total_bytes / 8),
-                ("import", self.limits.total_bytes * 3 / 16),
+                (
+                    "archive",
+                    if self.coordinated_exports {
+                        self.limits.total_bytes / 4
+                    } else {
+                        self.limits.total_bytes / 8
+                    },
+                ),
+                (
+                    "import",
+                    if self.coordinated_exports {
+                        self.limits.total_bytes / 4
+                    } else {
+                        self.limits.total_bytes * 3 / 16
+                    },
+                ),
             ] {
                 let slots = self
                     .reservations
@@ -576,6 +596,7 @@ impl Contract {
             reservations: vec![],
             manager_reserve_bytes: manager_reserve(),
             planned_allocation: false,
+            coordinated_exports: false,
             time_plan: None,
         })
     }
@@ -675,6 +696,12 @@ impl Contract {
             }
         }
         let quota = match kind {
+            "dump" if self.coordinated_exports => {
+                let export = self.limits.total_bytes / 4;
+                self.remaining().min(super::planned_transfer_payload_limit(
+                    export, export, export,
+                ))
+            }
             "dump" if self.planned_allocation => self.remaining(),
             "l0" | "l1" | "linker" | "unified" | "dump" => self.remaining() / 2,
             "transfer" => self.limits.total_bytes / 4,
@@ -1422,6 +1449,17 @@ impl Contract {
         )?;
         caps.push(("transfer", transfer));
         let mut c = Self::new_planned(limits, now, separate)?;
+        // A retained payload must fit transfer, archive and import. Fund equal
+        // bounded export slots before producers start; never mutate old contracts.
+        for slot in &mut c.reservations {
+            if matches!(slot.kind.as_str(), "archive" | "import") {
+                slot.reserved_bytes = c.limits.total_bytes / 4;
+            }
+        }
+        c.coordinated_exports = true;
+        if c.remaining() < if separate { 4 * 131072 } else { 2 * 131072 } {
+            return Err("协调采集/导出容量不足；未启动".into());
+        }
         c.time_plan = Some(TimePlan {
             schema: if long_plan {
                 "mobilee.session-time-plan/v3"
@@ -2107,5 +2145,77 @@ mod phase_guard_tests {
         assert_eq!(guard.receipt().limit_bytes, 1024);
         assert!(guard.constrain_time(0).is_err());
         assert_eq!(guard.receipt().admitted_write_bytes, 123);
+    }
+}
+
+#[cfg(test)]
+mod coordinated_export_tests {
+    use super::*;
+    #[test]
+    fn retained_5333_payload_fits_new_plan_and_original_contract_is_unchanged() {
+        let limits = Limits {
+            total_bytes: 4 * 1024 * 1024 * 1024,
+            max_seconds: 600,
+        };
+        let mut c =
+            Contract::new_planned_with_time(limits.clone(), 1, true, &[15, 90, 15]).unwrap();
+        let deadline = c.deadline_token;
+        assert!(c.coordinated_exports);
+        for (kind, charge) in [("l0", 2_373_938), ("l1", 1_892_290)] {
+            c.reserve(kind.into(), kind, 2).unwrap();
+            c.settle(
+                kind,
+                &serde_json::json!({"admitted_write_bytes":charge,"partial":false}),
+            )
+            .unwrap();
+        }
+        let dump = c.reserve("dump".into(), "dump", 3).unwrap().0;
+        assert!(dump >= 487_996_765);
+        let export = limits.total_bytes / 4;
+        let payload = super::super::planned_transfer_payload_limit(export, export, export);
+        assert!(dump <= payload);
+        // Actual original unique source bytes plus previously omitted base.apk.
+        assert!(317_344_486_u64 + 166_864_204 <= payload);
+        c.settle(
+            "dump",
+            &serde_json::json!({"admitted_write_bytes":487_931_229_u64,"partial":true}),
+        )
+        .unwrap();
+        for kind in ["transfer", "archive", "import"] {
+            assert_eq!(
+                c.reserve(format!("export:{kind}"), kind, 4).unwrap().0,
+                export
+            );
+        }
+        assert_eq!(c.deadline_token, deadline);
+        c.validate().unwrap();
+        let old = Contract::new_planned(limits.clone(), 1, true).unwrap();
+        let mut json = serde_json::to_value(&old).unwrap();
+        json.as_object_mut().unwrap().remove("coordinatedExports");
+        let restored: Contract = serde_json::from_value(json).unwrap();
+        assert!(!restored.coordinated_exports);
+        restored.validate().unwrap();
+        assert_eq!(
+            restored
+                .reservations
+                .iter()
+                .find(|r| r.kind == "archive")
+                .unwrap()
+                .reserved_bytes,
+            limits.total_bytes / 8
+        );
+    }
+    #[test]
+    fn infeasible_small_new_plan_fails_before_any_producer() {
+        assert!(Contract::new_planned_with_time(
+            Limits {
+                total_bytes: 4 * 1024 * 1024,
+                max_seconds: 600
+            },
+            1,
+            true,
+            &[15, 90, 15]
+        )
+        .is_err());
     }
 }

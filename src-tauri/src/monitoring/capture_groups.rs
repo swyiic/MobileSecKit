@@ -1364,6 +1364,38 @@ mod tests {
         assert_eq!(g.state, "partial");
     }
     #[test]
+    fn static_child_quota_proof_allows_only_owned_independent_linker() {
+        let mut g = coverage_partial_dump_group();
+        let note = g.stages[2].attempts[0].remote_lifecycle.as_mut().unwrap();
+        note["dump_coverage"]["coverage_causes"] =
+            serde_json::json!(["bound_code_copy_partial", "static_output_budget_exhausted"]);
+        note["dump_coverage"]["payload_coverage_complete"] = serde_json::json!(false);
+        note["dump_coverage"]["admitted_ranges"] = serde_json::json!(93);
+        assert!(g.continue_after_partial("dump"));
+        for cause in [
+            "output_io_failed",
+            "time_budget_exhausted",
+            "cancel_requested",
+            "source_identity_invalid",
+        ] {
+            let mut bad = g.clone();
+            bad.stages[2].attempts[0].remote_lifecycle.as_mut().unwrap()["dump_coverage"]
+                ["coverage_causes"] = serde_json::json!(["bound_code_copy_partial", cause]);
+            assert!(!bad.continue_after_partial("dump"));
+        }
+        let mut unconfirmed = g.clone();
+        unconfirmed.stages[2].attempts[0]
+            .remote_lifecycle
+            .as_mut()
+            .unwrap()["agent_exited_confirmed"] = serde_json::json!(false);
+        assert!(!unconfirmed.continue_after_partial("dump"));
+        let relation = g.start("linker", epoch()).unwrap();
+        g.finish(&relation, Some(Uuid::new_v4()), None, None)
+            .unwrap();
+        assert_eq!(g.stages[2].attempts[0].state, "partial");
+        assert_eq!(g.state, "partial");
+    }
+    #[test]
     fn local_window_exclusion_is_bounded_and_parent_stays_partial() {
         let mut g = coverage_partial_dump_group();
         let note = g.stages[2].attempts[0].remote_lifecycle.as_mut().unwrap();
@@ -2745,6 +2777,20 @@ fn dump_coverage_verified(note: &Value, package: &str) -> bool {
         && p["classification"] == "coverage_only"
         && p["package"] == package
         && p["catalog_complete"] == true
+        && p.get("coverage_causes").is_none_or(|causes| {
+            p["payload_coverage_complete"] == false
+                && causes.as_array().is_some_and(|rows| {
+                    !rows.is_empty()
+                        && rows.len() <= 2
+                        && rows.iter().any(|r| r == "bound_code_copy_partial")
+                        && rows.iter().all(|r| {
+                            matches!(
+                                r.as_str(),
+                                Some("bound_code_copy_partial" | "static_output_budget_exhausted")
+                            )
+                        })
+                })
+        })
         && p["bound_notes"]
             .as_u64()
             .is_some_and(|n| (1..=16).contains(&n))
