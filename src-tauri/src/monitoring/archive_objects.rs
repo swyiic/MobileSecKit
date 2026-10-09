@@ -1212,9 +1212,17 @@ mod retained_closeout_acceptance {
         );
         drop(zip);
         let restored = restore_from_export_source(&archive, &root).unwrap();
+        let import_started = std::time::Instant::now();
+        let import_guard =
+            session_budget::Guard::install(vec![restored.clone()], 768 * 1024 * 1024, 120000)
+                .unwrap();
         let bundle = import_kernsight_evidence_directory(restored.to_string_lossy().into_owned())
             .await
             .unwrap();
+        session_budget::charge(&restored.join("capture-group.json"), 0).unwrap();
+        assert!(import_started.elapsed().as_millis() < 120000);
+        assert!(!import_guard.receipt().partial);
+        drop(import_guard);
         assert_eq!(bundle.package, "cmb.pb");
         assert_eq!(
             std::fs::read(root.join("capture-group.json")).unwrap(),
