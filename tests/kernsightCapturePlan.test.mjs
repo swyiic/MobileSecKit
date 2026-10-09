@@ -228,3 +228,66 @@ test('new600s closeout profile retains90s observation with bounded archive and i
   assert.equal(captureTimeAllocation({l0:15,l1:90,linker:15},300,true).valid,false)
   assert.equal(captureTimeAllocation({l0:15,l1:90,linker:15},599,true).finalSeconds,140)
 })
+
+test('larger new deadlines share finite time with dump and retain final work', () => {
+  for (const [seconds, dump, transfer] of [[900,245,255],[901,245.5,255.5],[1200,300,500],[3600,300,2900]]) {
+    const plan = captureTimeAllocation({l0:15,l1:90,linker:15},seconds,true)
+    assert.equal(plan.valid,true)
+    assert.equal(plan.dumpSeconds,dump)
+    assert.equal(plan.transferSeconds,transfer)
+    assert.equal(plan.archiveSeconds,120)
+    assert.equal(plan.importSeconds,120)
+    assert.equal(plan.producer.reduce((sum,p)=>sum+p.seconds,0)+plan.dumpSeconds+plan.transferSeconds+plan.finalSeconds,seconds)
+  }
+})
+
+
+test('minimum total resolves the growing dump allowance instead of repeating insufficient advice', () => {
+  const durations = {l0:100,l1:100,linker:100}
+  const preview = captureTimeAllocation(durations,700,true)
+  assert.equal(preview.valid,false)
+  assert.equal(preview.minimumSeconds,810)
+  const admitted = captureTimeAllocation(durations,preview.minimumSeconds,true)
+  assert.equal(admitted.valid,true)
+  assert.equal(admitted.transferSeconds,30)
+  assert.equal(captureTimeAllocation(durations,809,true).valid,false)
+  assert.deepEqual(durations,{l0:100,l1:100,linker:100})
+})
+
+test('minimum total re-solves the 600s transition and the capped dump boundary', () => {
+  const short = {l0:114,l1:115,linker:115}
+  assert.equal(captureTimeAllocation(short,599,true).minimumSeconds,599)
+  assert.equal(captureTimeAllocation(short,599,true).valid,true)
+  const crossing = {l0:115,l1:115,linker:115}
+  assert.equal(captureTimeAllocation(crossing,599,true).minimumSeconds,900)
+  assert.equal(captureTimeAllocation(crossing,899,true).valid,false)
+  assert.equal(captureTimeAllocation(crossing,900,true).transferSeconds,30)
+  for (const [durations,separate,minimum] of [
+    [{l0:200,l1:100,linker:100},true,1010],
+    [{l0:201,l1:100,linker:100},true,1011],
+    [{l0:200,l1:120,linker:100},false,1010],
+    [{l0:201,l1:120,linker:100},false,1011],
+  ]) {
+    assert.equal(captureTimeAllocation(durations,700,separate).minimumSeconds,minimum)
+    assert.equal(captureTimeAllocation(durations,minimum,separate).transferSeconds,30)
+    assert.equal(captureTimeAllocation(durations,minimum-1,separate).valid,false)
+  }
+})
+
+test('suggested minimum admits all valid observation sums in the selected deadline regime', () => {
+  for (const separate of [false,true]) {
+    for (let sum=3;sum<=900;sum++) {
+      const l0=Math.min(300,sum-2),l1=Math.min(300,sum-l0-1)
+      const durations={l0,l1,linker:sum-l0-l1}
+      for (const total of [30,599,600,700,1009,1010,3600]) {
+        const preview=captureTimeAllocation(durations,total,separate)
+        const minimum=preview.minimumSeconds
+        assert.equal(Number.isInteger(minimum),true)
+        assert.equal(captureTimeAllocation(durations,minimum,separate).valid,true)
+        if ((preview.longPlan && minimum>600) || (!preview.longPlan && minimum!==600)) {
+          assert.equal(captureTimeAllocation(durations,minimum-1,separate).valid,false)
+        }
+      }
+    }
+  }
+})

@@ -13,6 +13,9 @@ pub struct CaptureDiagnostic {
     /// Display-only original counter records; never authorize continuation.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub coverage_records: Vec<Value>,
+    /// Exact matched lifecycle terminal facts, independent from diagnostic output.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terminal_record: Option<Value>,
     /// Original output retained in the parent file, within its terminal byte reserve.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub raw_output: Option<RawOutput>,
@@ -193,24 +196,265 @@ fn error_excerpt(source: &str, text: &str) -> (Option<String>, bool) {
     (Some(format!("{prefix}{retained}{suffix}")), truncated)
 }
 
-fn coverage_records(result: Option<&KernSightCaptureResult>) -> Vec<Value> {
+const TERMINAL_SCHEMA: &str = "mobilee.capture-terminal/v1";
+const MAX_TERMINAL_RECORD_BYTES: usize = 4096;
+
+fn terminal_record(
+    attempt: &Attempt,
+    result: Option<&KernSightCaptureResult>,
+    omitted: &mut bool,
+) -> Option<Value> {
+    let note = attempt.remote_lifecycle.as_ref()?;
+    // A sibling's controller receipt is retained on the controller attempt.
+    // No parent-only match can manufacture terminal facts for another attempt.
+    let r = &attempt.relation;
+    let relation = &note["relation"];
+    let matched = note["schema"] == "kernsight.capture-lifecycle/v1"
+        && relation["parent_id"] == r.parent_id.to_string()
+        && relation["stage_id"] == r.stage_id.to_string()
+        && relation["attempt_id"] == r.attempt_id.to_string()
+        && relation["attempt"] == r.attempt
+        && relation["stage_key"] == r.stage_key
+        && note["token"]
+            .as_str()
+            .and_then(|s| Uuid::parse_str(s).ok())
+            .is_some_and(|id| !id.is_nil());
+    if !matched {
+        *omitted = true;
+        return None;
+    }
+    if note["collection_returned"] != true {
+        return None;
+    }
+    if !matches!(
+        note["collection_status"].as_str(),
+        Some("completed" | "partial")
+    ) {
+        *omitted = true;
+        return None;
+    }
+    let mut record = serde_json::json!({
+        "schema": TERMINAL_SCHEMA,
+        "source": "matched_remote_lifecycle",
+        "relation": relation,
+        "token": note["token"],
+        // Exit status is the owned command result, never inferred from lifecycle.
+        "exit_code": result.and_then(|r| r.exit_code),
+    });
+    for key in [
+        "stop_reason",
+        "collection_returned",
+        "collection_status",
+        "agent_exited_confirmed",
+        "cleanup",
+        "target_pause",
+    ] {
+        record[key] = note[key].clone();
+    }
+    if let Some(coverage) = note.get("dump_coverage").filter(|v| !v.is_null()) {
+        if coverage["schema"] == "kernsight.dump-coverage/v1"
+            && serde_json::to_vec(coverage).is_ok_and(|v| v.len() <= 2048)
+        {
+            record["dump_coverage"] = coverage.clone();
+        } else {
+            *omitted = true;
+            // Only a valid proof omitted for its size can preserve base terminal
+            // facts. Invalid proof shapes remain mismatched in presentation.
+            if coverage["schema"] == "kernsight.dump-coverage/v1"
+                && serde_json::to_vec(coverage).is_ok_and(|v| v.len() > 2048)
+            {
+                record["dumpCoverageOmitted"] = true.into();
+            }
+        }
+    }
+    if serde_json::to_vec(&record).is_ok_and(|v| v.len() <= MAX_TERMINAL_RECORD_BYTES) {
+        Some(record)
+    } else {
+        *omitted = true;
+        None
+    }
+}
+
+// Contract reasons allow 16 x 256 Unicode characters. Preserve all of those
+// reasons even when quota detail or other producer fields need a projection.
+const MAX_BUDGET_RECORD_BYTES: usize = 20 * 1024;
+const MAX_COUNTER_RECORD_BYTES: usize = 4096;
+const MAX_SOURCE_COUNTER_BYTES: usize = 128 * 1024;
+const MAX_DIAGNOSTIC_JSON_BYTES: usize = 60 * 1024;
+
+fn projected_counter(record: Value, omitted: &mut bool) -> Option<Value> {
+    let encoded = serde_json::to_vec(&record).ok()?;
+    if encoded.len() <= 2048 {
+        return Some(record);
+    }
+    *omitted = true;
+    let schema = record["schema"].as_str()?;
+    let mut projected = serde_json::json!({"schema":schema,
+        "diagnostic_projection":true,"source_record_bytes":encoded.len()});
+    let keys: &[&str] = match schema {
+        "kernsight.output-budget/v1" => &[
+            "limit_bytes",
+            "admitted_write_bytes",
+            "rejected_writes",
+            "partial",
+        ],
+        "kernsight.perf-poll-budget/v1" => &[
+            "bounded_slice_yields",
+            "unread_tail_possible",
+            "unread_tail_count",
+            "scope_failures",
+            "perf_read_failures",
+            "budget_skipped_raw",
+            "quota_omitted_future_events",
+            "coverage_partial",
+        ],
+        "kernsight.capture-drain/v1" => &[
+            "producers_stopped",
+            "queues_observed_empty",
+            "unknown_tail",
+            "rounds",
+            "lost_samples",
+        ],
+        _ => return None,
+    };
+    for key in keys {
+        if let Some(value) = record
+            .get(*key)
+            .filter(|v| v.is_boolean() || v.is_number() || v.is_null())
+        {
+            projected[*key] = value.clone();
+        }
+    }
+    if schema == "kernsight.output-budget/v1" {
+        if let Some(reason) = record["reason"].as_str() {
+            projected["reason"] = reason.chars().take(256).collect::<String>().into();
+            projected["reason_truncated"] = (reason.chars().count() > 256).into();
+        }
+        if let Some(reasons) = record["failure_reasons"].as_array() {
+            projected["failure_reasons_count"] = reasons.len().into();
+            if reasons.len() <= 16
+                && reasons
+                    .iter()
+                    .all(|v| v.as_str().is_some_and(|s| s.chars().count() <= 256))
+            {
+                projected["failure_reasons"] = record["failure_reasons"].clone();
+            } else {
+                projected["failure_reasons_omitted"] = true.into();
+            }
+        }
+        for key in ["admitted_by_kind", "admission_calls_by_kind"] {
+            if let Some(value) = record
+                .get(key)
+                .filter(|v| serde_json::to_vec(v).is_ok_and(|b| b.len() <= 1024))
+            {
+                projected[key] = value.clone();
+            }
+        }
+    }
+    if schema == "kernsight.perf-poll-budget/v1" {
+        if let Some(reasons) = record["coverage_reasons"].as_object() {
+            let mut kept = serde_json::Map::new();
+            for key in [
+                "probe_quota",
+                "shortened_window",
+                "unread_tail",
+                "scope_failure",
+                "read_failure",
+                "perf_loss",
+            ] {
+                if let Some(value) = reasons.get(key).filter(|v| v.is_boolean()) {
+                    kept.insert(key.into(), value.clone());
+                }
+            }
+            projected["coverage_reasons"] = kept.into();
+        }
+        projected["quota_stops_count"] = record["quota_stops"].as_array().map(Vec::len).into();
+        projected["quota_stops_omitted"] = true.into();
+    }
+    let missing: Vec<_> = record
+        .as_object()?
+        .keys()
+        .filter(|key| projected.get(*key).is_none())
+        .cloned()
+        .collect();
+    projected["omitted_fields"] = missing.into();
+    let limit = if schema == "kernsight.output-budget/v1" {
+        MAX_BUDGET_RECORD_BYTES
+    } else {
+        MAX_COUNTER_RECORD_BYTES
+    };
+    serde_json::to_vec(&projected)
+        .is_ok_and(|v| v.len() <= limit)
+        .then_some(projected)
+}
+
+fn coverage_records(result: Option<&KernSightCaptureResult>, omitted: &mut bool) -> Vec<Value> {
     let mut records = Vec::new();
     for schema in [
         "kernsight.capture-drain/v1",
         "kernsight.perf-poll-budget/v1",
+        "kernsight.output-budget/v1",
     ] {
-        if let Some(record) = result
-            .into_iter()
-            .flat_map(|r| r.stderr.lines())
-            .rev()
-            .filter(|line| line.len() <= 2048)
-            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
-            .find(|v| v["schema"] == schema && serde_json::to_vec(v).is_ok_and(|b| b.len() <= 2048))
-        {
-            records.push(record);
+        for line in result.into_iter().flat_map(|r| r.stderr.lines()).rev() {
+            if !line.contains(schema) {
+                continue;
+            }
+            if line.len() > MAX_SOURCE_COUNTER_BYTES {
+                *omitted = true;
+                break;
+            }
+            let Ok(record) = serde_json::from_str::<Value>(line) else {
+                *omitted = true;
+                continue;
+            };
+            if record["schema"] != schema {
+                continue;
+            }
+            if let Some(record) = projected_counter(record, omitted) {
+                records.push(record);
+            } else {
+                *omitted = true;
+            }
+            break;
         }
     }
     records
+}
+
+fn bound_diagnostic(mut diagnostic: CaptureDiagnostic) -> CaptureDiagnostic {
+    // Leave room for the existing 3KiB tail and attempt metadata inside the
+    // 64KiB terminal reserve. The 32KiB raw-output ceiling is never raised.
+    while serde_json::to_vec(&diagnostic).map_or(usize::MAX, |v| v.len())
+        > MAX_DIAGNOSTIC_JSON_BYTES
+    {
+        if let Some(raw) = diagnostic.raw_output.as_mut() {
+            raw.complete = false;
+            let text = if raw.stdout.is_empty() {
+                &mut raw.stderr
+            } else {
+                &mut raw.stdout
+            };
+            if text.is_empty() {
+                diagnostic.raw_output = None;
+                continue;
+            }
+            let mut end = text.len() * 3 / 4;
+            while !text.is_char_boundary(end) {
+                end -= 1;
+            }
+            text.truncate(end);
+        } else if diagnostic.coverage_records.pop().is_some() {
+            diagnostic.structured_record_omitted = true;
+        } else if diagnostic.terminal_record.take().is_some() || diagnostic.record.take().is_some()
+        {
+            diagnostic.structured_record_omitted = true;
+        } else {
+            diagnostic.error_excerpt = None;
+            diagnostic.error_excerpt_truncated = true;
+            break;
+        }
+    }
+    diagnostic
 }
 
 pub(super) fn collect(
@@ -243,7 +487,9 @@ pub(super) fn collect(
             }
         }
     }
-    if result.is_none() && record.is_none() && !omitted {
+    let terminal_record = terminal_record(attempt, result, &mut omitted);
+    let coverage_records = coverage_records(result, &mut omitted);
+    if result.is_none() && record.is_none() && terminal_record.is_none() && !omitted {
         return None;
     }
     let (excerpt, excerpt_truncated) = result
@@ -264,8 +510,9 @@ pub(super) fn collect(
         };
         text.len() + format!("[{name}]\n").len() > MAX_CAPTURE_DIAGNOSTIC_BYTES
     });
-    Some(CaptureDiagnostic {
-        coverage_records: coverage_records(result),
+    Some(bound_diagnostic(CaptureDiagnostic {
+        coverage_records,
+        terminal_record,
         schema: DIAGNOSTIC_SCHEMA.into(),
         raw_output: result.map(raw_output),
         raw_output_attempt_id: None,
@@ -277,7 +524,7 @@ pub(super) fn collect(
         raw_tail_truncated,
         error_excerpt_truncated: excerpt_truncated,
         structured_record_omitted: omitted,
-    })
+    }))
 }
 
 #[cfg(test)]
@@ -298,6 +545,172 @@ mod tests {
         assert!(diagnostic.raw_tail_truncated);
         assert_eq!(a.state, "failed");
         assert!(collect(&a, None).is_none());
+    }
+
+    #[test]
+    fn matched_partial_terminal_keeps_all_reasons_and_loss_without_raw_log_growth() {
+        let mut a = attempt();
+        let mut note = lifecycle(&a, "not a qualification failure");
+        note.as_object_mut()
+            .unwrap()
+            .remove("qualification_failure");
+        note["collection_returned"] = true.into();
+        note["collection_status"] = "partial".into();
+        note["stop_reason"] = "perf_poll_backlog_or_scope_gap_at_observation_end".into();
+        note["agent_exited_confirmed"] = true.into();
+        a.remote_lifecycle = Some(note.clone());
+        let budget = serde_json::json!({"schema":"kernsight.output-budget/v1", "partial":true,
+            "reason":"perf_poll_backlog_or_scope_gap_at_observation_end", "failure_reasons":["perf_loss","unread_tail"]});
+        let drain = serde_json::json!({"schema":"kernsight.capture-drain/v1", "lost_samples":169234,"unknown_tail":true});
+        let poll = serde_json::json!({"schema":"kernsight.perf-poll-budget/v1", "coverage_partial":true,
+            "coverage_reasons":{"perf_loss":true,"unread_tail":true}, "budget_skipped_raw":7773});
+        let stderr = format!("{}\n{budget}\n{drain}\n{poll}", "x".repeat(100000));
+        let d = collect(&a, Some(&output("", &stderr))).unwrap();
+        assert_eq!(d.coverage_records, vec![drain, poll, budget]);
+        let terminal = d.terminal_record.unwrap();
+        assert_eq!(terminal["relation"], note["relation"]);
+        assert_eq!(terminal["token"], note["token"]);
+        assert_eq!(terminal["stop_reason"], note["stop_reason"]);
+        assert_eq!(terminal["collection_status"], "partial");
+        assert_eq!(terminal["exit_code"], 1);
+        assert!(terminal.get("target_exit_confirmed").is_none());
+        let raw = d.raw_output.unwrap();
+        assert!(!raw.complete);
+        assert!(serde_json::to_vec(&raw).unwrap().len() <= RAW_OUTPUT_JSON_LIMIT);
+        assert!(serde_json::to_vec(&terminal).unwrap().len() <= MAX_TERMINAL_RECORD_BYTES);
+    }
+
+    #[test]
+    fn unmatched_terminal_and_output_only_claims_never_become_terminal_facts() {
+        for field in [
+            "parent_id",
+            "stage_id",
+            "attempt_id",
+            "attempt",
+            "stage_key",
+            "token",
+        ] {
+            let mut a = attempt();
+            let mut note = lifecycle(&a, "irrelevant");
+            note.as_object_mut()
+                .unwrap()
+                .remove("qualification_failure");
+            note["collection_returned"] = true.into();
+            note["collection_status"] = "partial".into();
+            if field == "token" {
+                note["token"] = "unknown-owner".into();
+            } else {
+                note["relation"][field] = serde_json::json!("foreign");
+            }
+            a.remote_lifecycle = Some(note);
+            let d = collect(&a, None).unwrap();
+            assert!(d.terminal_record.is_none());
+            assert!(d.structured_record_omitted);
+        }
+        let a = attempt();
+        let mut note = lifecycle(&a, "output cannot prove return");
+        note["collection_returned"] = true.into();
+        note["collection_status"] = "completed".into();
+        let d = collect(&a, Some(&output("", &note.to_string()))).unwrap();
+        assert!(d.terminal_record.is_none());
+    }
+
+    #[test]
+    fn legacy_missing_terminal_stays_unknown_and_oversized_records_are_explicit() {
+        let mut a = attempt();
+        a.remote_lifecycle = Some(lifecycle(&a, "legacy qualification only"));
+        assert!(collect(&a, None).unwrap().terminal_record.is_none());
+        let note = a.remote_lifecycle.as_mut().unwrap();
+        note["collection_returned"] = true.into();
+        note["collection_status"] = "partial".into();
+        note["stop_reason"] = "身份🙂".repeat(5000).into();
+        let d = collect(&a, None).unwrap();
+        assert!(d.terminal_record.is_none());
+        assert!(d.structured_record_omitted);
+        let budget = serde_json::json!({"schema":"kernsight.output-budget/v1", "failure_reasons":["x".repeat(3000)]});
+        let d = collect(&attempt(), Some(&output("", &budget.to_string()))).unwrap();
+        assert_eq!(d.coverage_records[0]["failure_reasons_omitted"], true);
+        assert!(d.structured_record_omitted);
+    }
+
+    #[test]
+    fn large_counter_projection_keeps_all_contract_reasons_and_loss_with_total_bound() {
+        let reasons: Vec<_> = (0..16)
+            .map(|i| format!("{i}{}", "🙂".repeat(253)))
+            .collect();
+        let budget = serde_json::json!({"schema":"kernsight.output-budget/v1", "limit_bytes":100,
+            "admitted_write_bytes":99,"rejected_writes":0,"partial":true,"failure_reasons":reasons});
+        let poll = serde_json::json!({"schema":"kernsight.perf-poll-budget/v1", "budget_skipped_raw":7773,
+            "coverage_reasons":{"perf_loss":true,"unread_tail":true}, "quota_stops":["x".repeat(3000),"y".repeat(3000)]});
+        let drain = serde_json::json!({"schema":"kernsight.capture-drain/v1", "lost_samples":169234,"unknown_tail":true});
+        let failure = failure(&"x".repeat(10000));
+        let stderr = format!(
+            "{failure}\n{}\n{budget}\n{poll}\n{drain}",
+            "z".repeat(100000)
+        );
+        let d = collect(&attempt(), Some(&output("", &stderr))).unwrap();
+        assert_eq!(d.coverage_records[0], drain);
+        assert_eq!(d.coverage_records[1]["budget_skipped_raw"], 7773);
+        assert_eq!(d.coverage_records[1]["coverage_reasons"]["perf_loss"], true);
+        assert_eq!(d.coverage_records[1]["quota_stops_count"], 2);
+        assert_eq!(d.coverage_records[1]["quota_stops_omitted"], true);
+        assert_eq!(
+            d.coverage_records[2]["failure_reasons"],
+            serde_json::json!(reasons)
+        );
+        assert!(d.structured_record_omitted);
+        assert!(serde_json::to_vec(&d).unwrap().len() <= MAX_DIAGNOSTIC_JSON_BYTES);
+        assert!(
+            serde_json::to_vec(d.raw_output.as_ref().unwrap())
+                .unwrap()
+                .len()
+                <= RAW_OUTPUT_JSON_LIMIT
+        );
+        assert!(!d.raw_output.as_ref().unwrap().complete);
+    }
+
+    #[test]
+    fn legal_large_dump_proof_omission_keeps_base_terminal_and_explicit_marker() {
+        let mut a = attempt();
+        a.relation.stage_key = "dump".into();
+        let mut note = lifecycle(&a, "not a qualification failure");
+        note.as_object_mut()
+            .unwrap()
+            .remove("qualification_failure");
+        note["collection_returned"] = true.into();
+        note["collection_status"] = "partial".into();
+        note["stop_reason"] = "bound_code_copy_partial".into();
+        note["dump_coverage"] = serde_json::json!({"schema":"kernsight.dump-coverage/v1",
+            "catalog_complete":true,"payload_coverage_complete":false,
+            "coverage_causes":(0..16).map(|i|format!("{i}{}", "x".repeat(253))).collect::<Vec<_>>()});
+        a.remote_lifecycle = Some(note.clone());
+        let d = collect(&a, None).unwrap();
+        let terminal = d.terminal_record.unwrap();
+        assert_eq!(terminal["dumpCoverageOmitted"], true);
+        assert!(terminal.get("dump_coverage").is_none());
+        assert_eq!(terminal["stop_reason"], "bound_code_copy_partial");
+        assert_eq!(terminal["relation"], note["relation"]);
+        assert_eq!(terminal["token"], note["token"]);
+        assert!(d.structured_record_omitted);
+        assert_eq!(a.remote_lifecycle.unwrap(), note);
+    }
+
+    #[test]
+    fn invalid_dump_proof_cannot_gain_a_legal_omission_marker() {
+        let mut a = attempt();
+        let mut note = lifecycle(&a, "not a qualification failure");
+        note["collection_returned"] = true.into();
+        note["collection_status"] = "partial".into();
+        note["dump_coverage"] =
+            serde_json::json!({"schema":"foreign/v1", "noisy":"x".repeat(3000)});
+        a.remote_lifecycle = Some(note);
+        let d = collect(&a, None).unwrap();
+        assert!(d
+            .terminal_record
+            .unwrap()
+            .get("dumpCoverageOmitted")
+            .is_none());
+        assert!(d.structured_record_omitted);
     }
 
     fn attempt() -> Attempt {

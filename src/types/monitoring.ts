@@ -427,6 +427,7 @@ export interface KernSightCaptureRelation {parentId:string;stageId:string;attemp
 export interface KernSightCaptureDiagnostic {
   schema: 'mobilee.capture-diagnostic/v1'
   coverageRecords?: Record<string, unknown>[]
+  terminalRecord?: Record<string, unknown> | null
   source: 'remote_lifecycle' | 'stderr' | 'stdout' | null
   record: Record<string, unknown> | null
   errorExcerpt: string | null

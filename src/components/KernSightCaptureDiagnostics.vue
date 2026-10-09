@@ -17,6 +17,8 @@
       <p>实际（observed）</p><pre>{{ diagnostics.observed ?? '未知（缺字段）' }}</pre>
     </details>
     <p class="diagnostic-note">{{ diagnostics.producerExitLabel }} · {{ diagnostics.targetExitLabel }}。生产者退出不等于目标进程退出，未确认也不代表仍存活。</p>
+    <details v-if="diagnostics.terminalFacts"><summary>已匹配结构化终态</summary><pre>{{ diagnostics.terminalFacts }}</pre></details>
+    <details v-if="diagnostics.coverageRecords"><summary>覆盖与输出预算计数（诊断输出）</summary><pre>{{ diagnostics.coverageRecords }}</pre></details>
     <p v-for="warning in diagnostics.warnings" :key="warning" class="diagnostic-warning">{{ warning }}</p>
     <p v-if="diagnostics.byteLabel" class="diagnostic-note">{{ diagnostics.byteLabel }}</p>
     <p v-if="copyStatus" :role="copyFailed ? 'alert' : 'status'" :class="copyFailed ? 'diagnostic-warning' : 'diagnostic-note'">{{ copyStatus }}</p>

@@ -7,7 +7,7 @@ export interface CaptureDiagnosticView {
   coveragePartial: boolean
   title: string
   cause: string | null
-  primary: 'structured' | 'excerpt' | 'missing'
+  primary: 'structured' | 'terminal' | 'excerpt' | 'missing'
   sourceLabel: string
   scopeLabel: string
   kind: string | null
@@ -19,6 +19,8 @@ export interface CaptureDiagnosticView {
   warnings: string[]
   byteLabel: string | null
   rawTail: string | null
+  terminalFacts: string | null
+  coverageRecords: string | null
 }
 
 function object(value: unknown): JsonRecord | null {
@@ -75,6 +77,28 @@ function matchingReceipt(value: unknown, note: JsonRecord | null, scope: string 
     && sameRelation(relation(receipt.record.relation), relation(note?.relation))
     && sameJson(receipt.record.relation, note?.relation) ? receipt : null
 }
+function matchingTerminal(value: unknown, note: JsonRecord | null, scope: string | null): JsonRecord | null {
+  const terminal = object(value)
+  if (terminal?.schema !== 'mobilee.capture-terminal/v1' || terminal.source !== 'matched_remote_lifecycle'
+    || !scope || !validLifecycleToken(terminal.token) || terminal.token !== note?.token
+    || !sameRelation(relation(terminal.relation), relation(note?.relation))
+    || !sameJson(terminal.relation, note?.relation)
+    || terminal.collection_returned !== true || !['completed', 'partial'].includes(String(terminal.collection_status))) return null
+  for (const key of ['stop_reason', 'collection_returned', 'collection_status', 'agent_exited_confirmed', 'cleanup', 'target_pause']) {
+    if (!sameJson(terminal[key] ?? null, note?.[key] ?? null)) return null
+  }
+  if (terminal.dumpCoverageOmitted === true) {
+    const originalCoverage = object(note?.dump_coverage)
+    if (terminal.dump_coverage != null || originalCoverage?.schema !== 'kernsight.dump-coverage/v1'
+      || new TextEncoder().encode(JSON.stringify(originalCoverage)).length <= 2048) return null
+  } else if (!sameJson(terminal.dump_coverage ?? null, note?.dump_coverage ?? null)) return null
+  return terminal
+}
+function retainedCoverageRecords(values: unknown): JsonRecord[] {
+  return Array.isArray(values) ? values.map(object).filter((value): value is JsonRecord => Boolean(value
+    && ['kernsight.capture-drain/v1', 'kernsight.perf-poll-budget/v1', 'kernsight.output-budget/v1'].includes(String(value.schema))
+    && new TextEncoder().encode(JSON.stringify(value)).length <= (value.schema === 'kernsight.output-budget/v1' ? 20 * 1024 : 4096))).slice(0, 3) : []
+}
 function boolLabel(value: unknown): string {
   return value === true ? '已确认退出' : value === false ? '未确认退出（false）' : '未知（缺少确认）'
 }
@@ -92,11 +116,18 @@ export function captureAttemptDiagnostics(group: KernSightCaptureGroup, attempt:
     const outputReceipt = failureRecord(diagnostic.record)
     if (outputReceipt) receipt = { ...outputReceipt, source: diagnostic.source, trusted: false }
   }
+  const terminal = matchingTerminal(diagnostic?.terminalRecord, note, scope)
+  const coverage = retainedCoverageRecords(diagnostic?.coverageRecords)
   const excerpt = text(diagnostic?.errorExcerpt)
-  const cause = text(receipt?.failure.cause) || excerpt
-  const primary = text(receipt?.failure.cause) ? 'structured' : excerpt ? 'excerpt' : 'missing'
+  const terminalReason = terminal ? text(terminal.stop_reason) : null
+  const terminalStatus = terminal ? `collection_status=${terminal.collection_status}；stop_reason 未记录` : null
+  const cause = text(receipt?.failure.cause) || terminalReason || excerpt || terminalStatus
+  const primary = text(receipt?.failure.cause) ? 'structured' : terminalReason ? 'terminal' : excerpt ? 'excerpt' : terminalStatus ? 'terminal' : 'missing'
   const warnings: string[] = []
   const rawTail = text(attempt.diagnosticTail)
+  if (diagnostic?.terminalRecord != null && !terminal) warnings.push('结构化终态未匹配当前生命周期、token、父会话与原始终态字段；原记录保留，未用于确认本次终态。')
+  if (terminal?.dumpCoverageOmitted === true) warnings.push('dump 覆盖证明超过终态摘要额度，详情未复制到摘要；原记录仍在生命周期 JSON 中。这里只确认基础终态，不证明完整覆盖，也不能授权继续采集。')
+  if (coverage.length) warnings.push('输出预算、drain 与 poll 记录仅作诊断计数；不证明完整采集，也不能授权继续采集。')
   const rawTailTruncated = diagnostic?.rawTailTruncated === true || /\[(?:stderr|stdout) tail; earlier output omitted\]/.test(rawTail || '')
   if ((note?.qualification_failure != null && !savedReceipt) || (diagnostic?.source === 'remote_lifecycle' && diagnostic.record != null && !retainedReceipt)) {
     warnings.push('结构化失败回执格式无效，或身份未匹配当前生命周期、token 与父会话；未将其用作本次失败原因，原记录保留在诊断 JSON 中。')
@@ -113,7 +144,7 @@ export function captureAttemptDiagnostics(group: KernSightCaptureGroup, attempt:
   const hasDiagnostic = Boolean(diagnostic || rawTail || note?.qualification_failure || attempt.error
     || ['failed', 'partial', 'interrupted', 'cancelled'].includes(attempt.state))
   const sourceLabel = primary === 'structured' ? receipt?.trusted ? '已匹配生命周期失败回执' : `${receipt?.source} 结构化诊断输出`
-    : primary === 'excerpt' ? '错误摘要（诊断输出）' : '失败原因未留存 / 未确认'
+    : primary === 'terminal' ? '已匹配生命周期终态' : primary === 'excerpt' ? '错误摘要（诊断输出）' : '失败原因未留存 / 未确认'
   const bytes = (value: unknown) => typeof value === 'number' && Number.isFinite(value) && value >= 0 ? `${value} B` : '未知'
   const byteLabel = diagnostic ? `原始输出计数：stdout ${bytes(diagnostic.stdoutBytes)} · stderr ${bytes(diagnostic.stderrBytes)}（不代表全部输出已留存）` : null
   return {
@@ -126,7 +157,7 @@ export function captureAttemptDiagnostics(group: KernSightCaptureGroup, attempt:
     expected: display(receipt?.failure.expected), observed: display(receipt?.failure.observed),
     producerExitLabel: `采集生产者：${boolLabel(scope ? note?.agent_exited_confirmed : null)}`,
     targetExitLabel: `目标进程：${boolLabel(receipt?.trusted ? receipt.failure.target_exit_confirmed : null)}`,
-    warnings, byteLabel, rawTail,
+    warnings, byteLabel, rawTail, terminalFacts: terminal ? display(terminal) : null, coverageRecords: coverage.length ? display(coverage) : null,
   }
 }
 

@@ -281,6 +281,117 @@ test('matching empty, nil or malformed lifecycle tokens stay unconfirmed', () =>
   }
 })
 
+const terminalRecord = note => ({ schema: 'mobilee.capture-terminal/v1', source: 'matched_remote_lifecycle',
+  relation: note.relation, token: note.token, exit_code: 1,
+  ...Object.fromEntries(['stop_reason', 'collection_returned', 'collection_status', 'agent_exited_confirmed', 'cleanup', 'target_pause', 'dump_coverage'].map(key => [key, note[key] ?? null])) })
+
+test('matched partial terminal preserves complete structured causes and counters independently of stderr truncation', () => {
+  const note = { ...lifecycle(), qualification_failure: null, collection_returned: true, collection_status: 'partial',
+    stop_reason: 'perf_poll_backlog_or_scope_gap_at_observation_end', cleanup: 'producer_scope_returned', target_pause: 'forbidden' }
+  const budget = { schema: 'kernsight.output-budget/v1', partial: true, failure_reasons: ['perf_loss', 'unread_tail'] }
+  const drain = { schema: 'kernsight.capture-drain/v1', lost_samples: 169234, unknown_tail: true }
+  const poll = { schema: 'kernsight.perf-poll-budget/v1', budget_skipped_raw: 7773, coverage_reasons: { perf_loss: true, unread_tail: true } }
+  const f = fixture({ state: 'partial', remoteLifecycle: note, captureDiagnostic: diagnostic({ source: null, record: null,
+    terminalRecord: terminalRecord(note), coverageRecords: [drain, poll, budget], rawTailTruncated: true }) })
+  const view = f.view()
+  assert.equal(view.primary, 'terminal')
+  assert.equal(view.cause, note.stop_reason)
+  assert.equal(view.coveragePartial, true)
+  assert.match(view.sourceLabel, /已匹配生命周期终态/)
+  assert.deepEqual(JSON.parse(view.coverageRecords), [drain, poll, budget])
+  assert.equal(JSON.parse(view.terminalFacts).collection_status, 'partial')
+  assert.match(view.targetExitLabel, /未知/)
+  assert.equal(f.attempt.state, 'partial')
+})
+
+function dumpTerminalFixture() {
+  const r = relation('dump')
+  const coverage = { schema: 'kernsight.dump-coverage/v1', catalog_complete: true, payload_coverage_complete: false,
+    coverage_causes: Array.from({ length: 16 }, (_, i) => `${i}${'x'.repeat(253)}`) }
+  const note = { ...lifecycle(r), qualification_failure: null, collection_returned: true, collection_status: 'partial',
+    stop_reason: 'bound_code_copy_partial', dump_coverage: coverage }
+  const record = terminalRecord(note); delete record.dump_coverage; record.dumpCoverageOmitted = true
+  const f = fixture({ relation: r, state: 'partial', remoteLifecycle: note,
+    captureDiagnostic: diagnostic({ source: null, record: null, terminalRecord: record, structuredRecordOmitted: true }) })
+  f.group.stages[0].id = r.stageId; f.group.stages[0].key = 'dump'
+  return f
+}
+
+test('legal oversized dump proof omission preserves base terminal facts and the complete source proof', () => {
+  const f = dumpTerminalFixture(), original = JSON.stringify(f.attempt.remoteLifecycle)
+  const view = f.view()
+  assert.equal(view.primary, 'terminal')
+  assert.equal(view.cause, 'bound_code_copy_partial')
+  assert.equal(view.coveragePartial, true)
+  assert.equal(JSON.parse(view.terminalFacts).dumpCoverageOmitted, true)
+  assert.equal(JSON.parse(view.terminalFacts).dump_coverage, undefined)
+  assert.match(view.warnings.join(' '), /覆盖证明超过终态摘要额度.*不能授权继续采集/)
+  assert.equal(JSON.stringify(f.attempt.remoteLifecycle), original)
+  assert.equal(f.attempt.state, 'partial')
+})
+
+test('dump proof omission cannot bypass base identity or result checks or hide a present proof', () => {
+  for (const mutate of [
+    f => { delete f.attempt.captureDiagnostic.terminalRecord.dumpCoverageOmitted },
+    f => { f.attempt.captureDiagnostic.terminalRecord.dumpCoverageOmitted = false },
+    f => { f.attempt.captureDiagnostic.terminalRecord.dump_coverage = f.attempt.remoteLifecycle.dump_coverage },
+    f => { f.attempt.remoteLifecycle.dump_coverage = { schema: 'kernsight.dump-coverage/v1' } },
+    f => { f.attempt.remoteLifecycle.dump_coverage.schema = 'foreign/v1' },
+    f => { f.attempt.captureDiagnostic.terminalRecord.token = 'foreign' },
+    f => { f.attempt.captureDiagnostic.terminalRecord.collection_status = 'completed' },
+    f => { f.attempt.captureDiagnostic.terminalRecord.stop_reason = 'different' },
+  ]) {
+    const f = dumpTerminalFixture(); mutate(f)
+    assert.equal(f.view().primary, 'excerpt')
+    assert.equal(f.view().terminalFacts, null)
+    assert.match(f.view().warnings.join(' '), /结构化终态未匹配/)
+  }
+})
+
+test('projected counters preserve all bounded failure reasons and explicitly omitted quota detail', () => {
+  const reasons = Array.from({ length: 16 }, (_, i) => `${i}${'🙂'.repeat(253)}`)
+  const budget = { schema: 'kernsight.output-budget/v1', diagnostic_projection: true, failure_reasons: reasons }
+  const poll = { schema: 'kernsight.perf-poll-budget/v1', diagnostic_projection: true, budget_skipped_raw: 7773,
+    coverage_reasons: { perf_loss: true }, quota_stops_count: 2, quota_stops_omitted: true }
+  const f = fixture({ remoteLifecycle: null, captureDiagnostic: diagnostic({ source: null, record: null, coverageRecords: [poll, budget] }) })
+  assert.deepEqual(JSON.parse(f.view().coverageRecords), [poll, budget])
+  assert.equal(f.view().terminalFacts, null)
+})
+
+test('a matched terminal without a stop reason keeps the specific original error excerpt', () => {
+  const note = { ...lifecycle(), qualification_failure: null, collection_returned: true, collection_status: 'partial', stop_reason: null }
+  const f = fixture({ remoteLifecycle: note, captureDiagnostic: diagnostic({ source: null, record: null,
+    terminalRecord: terminalRecord(note), errorExcerpt: 'Error: physical observation denied (os error 13)' }) })
+  assert.equal(f.view().primary, 'excerpt')
+  assert.match(f.view().cause, /physical observation denied/)
+  assert.equal(JSON.parse(f.view().terminalFacts).stop_reason, null)
+})
+
+test('foreign terminal token, relation, status and output-only claims cannot confirm terminal facts', () => {
+  const note = { ...lifecycle(), qualification_failure: null, collection_returned: true, collection_status: 'partial', stop_reason: 'perf_loss' }
+  for (const mutate of [r => { r.token = 'foreign' }, r => { r.relation = { ...r.relation, attempt_id: 'foreign' } },
+    r => { r.collection_status = 'completed' }, r => { r.agent_exited_confirmed = false }, r => { r.source = 'stderr' }]) {
+    const record = terminalRecord(note); mutate(record)
+    const f = fixture({ remoteLifecycle: note, captureDiagnostic: diagnostic({ source: null, record: null, terminalRecord: record }) })
+    assert.equal(f.view().primary, 'excerpt')
+    assert.equal(f.view().terminalFacts, null)
+    assert.match(f.view().warnings.join(' '), /结构化终态未匹配/)
+  }
+  const old = fixture({ remoteLifecycle: note, captureDiagnostic: diagnostic({ source: null, record: null, errorExcerpt: null }) })
+  assert.equal(old.view().primary, 'missing')
+  assert.equal(old.view().terminalFacts, null)
+  const output = fixture({ remoteLifecycle: null, captureDiagnostic: diagnostic({ source: 'stderr', record: terminalRecord(note), errorExcerpt: null }) })
+  assert.equal(output.view().primary, 'missing')
+})
+
+test('unknown and oversized coverage records stay diagnostic-only and are never displayed as terminal facts', () => {
+  const f = fixture({ remoteLifecycle: null, captureDiagnostic: diagnostic({ source: null, record: null, errorExcerpt: null,
+    coverageRecords: [{ schema: 'foreign/v1', collection_status: 'completed' }, { schema: 'kernsight.output-budget/v1', reason: 'x'.repeat(21000) }] }) })
+  assert.equal(f.view().coverageRecords, null)
+  assert.equal(f.view().terminalFacts, null)
+  assert.equal(f.view().primary, 'missing')
+})
+
 test('retained partial coverage is distinct from failure without altering raw cause or state', () => {
   const f = fixture({ state: 'partial', remoteLifecycle: null, captureDiagnostic: diagnostic({ source: 'stderr', record: null, errorExcerpt: 'Error: capture coverage partial: perf_poll_backlog_or_scope_gap_at_observation_end' }) })
   assert.equal(f.view().title, '覆盖不足诊断')

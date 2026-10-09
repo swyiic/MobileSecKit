@@ -1349,11 +1349,19 @@ mod planned_allocation_tests {
     }
 }
 
+/// New contracts share added time between dump and transfer. Existing plans
+/// retain their serialized caps and original monotonic stop coordinates.
+fn planned_dump_ms(total_ms: u64) -> u64 {
+    (95_000 + total_ms.saturating_sub(600_000) / 2).min(300_000)
+}
+
 impl TimePlan {
     fn validate(&self, total_ms: u64) -> Result<(), String> {
         let (archive_ms, import_ms, final_ms) = match self.schema.as_str() {
             "mobilee.session-time-plan/v1" => (60000, 75000, 140000),
-            "mobilee.session-time-plan/v2" | "mobilee.session-time-plan/v3"
+            "mobilee.session-time-plan/v2"
+            | "mobilee.session-time-plan/v3"
+            | "mobilee.session-time-plan/v4"
                 if total_ms >= 600000 =>
             {
                 (120000, 120000, 245000)
@@ -1438,7 +1446,14 @@ impl Contract {
             )]
         };
         caps.extend([
-            ("dump", if long_plan { 95000 } else { 55000 }),
+            (
+                "dump",
+                if long_plan {
+                    planned_dump_ms(total)
+                } else {
+                    55000
+                },
+            ),
             ("archive", archive_ms),
             ("import", import_ms),
             ("terminal", 5000),
@@ -1462,7 +1477,7 @@ impl Contract {
         }
         c.time_plan = Some(TimePlan {
             schema: if long_plan {
-                "mobilee.session-time-plan/v3"
+                "mobilee.session-time-plan/v4"
             } else {
                 "mobilee.session-time-plan/v1"
             }
@@ -1578,7 +1593,7 @@ mod time_plan_tests {
             )
             .unwrap();
             let p = c.time_plan.as_ref().unwrap();
-            assert_eq!(p.schema, "mobilee.session-time-plan/v3");
+            assert_eq!(p.schema, "mobilee.session-time-plan/v4");
             assert_eq!(p.final_reserve_ms, 245000);
             p.validate(600000).unwrap();
             p.validate_observations(separate, &[15, 90, 15]).unwrap();
@@ -1597,6 +1612,107 @@ mod time_plan_tests {
             }
         }
     }
+
+    #[test]
+    fn larger_new_contract_shares_time_without_renewing_retained_v3() {
+        for (seconds, dump, transfer) in [(900, 245_000, 255_000), (1200, 300_000, 500_000)] {
+            let c = Contract::new_planned_with_time(
+                Limits {
+                    total_bytes: 8 * 1024 * 1024 * 1024,
+                    max_seconds: seconds,
+                },
+                1,
+                true,
+                &[15, 90, 15],
+            )
+            .unwrap();
+            let plan = c.time_plan.as_ref().unwrap();
+            plan.validate(seconds * 1000).unwrap();
+            plan.validate_observations(true, &[15, 90, 15]).unwrap();
+            assert_eq!(
+                plan.phases
+                    .iter()
+                    .find(|p| p.kind == "dump")
+                    .unwrap()
+                    .cap_ms,
+                dump
+            );
+            assert_eq!(
+                plan.phases
+                    .iter()
+                    .find(|p| p.kind == "transfer")
+                    .unwrap()
+                    .cap_ms,
+                transfer
+            );
+            assert_eq!(
+                plan.phases.iter().map(|p| p.cap_ms).sum::<u64>(),
+                seconds * 1000
+            );
+            assert!(plan
+                .phases
+                .iter()
+                .filter(|p| matches!(p.kind.as_str(), "archive" | "import"))
+                .all(|p| p.cap_ms == 120_000));
+        }
+        let mut old = Contract::new_planned_with_time(
+            Limits {
+                total_bytes: 4 * 1024 * 1024 * 1024,
+                max_seconds: 900,
+            },
+            1,
+            true,
+            &[15, 90, 15],
+        )
+        .unwrap();
+        let plan = old.time_plan.as_mut().unwrap();
+        plan.schema = "mobilee.session-time-plan/v3".into();
+        for phase in &mut plan.phases {
+            if phase.kind == "dump" {
+                phase.cap_ms = 95_000;
+                phase.stop_at_parent_remaining_ms = Some(400_000);
+            }
+            if phase.kind == "transfer" {
+                phase.cap_ms = 405_000;
+            }
+        }
+        let before = serde_json::to_vec(&old).unwrap();
+        let restored: Contract = serde_json::from_slice(&before).unwrap();
+        restored.validate().unwrap();
+        restored
+            .time_plan
+            .as_ref()
+            .unwrap()
+            .validate_observations(true, &[15, 90, 15])
+            .unwrap();
+        assert_eq!(serde_json::to_vec(&restored).unwrap(), before);
+        // The original issued stop coordinate still rejects an expired attempt.
+        old.deadline_token = Some(super::super::session_deadline::Deadline::register(
+            Duration::from_millis(399_999),
+        ));
+        let issued = old
+            .time_plan
+            .as_ref()
+            .unwrap()
+            .phases
+            .iter()
+            .find(|p| p.kind == "dump")
+            .unwrap()
+            .stop_at_parent_remaining_ms;
+        assert!(old.begin_time_phase("dump", 1).is_err());
+        assert_eq!(
+            old.time_plan
+                .as_ref()
+                .unwrap()
+                .phases
+                .iter()
+                .find(|p| p.kind == "dump")
+                .unwrap()
+                .stop_at_parent_remaining_ms,
+            issued
+        );
+    }
+
     #[test]
     fn actual_ui_dump_elapsed_replay_keeps_old_failure_and_new_original_boundary() {
         // Retained 409f90ab UI attempt: 1791436111847 -> 1791436174889.
@@ -1837,7 +1953,9 @@ impl TimePlan {
         }
         let l1_padding = if matches!(
             self.schema.as_str(),
-            "mobilee.session-time-plan/v2" | "mobilee.session-time-plan/v3"
+            "mobilee.session-time-plan/v2"
+                | "mobilee.session-time-plan/v3"
+                | "mobilee.session-time-plan/v4"
         ) {
             15
         } else {
@@ -1860,18 +1978,22 @@ impl TimePlan {
                 return Err("父观察窗口与事前时间计划不一致".into());
             }
         }
-        if !self.phases.iter().any(|p| {
-            p.kind == "dump"
-                && p.cap_ms
-                    == if self.schema == "mobilee.session-time-plan/v3" {
-                        95000
-                    } else {
-                        55000
-                    }
-        }) || !self
+        let total_ms = self.phases.iter().try_fold(0u64, |sum, p| {
+            sum.checked_add(p.cap_ms).ok_or("时间总数溢出")
+        })?;
+        let dump_ms = match self.schema.as_str() {
+            "mobilee.session-time-plan/v4" => planned_dump_ms(total_ms),
+            "mobilee.session-time-plan/v3" => 95_000,
+            _ => 55_000,
+        };
+        if !self
             .phases
             .iter()
-            .any(|p| p.kind == "transfer" && p.cap_ms >= 30000)
+            .any(|p| p.kind == "dump" && p.cap_ms == dump_ms)
+            || !self
+                .phases
+                .iter()
+                .any(|p| p.kind == "transfer" && p.cap_ms >= 30000)
         {
             return Err("Dump/transfer时间预留无效".into());
         }

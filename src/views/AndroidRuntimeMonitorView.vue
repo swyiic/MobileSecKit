@@ -127,7 +127,7 @@
         <div v-if="captureForm.plan === 'auto'" class="wide ks-time-allocation" role="status">
           <template v-if="autoTimeAllocation"><strong>时间分配：{{ autoTimeAllocation.producer.map(phase => `${phase.key} ${phase.seconds}s`).join(' · ') }} · Dump {{ autoTimeAllocation.dumpSeconds }}s · 传输 {{ Math.max(0, autoTimeAllocation.transferSeconds) }}s · 最终 {{ autoTimeAllocation.finalSeconds }}s</strong><small>最终预留：归档 {{ autoTimeAllocation.archiveSeconds }}s、导入 {{ autoTimeAllocation.importSeconds }}s、终态 5s。L0/Linker 启动预留10s，L1/统一会话预留{{ autoTimeAllocation.longPlan ? 15 : 10 }}s；传输至少30s。{{ autoTimeAllocation.valid ? '满足时间准入；不保证所有阶段完成。' : `总期限不足，至少需要 ${autoTimeAllocation.minimumSeconds}s；未启动，请调整新父窗口或期限。` }}</small></template>
           <small v-else>观察窗必须为 1–300 秒整数，总期限必须为 30–3600 秒整数；未启动。</small>
-          <small>新任务默认4GiB、600秒，观察窗15 / 90 / 15秒；有效已保存窗口保留。缩短窗口会缩小覆盖，缺失保持未知。传输额度耗尽时保留 partial；时间准入不保证全部阶段完成。</small>
+          <small>新任务默认8GiB、900秒，观察窗15 / 90 / 15秒；有效已保存窗口保留。缩短窗口会缩小覆盖，缺失保持未知。传输额度耗尽时保留 partial；时间准入不保证全部阶段完成。</small>
         </div>
         <label v-if="captureForm.plan === 'auto'" class="wide"><span>隔离候选运行根（留空使用旧默认路径）</span><input v-model="captureForm.isolatedRoot" :disabled="captureRunning" placeholder="/data/local/tmp/ksight-candidate-本轮ID" /><small>目录、agent、BPF、资产与证据均需处于此根；不安装或替换默认工具。</small></label>
         <label v-if="captureForm.plan === 'auto' && captureForm.isolatedRoot.trim()" class="wide"><span>隔离agent绝对路径（留空为运行根/ksightd）</span><input v-model="captureForm.isolatedAgent" :disabled="captureRunning" /><span>候选完整SHA256（必填）</span><input v-model="captureForm.isolatedSha256" :disabled="captureRunning" /></label>
@@ -662,8 +662,8 @@ const captureForm = reactive({
   plan: 'auto' as 'capture' | 'dump' | 'auto',
   codeOnly:false,
   isolatedRoot:"",isolatedAgent:"",isolatedSha256:"",
-  totalBudgetMiB:4096,
-  maxSessionSeconds:600,
+  totalBudgetMiB:8192,
+  maxSessionSeconds:900,
   collectKeys:false,collectPrivate:false,collectMemoryWindows:false,
   autoSessionMode: 'startup_replay' as 'startup_replay' | 'unified',
   autoL0Seconds: 15,

@@ -171,10 +171,19 @@ export function captureTimeAllocation(durations: { l0: number; l1: number; linke
   const producer = separate
     ? [{ key: 'L0', seconds: durations.l0 + 10 }, { key: 'L1', seconds: durations.l1 + l1Padding }, { key: 'Linker', seconds: durations.linker + 10 }]
     : [{ key: '统一 session', seconds: durations.l0 + durations.l1 + durations.linker + l1Padding }]
-  const dumpSeconds = longPlan ? 95 : 55
-  const heldSeconds = producer.reduce((sum, phase) => sum + phase.seconds, 0) + dumpSeconds + finalSeconds
+  const dumpSeconds = longPlan ? Math.min(300, 95 + (totalSeconds - 600) / 2) : 55
+  const producerSeconds = producer.reduce((sum, phase) => sum + phase.seconds, 0)
+  const heldSeconds = producerSeconds + dumpSeconds + finalSeconds
   const transferSeconds = totalSeconds - heldSeconds
-  const minimumSeconds = heldSeconds + 30
+  // Solve admission under the selected plan. Dump grows with the total until
+  // 1010s; crossing 600s also increases startup and final processing reserves.
+  const shortMinimumSeconds = producerSeconds + 55 + 140 + 30
+  const longProducerSeconds = producerSeconds + (longPlan ? 0 : 5)
+  const uncappedLongMinimumSeconds = 2 * longProducerSeconds + 140
+  const longMinimumSeconds = uncappedLongMinimumSeconds <= 1010
+    ? Math.max(600, uncappedLongMinimumSeconds) : longProducerSeconds + 575
+  const minimumSeconds = Math.ceil(longPlan || shortMinimumSeconds >= 600
+    ? longMinimumSeconds : shortMinimumSeconds)
   return { producer, dumpSeconds, archiveSeconds, importSeconds, terminalSeconds: 5,
     finalSeconds, transferSeconds, minimumSeconds, longPlan, valid: transferSeconds >= 30 }
 }
