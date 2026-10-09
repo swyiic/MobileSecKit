@@ -80,6 +80,69 @@ pub(super) fn proof(
         "acceptedEvents":accepted,"committedEvents":accepted,"sealed":true}),
     )
 }
+// A quota gap is explicit omitted coverage, never synthetic loss or unread tail.
+fn confirmed_helper_quota(poll: &Value) -> bool {
+    poll.get("quota_omitted_future_events")
+        .is_some_and(Value::is_null)
+        && poll["quota_stops"].as_array().is_some_and(|stops| {
+            !stops.is_empty()
+                && stops.len() <= 256
+                && stops.iter().all(|stop| {
+                    let adapter = stop["adapter"].as_str().unwrap_or("");
+                    stop["schema"] == "kernsight.probe-quota-stop/v1"
+                        && matches!(
+                            adapter,
+                            "jni_new_string_utf"
+                                | "jni_get_string_utf_chars"
+                                | "jni_get_string_utf_length"
+                                | "jni_get_string_utf_region"
+                                | "jni_get_array_length"
+                                | "jni_get_byte_array_elements"
+                                | "jni_get_byte_array_region"
+                                | "jni_set_byte_array_region"
+                                | "jni_new_string"
+                                | "jni_get_string_length"
+                                | "jni_get_string_chars"
+                                | "jni_get_string_region"
+                                | "jni_get_string_critical"
+                                | "jni_get_char_array_elements"
+                                | "jni_get_char_array_region"
+                                | "jni_set_char_array_region"
+                                | "jni_get_primitive_array_critical"
+                                | "jni_get_direct_buffer_address"
+                                | "jni_get_direct_buffer_capacity"
+                                | "binder_parcel_string"
+                                | "binder_parcel_utf8"
+                                | "binder_parcel_int32"
+                                | "binder_parcel_int64"
+                                | "binder_parcel_uint32"
+                                | "binder_parcel_uint64"
+                                | "binder_parcel_bool"
+                                | "binder_parcel_cstring"
+                                | "binder_parcel_bytes"
+                                | "binder_parcel_fd"
+                                | "binder_parcel_dup_fd"
+                                | "binder_parcel_binder"
+                                | "binder_parcel_byte"
+                                | "binder_parcel_char"
+                        )
+                        && stop["producer_stopped"] == true
+                        && stop["coverage_partial"] == true
+                        && stop.get("stop_error").is_some_and(Value::is_null)
+                        && stop
+                            .get("omitted_future_events")
+                            .is_some_and(Value::is_null)
+                        && stop["hit_cap"].as_u64().is_some_and(|cap| {
+                            cap > 0
+                                && cap <= u64::from(u32::MAX)
+                                && stop["accepted_hits"]
+                                    .as_u64()
+                                    .is_some_and(|hits| hits >= cap && hits <= u64::from(u32::MAX))
+                        })
+                })
+        })
+}
+
 // Queue coverage is independent of closed-producer and original-source safety.
 // Require explicit, internally consistent diagnostics; never infer absent fields.
 fn safe_closed_coverage(drain: &Value, poll: &Value) -> bool {
@@ -100,7 +163,8 @@ fn safe_closed_coverage(drain: &Value, poll: &Value) -> bool {
         && poll["coverage_partial"] == true
         && (drain["lost_samples"].as_u64().is_some_and(|n| n > 0)
             || drain["unknown_tail"] == true
-            || poll["unread_tail_possible"] == true)
+            || poll["unread_tail_possible"] == true
+            || confirmed_helper_quota(poll))
 }
 pub(super) fn authorize_phase(proof: Option<Value>, safe: bool) -> Option<Value> {
     if !safe {
@@ -305,6 +369,80 @@ mod tests {
         g.stages[1].attempts[0].remote_lifecycle = Some(n);
         g.stages[1].attempts[0].coverage_continuation = authorize_phase(Some(p), true);
         g
+    }
+    #[test]
+    fn confirmed_quota_partial_can_continue_without_fabricating_perf_loss() {
+        let drain = json!({"schema":"kernsight.capture-drain/v1","producers_stopped":true,"queues_observed_empty":true,"unknown_tail":false,"rounds":2,"lost_samples":0});
+        let stop = json!({"schema":"kernsight.probe-quota-stop/v1","adapter":"binder_parcel_int32","hit_cap":1024,"accepted_hits":1024,"producer_stopped":true,"coverage_partial":true,"stop_error":null,"omitted_future_events":null});
+        let poll = json!({"schema":"kernsight.perf-poll-budget/v1","scope_failures":0,"perf_read_failures":0,"coverage_partial":true,"unread_tail_possible":false,"quota_omitted_future_events":null,"quota_stops":[stop]});
+        assert!(safe_closed_coverage(&drain, &poll));
+        assert_eq!(drain["lost_samples"], 0);
+        // Exercise the full production proof/settlement gate, not only counters.
+        let (mut g, r, mut result, lifecycle, manifest, source) = fixture();
+        result.stderr = format!("{drain}\n{poll}\nError: capture coverage partial");
+        let p = proof(
+            &g,
+            &r,
+            result.session_id.unwrap(),
+            &result,
+            &lifecycle,
+            &manifest,
+            &source,
+        )
+        .unwrap();
+        g.budget
+            .as_mut()
+            .unwrap()
+            .reserve(r.attempt_id.to_string(), "l1", now_millis())
+            .unwrap();
+        g.budget
+            .as_mut()
+            .unwrap()
+            .settle(
+                &r.attempt_id.to_string(),
+                &json!({"admitted_write_bytes":1000,"partial":true}),
+            )
+            .unwrap();
+        g.finish(
+            &r,
+            result.session_id,
+            None,
+            Some("remote_collection_partial".into()),
+        )
+        .unwrap();
+        g.stages[1].attempts[0].remote_lifecycle = Some(lifecycle);
+        g.stages[1].attempts[0].coverage_continuation = authorize_phase(Some(p), true);
+        assert!(g.continue_after_partial("l1"));
+        let snapshot = g.start("dump", epoch()).unwrap();
+        g.finish(&snapshot, None, Some("owned-dump".into()), None)
+            .unwrap();
+        let linker = g.start("linker", epoch()).unwrap();
+        g.finish(&linker, Some(Uuid::new_v4()), None, None).unwrap();
+        assert_eq!(g.state, "partial");
+        assert_eq!(g.stages[1].attempts[0].state, "partial");
+
+        for invalid in [
+            json!({"producer_stopped":false}),
+            json!({"stop_error":"detach failed"}),
+            json!({"omitted_future_events":0}),
+            json!({"accepted_hits":1023}),
+            json!({"adapter":"tls_ssl_write"}),
+            json!({"adapter":"jni_registration"}),
+            json!({"adapter":"jni_unknown"}),
+            json!({"adapter":"binder_parcel_unknown"}),
+        ] {
+            let mut bad = poll.clone();
+            for (k, v) in invalid.as_object().unwrap() {
+                bad["quota_stops"][0][k] = v.clone();
+            }
+            assert!(!safe_closed_coverage(&drain, &bad));
+        }
+        let mut missing = poll.clone();
+        missing.as_object_mut().unwrap().remove("quota_stops");
+        assert!(!safe_closed_coverage(&drain, &missing));
+        let mut unsafe_scope = poll.clone();
+        unsafe_scope["scope_failures"] = json!(1);
+        assert!(!safe_closed_coverage(&drain, &unsafe_scope));
     }
     #[test]
     fn sealed_loss_only_can_snapshot_without_upgrading_coverage() {
