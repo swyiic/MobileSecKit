@@ -89,7 +89,10 @@ fn safe_closed_coverage(drain: &Value, poll: &Value) -> bool {
         && drain["queues_observed_empty"].as_bool().is_some()
         && drain["unknown_tail"].as_bool()
             == drain["queues_observed_empty"].as_bool().map(|empty| !empty)
-        && drain["rounds"].as_u64().is_some_and(|n| n > 0)
+        // A confirmed producer stop may consume the drain allowance before
+        // the first read. That is an explicit unknown tail, never an empty ring.
+        && drain["rounds"].as_u64().is_some_and(|n| n > 0
+            || (drain["queues_observed_empty"] == false && drain["unknown_tail"] == true))
         && drain["lost_samples"].as_u64().is_some()
         && poll["scope_failures"] == 0
         && poll["perf_read_failures"] == 0
@@ -376,6 +379,56 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         assert!(proof(&g, &r, result.session_id.unwrap(), &result, &n, &m, &source).is_none());
+    }
+    #[test]
+    fn zero_round_shutdown_keeps_unknown_tail_and_requires_all_other_safety_proofs() {
+        let (g, r, mut result, n, m, source) = fixture();
+        let mut rows: Vec<Value> = result
+            .stderr
+            .lines()
+            .filter_map(|l| serde_json::from_str(l).ok())
+            .collect();
+        rows[0]["rounds"] = json!(0);
+        rows[0]["queues_observed_empty"] = json!(false);
+        rows[0]["unknown_tail"] = json!(true);
+        rows[1]["unread_tail_possible"] = json!(true);
+        result.stderr = rows
+            .iter()
+            .map(Value::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        let session = result.session_id.unwrap();
+        let p = proof(&g, &r, session, &result, &n, &m, &source).unwrap();
+        assert_eq!(p["coverage"], "incomplete_tail");
+        assert_eq!(p["drain"]["rounds"], 0);
+        assert_eq!(p["drain"]["queues_observed_empty"], false);
+        for field in ["producers_stopped", "unknown_tail"] {
+            let mut bad_rows = rows.clone();
+            bad_rows[0][field] = json!(false);
+            let mut bad = copy_result(&result);
+            bad.stderr = bad_rows
+                .iter()
+                .map(Value::to_string)
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert!(proof(&g, &r, session, &bad, &n, &m, &source).is_none());
+        }
+        let mut bad_n = n.clone();
+        bad_n["agent_exited_confirmed"] = json!(false);
+        assert!(proof(&g, &r, session, &result, &bad_n, &m, &source).is_none());
+        let mut bad_m = m.clone();
+        bad_m["writer"]["terminal_finalized"] = json!(false);
+        assert!(proof(&g, &r, session, &result, &n, &bad_m, &source).is_none());
+        let mut bad_rows = rows.clone();
+        bad_rows[0]["queues_observed_empty"] = json!(true);
+        bad_rows[0]["unknown_tail"] = json!(false);
+        let mut bad = copy_result(&result);
+        bad.stderr = bad_rows
+            .iter()
+            .map(Value::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(proof(&g, &r, session, &bad, &n, &m, &source).is_none());
     }
     #[test]
     fn missing_conflicting_or_unsafe_counter_and_identity_facts_fail_closed() {
