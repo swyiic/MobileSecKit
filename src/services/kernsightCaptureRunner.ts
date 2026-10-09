@@ -74,5 +74,12 @@ export function captureStageLabel(key: string): string {
   return ({ l0: 'L0 内核观察', l1: 'L1 TLS / JNI / Binder', dump: 'L2 代码快照', linker: 'Linker 加载观察', session: '统一阶段会话' } as Record<string, string>)[key] || key
 }
 export function captureStateLabel(state: string): string {
-  return ({ planned: '待执行', running: '采集中', succeeded: '执行结束', partial: '部分完成', failed: '采集失败', interrupted: '已中断', unavailable: '来源不可用（未启动）', cancelled: '已取消', canceled: '已取消' } as Record<string, string>)[state] || state
+  return ({ planned: '待执行', running: '采集中', succeeded: '执行结束', partial: '覆盖不足（partial）', failed: '采集失败', interrupted: '已中断', unavailable: '来源不可用（未启动）', cancelled: '已取消', canceled: '已取消' } as Record<string, string>)[state] || state
+}
+
+/** Saved evidence is usable independently of the source coverage; no state upgrade. */
+export function captureSavedOutcome(group: KernSightCaptureGroup, root: string): string {
+  const coverage = group.state === 'partial' ? '覆盖不足（partial），请核对阶段诊断'
+    : group.state === 'succeeded' ? '覆盖完整性仍按来源记录核对' : '采集未全部完成，请核对阶段记录'
+  return `本次主会话证据已保存并导入：${root}；${coverage}`
 }

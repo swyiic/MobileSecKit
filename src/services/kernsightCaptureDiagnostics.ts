@@ -4,6 +4,8 @@ type JsonRecord = Record<string, unknown>
 type FailureReceipt = { record: JsonRecord; failure: JsonRecord; source: 'remote_lifecycle' | 'stderr' | 'stdout'; trusted: boolean }
 export interface CaptureDiagnosticView {
   visible: boolean
+  coveragePartial: boolean
+  title: string
   cause: string | null
   primary: 'structured' | 'excerpt' | 'missing'
   sourceLabel: string
@@ -115,7 +117,10 @@ export function captureAttemptDiagnostics(group: KernSightCaptureGroup, attempt:
   const bytes = (value: unknown) => typeof value === 'number' && Number.isFinite(value) && value >= 0 ? `${value} B` : '未知'
   const byteLabel = diagnostic ? `原始输出计数：stdout ${bytes(diagnostic.stdoutBytes)} · stderr ${bytes(diagnostic.stderrBytes)}（不代表全部输出已留存）` : null
   return {
-    visible: hasDiagnostic, cause, primary, sourceLabel,
+    visible: hasDiagnostic,
+    coveragePartial: attempt.state === 'partial' && !receipt,
+    title: attempt.state === 'partial' && !receipt ? '覆盖不足诊断' : '失败诊断',
+    cause, primary, sourceLabel,
     scopeLabel: scope === 'controller' ? `统一采集控制器回执 · ${relation(note?.relation)?.stageKey} · attempt ${relation(note?.relation)?.attempt}；不是本阶段独立回执` : '',
     kind: display(receipt?.failure.kind), errno: display(receipt?.failure.errno),
     expected: display(receipt?.failure.expected), observed: display(receipt?.failure.observed),

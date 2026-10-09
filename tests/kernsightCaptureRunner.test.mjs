@@ -3,7 +3,7 @@ import test from 'node:test'
 import { readFileSync } from 'node:fs'
 import ts from 'typescript'
 const code = ts.transpileModule(readFileSync(new URL('../src/services/kernsightCaptureRunner.ts', import.meta.url), 'utf8'), { compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.ES2022 } }).outputText
-const { runCaptureGroupPlan, mergeCaptureResults, latestGroupSession } = await import(`data:text/javascript;base64,${Buffer.from(code).toString('base64')}`)
+const { captureSavedOutcome, runCaptureGroupPlan, mergeCaptureResults, latestGroupSession } = await import(`data:text/javascript;base64,${Buffer.from(code).toString('base64')}`)
 const initial = unified => ({ id: 'parent-a', serial: 'mock', package: 'org.example.app', unified, stages: (unified ? ['l0', 'l1', 'linker', 'dump'] : ['l0', 'l1', 'dump', 'linker']).map(key => ({ key, launchAfterAttach: !unified && key !== 'dump', attempts: [] })) })
 const result = (key, exitCode = 0) => ({ sessionId: key === 'dump' ? null : `session-${key}`, startedUnixMs: 1, finishedUnixMs: 2, stdout: `stdout-${key}`, stderr: exitCode ? `stderr-${key}` : '', commandPreview: key, exitCode })
 function harness(group, states = {}) {
@@ -146,3 +146,13 @@ test('even a mistaken continuation flag cannot run the snapshot after partial L1
   const done=await runCaptureGroupPlan(g,h.backend,h.hooks);
   assert.deepEqual(h.calls.map(c=>c[1]),['l0','l1','dump','linker']);assert.equal(done.stages[2].attempts[0].state,'unavailable');
  });
+
+test('saved partial evidence remains usable and is never described as complete capture', () => {
+  const group = { ...initial(false), state: 'partial' }
+  const before = JSON.stringify(group)
+  const message = captureSavedOutcome(group, '/retained/cmb.pb')
+  assert.match(message, /已保存并导入/)
+  assert.match(message, /覆盖不足（partial）/)
+  assert.equal(JSON.stringify(group), before)
+  assert.match(captureSavedOutcome({ ...group, state: 'failed' }, '/retained'), /采集未全部完成/)
+})

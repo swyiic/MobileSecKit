@@ -239,7 +239,7 @@
               <code v-if="attempt.remoteArtifactRoot">{{ attempt.remoteArtifactRoot }}</code>
               <small v-if="stage.launchAfterAttach">{{ startupEvidenceLabel(attempt.remoteLifecycle) }}</small>
               <small>{{ qualifiedSourceLabel(attempt.remoteLifecycle) }}</small></details>
-              <details v-if="attempt.error" class="ks-attempt-error"><summary :title="attempt.error">{{ attempt.error.split(/[；\n]/)[0] }}</summary><p>{{ attempt.error }}</p></details>
+              <details v-if="attempt.error" class="ks-attempt-error" :class="{ 'coverage-partial': attempt.state === 'partial' }"><summary :title="attempt.error">{{ attempt.error.split(/[；\n]/)[0] }}</summary><p>{{ attempt.error }}</p></details>
               <KernSightCaptureDiagnostics :group="group" :attempt="attempt" />
             </div>
           </article>
@@ -506,7 +506,7 @@
 
 <script setup lang="ts">
 import FullValue from '@/components/FullValue.vue'
-import { runCaptureGroupPlan, mergeCaptureResults, captureStateLabel, captureStageLabel, latestGroupSession } from '@/services/kernsightCaptureRunner'
+import { runCaptureGroupPlan, mergeCaptureResults, captureStateLabel, captureStageLabel, latestGroupSession, captureSavedOutcome } from '@/services/kernsightCaptureRunner'
 import { mergeCaptureGroups,groupSessionIds,captureGroupEdges,captureGroupCanTrash,captureGroupImportIsTrashed,newCaptureFromGroup } from '../services/kernsightCaptureGroups'
 import { packageEvidenceReports, importedSessionId, bundleForSession, linkedEvidenceMatches, createLatestRequest, createKeyedRequests, evidenceCountLabel, executionStatusLabel } from '../services/kernsightWorkspaceState'
 import { memoryCounterLabel, memoryEvidenceLabel } from '../services/kernsightMemoryEvidence'
@@ -2024,7 +2024,7 @@ async function executeCaptureGroup(group: KernSightCaptureGroup) {
       try {
         const bundle=await monitoringBackend.saveKernSightGroupEvidence(group.id)
         upsertBundle(bundle)
-        evidenceMessage.value=`本次主会话已保存：${bundle.root}；覆盖按原 partial/未知记录核对`
+        evidenceMessage.value=captureSavedOutcome(current, bundle.root)
       } catch(error) {
         operationErrors[`save:${group.id}`]=readableError(error)
         evidenceError.value=`已有源证据保留；自动保存未完成：${readableError(error)}`
@@ -2887,6 +2887,7 @@ details.ks-session-row pre { max-height: 360px; overflow: auto; white-space: pre
   .ks-session-list .ks-capture-group > summary > b { grid-column: 1; grid-row: auto; }
 }
 
+.ks-capture-group .ks-attempt-error.coverage-partial { color: var(--amber); background: color-mix(in srgb, var(--amber) 7%, var(--surface)); }
 .ks-module-row{padding:8px 0;border-bottom:1px solid var(--line);font-size:14px;min-width:0}.ks-module-row>div{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:4px 12px;align-items:center}.ks-module-row small{grid-column:1/-1;font-size:12px;color:var(--muted)}.ks-copy-path{display:block;min-width:0;max-width:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;border:0;background:transparent;color:inherit;text-align:left;cursor:pointer;font:inherit}.ks-source-diagnostics pre{max-height:320px;overflow:auto;font-size:12px}.ks-pull-notice>div{min-width:0;flex:1}.ks-attempt-error summary{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.ks-dex-ownership>details>summary{font-size:14px;line-height:1.6}@media(max-width:520px){.ks-module-row>div{grid-template-columns:minmax(0,1fr)}.ks-module-row small{grid-column:auto}}
 </style>
 

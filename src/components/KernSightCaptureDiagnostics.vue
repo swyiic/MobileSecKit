@@ -1,7 +1,7 @@
 <template>
-  <section v-if="diagnostics.visible" class="ks-capture-diagnostics" aria-label="阶段失败诊断">
+  <section v-if="diagnostics.visible" class="ks-capture-diagnostics" :aria-label="diagnostics.title" :class="{ 'coverage-partial': diagnostics.coveragePartial }">
     <header>
-      <strong>失败诊断</strong>
+      <strong>{{ diagnostics.title }}</strong>
       <button type="button" class="ghost-button" :disabled="copying" @click.stop="copyDiagnostics">{{ copying ? '复制中…' : '复制已留存诊断 JSON' }}</button>
     </header>
     <p class="diagnostic-source">{{ diagnostics.sourceLabel }}</p>
@@ -69,6 +69,7 @@ button { white-space: normal; max-width: 100%; }
 p { margin: 7px 0; line-height: 1.55; overflow-wrap: anywhere; }
 .diagnostic-source { color: var(--muted); }
 .diagnostic-cause { padding: 9px; color: var(--red); background: var(--surface); border-radius: 6px; }
+.coverage-partial .diagnostic-cause { color: var(--amber); }
 .diagnostic-note { color: var(--muted); }
 .diagnostic-warning { color: var(--amber); }
 .diagnostic-fields { display: grid; grid-template-columns: auto minmax(0, 1fr); gap: 5px 10px; margin: 8px 0; }

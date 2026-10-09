@@ -280,3 +280,14 @@ test('matching empty, nil or malformed lifecycle tokens stay unconfirmed', () =>
     }
   }
 })
+
+test('retained partial coverage is distinct from failure without altering raw cause or state', () => {
+  const f = fixture({ state: 'partial', remoteLifecycle: null, captureDiagnostic: diagnostic({ source: 'stderr', record: null, errorExcerpt: 'Error: capture coverage partial: perf_poll_backlog_or_scope_gap_at_observation_end' }) })
+  assert.equal(f.view().title, '覆盖不足诊断')
+  assert.equal(f.view().coveragePartial, true)
+  assert.match(f.view().cause, /capture coverage partial/)
+  assert.equal(f.attempt.state, 'partial')
+  assert.equal(fixture().view().title, '失败诊断')
+  // A concrete qualification failure must still be shown as a failure.
+  assert.equal(fixture({ state: 'partial' }).view().title, '失败诊断')
+})
