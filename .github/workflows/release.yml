@@ -36,6 +36,7 @@ jobs:
     permissions:
       contents: write
     steps:
+      - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
         with:
           path: release
@@ -45,6 +46,11 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create "${GITHUB_REF_NAME}" release/* \
-            --title "${GITHUB_REF_NAME}" \
-            --notes "ME ${GITHUB_REF_NAME} for macOS. Built by the release workflow on this tag."
+          find release -type f -print
+          if gh release view "${GITHUB_REF_NAME}" >/dev/null 2>&1; then
+            gh release upload "${GITHUB_REF_NAME}" release/* --clobber
+          else
+            gh release create "${GITHUB_REF_NAME}" release/* \
+              --title "${GITHUB_REF_NAME}" \
+              --notes "ME ${GITHUB_REF_NAME} for macOS. Built by the release workflow on this tag."
+          fi
