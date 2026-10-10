@@ -2919,8 +2919,8 @@ mod manual_time_v5 {
         )
         .is_err());
     }
-    #[test]
-    fn fixed_capture_expiry_refuses_collection_but_allows_original_save_budget() {
+    #[tokio::test(start_paused = true)]
+    async fn fixed_capture_expiry_refuses_collection_but_allows_original_save_budget() {
         let mut c = explicit(30, 15);
         c.deadline_token = Some(super::super::session_deadline::Deadline::register(
             Duration::from_millis(500040),
@@ -2942,7 +2942,7 @@ mod manual_time_v5 {
             105000
         );
         let phase = c.phase_deadline("l1").unwrap();
-        std::thread::sleep(Duration::from_millis(50));
+        tokio::time::advance(Duration::from_millis(50)).await;
         assert!(phase.check().is_err());
         assert!(c.collection_deadline().is_err());
         assert!(c
@@ -2973,29 +2973,68 @@ mod manual_time_v5 {
         assert!(p.elapsed_ms.unwrap() >= 50);
         assert!(p.finished_unix_ms.is_some());
     }
-    #[test]
-    fn preflight_and_repeat_phase_lookup_spend_first_absolute_boundary() {
+    #[tokio::test(start_paused = true)]
+    async fn preflight_and_repeat_phase_lookup_spend_first_absolute_boundary() {
         let mut c = explicit(30, 15);
         c.deadline_token = Some(super::super::session_deadline::Deadline::register(
             Duration::from_millis(500060),
         ));
+        let token = c.deadline_token;
         c.reserve("l0".into(), "l0", super::super::now_millis())
             .unwrap();
         let stop = c.time_plan.as_ref().unwrap().phases[0].stop_at_parent_remaining_ms;
+        // Preflight and repeated lookups must spend the original 60 ms lease.
+        tokio::time::advance(Duration::from_millis(10)).await;
         let first = c.phase_deadline("l0").unwrap();
-        std::thread::sleep(Duration::from_millis(25));
+        assert_eq!(first.remaining_ms().unwrap(), 50);
+        tokio::time::advance(Duration::from_millis(15)).await;
         let second = c.phase_deadline("l0").unwrap();
-        assert!(second.remaining_ms().unwrap() <= 35);
+        assert_eq!(first.remaining_ms().unwrap(), 35);
+        assert_eq!(second.remaining_ms().unwrap(), 35);
         assert_eq!(
             stop,
             c.time_plan.as_ref().unwrap().phases[0].stop_at_parent_remaining_ms
         );
-        std::thread::sleep(Duration::from_millis(40));
+        tokio::time::advance(Duration::from_millis(34)).await;
+        assert_eq!(first.remaining_ms().unwrap(), 1);
+        assert_eq!(second.remaining_ms().unwrap(), 1);
+        tokio::time::advance(Duration::from_millis(1)).await;
         assert!(first.check().is_err());
         assert!(second.check().is_err());
+        assert!(c.phase_deadline("l0").is_err());
         assert!(c
             .begin_time_phase("l0", super::super::now_millis())
             .is_err());
+        assert_eq!(c.deadline().unwrap().remaining_ms().unwrap(), 500000);
+        assert_eq!(token, c.deadline_token);
+    }
+    #[tokio::test(start_paused = true)]
+    async fn expired_preflight_cannot_acquire_or_renew_phase() {
+        for elapsed_ms in [60, 65, 1000] {
+            let mut c = explicit(30, 15);
+            c.deadline_token = Some(super::super::session_deadline::Deadline::register(
+                Duration::from_millis(500060),
+            ));
+            let token = c.deadline_token;
+            c.reserve("l0".into(), "l0", super::super::now_millis())
+                .unwrap();
+            let stop = c.time_plan.as_ref().unwrap().phases[0].stop_at_parent_remaining_ms;
+            tokio::time::advance(Duration::from_millis(elapsed_ms)).await;
+            let error = c.phase_deadline("l0").err().unwrap();
+            assert!(
+                error.contains("parent_deadline_exhausted: fixed capture/phase boundary"),
+                "{error}"
+            );
+            assert!(c
+                .begin_time_phase("l0", super::super::now_millis())
+                .is_err());
+            assert!(c.deadline().unwrap().check().is_ok());
+            assert_eq!(token, c.deadline_token);
+            assert_eq!(
+                stop,
+                c.time_plan.as_ref().unwrap().phases[0].stop_at_parent_remaining_ms
+            );
+        }
     }
     #[test]
     fn legacy_receipts_keep_original_caps_and_unknown_actual_time() {

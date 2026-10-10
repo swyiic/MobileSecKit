@@ -347,26 +347,42 @@ impl Group {
                 && self.stages[..i]
                     .last()
                     .is_some_and(|s| coverage_continuation::verified(self, s));
-            let saved_dump = previous.key == "dump"
-                && next.key == "linker"
-                && i + 1 == index
-                && previous.attempts.last().is_some_and(|attempt| {
-                    attempt.state == "partial"
-                        && attempt.remote_artifact_root.is_some()
-                        && attempt.remote_lifecycle.as_ref().is_some_and(|note| {
-                            note["collection_returned"] == true
-                                && note["collection_status"] == "partial"
-                        })
-                });
             if !(self.quota_partial_closed(previous) && (independent || replaced))
                 && !(coverage && (independent || (next.key == "dump" && i + 1 == index)))
                 && !source_absent
-                && !saved_dump
             {
                 return Err("前置必需阶段未成功或依赖/清理未确认".into());
             }
         }
         Ok(())
+    }
+    // Retained bytes do not prove complete coverage or authorize a successor.
+    // Called only after the output receipt has passed budget settlement.
+    fn record_partial_settlement(
+        &mut self,
+        r: &Relation,
+        note: &Value,
+        remaining_ms: u64,
+        error: Option<&str>,
+    ) {
+        if let Some(a) = self
+            .stages
+            .iter_mut()
+            .flat_map(|s| s.attempts.iter_mut())
+            .find(|a| a.relation == *r)
+        {
+            a.state = "partial".into();
+            a.error = Some(diagnostics::partial_stage_error(
+                &r.stage_key,
+                note["reason"]
+                    .as_str()
+                    .or_else(|| note["host_time_fence"].as_str())
+                    .unwrap_or("原因未确认"),
+                remaining_ms,
+                error,
+            ));
+        }
+        self.refresh();
     }
     fn continue_after_partial(&self, key: &str) -> bool {
         let Some(index) = self.stages.iter().position(|s| s.key == key) else {
@@ -1112,25 +1128,15 @@ async fn run_group_stage_at(
                 let settlement = b.settle(&r.attempt_id.to_string(), &note);
                 let settled = settlement.is_ok();
                 continuation_phase_safe &= settled;
-                let kept_copy = settled
+                if settled
                     && note["partial"] == true
                     && note["reason"].as_str() == Some("bound_code_copy_partial")
-                    && note["admitted_write_bytes"].as_u64().unwrap_or(0) > 0;
-                if kept_copy {
-                    if let Some(reservation) = b
-                        .reservations
-                        .iter_mut()
-                        .find(|item| item.id == r.attempt_id.to_string())
-                    {
-                        reservation.status = "admitted_plus_terminal_reserve".into();
-                    }
+                    && note["admitted_write_bytes"].as_u64().unwrap_or(0) > 0
+                {
                     let admitted = note["admitted_write_bytes"].as_u64().unwrap_or(0);
                     saved_copy_note = Some(format!(
                         "代码快照未拷完：已写入 {admitted} 字节。已保存的文件可以分析。"
                     ));
-                    // The runner stops the parent when this error is set, even if
-                    // the attempt itself was accepted. Linker must still run.
-                    error = None;
                 }
                 if let Err(e) = settlement {
                     if let Some(a) = g
@@ -1145,29 +1151,12 @@ async fn run_group_stage_at(
                     g.refresh();
                 }
                 if note["partial"] == true && settled {
-                    if let Some(a) = g
-                        .stages
-                        .iter_mut()
-                        .flat_map(|s| s.attempts.iter_mut())
-                        .find(|a| a.relation == r)
-                    {
-                        if kept_copy {
-                            a.state = "succeeded".into();
-                            a.error = None;
-                        } else {
-                            a.state = "partial".into();
-                            a.error = Some(diagnostics::partial_stage_error(
-                                &stage.key,
-                                note["reason"]
-                                    .as_str()
-                                    .or_else(|| note["host_time_fence"].as_str())
-                                    .unwrap_or("原因未确认"),
-                                deadline.remaining_ms().unwrap_or(0),
-                                error.as_deref(),
-                            ));
-                        }
-                    }
-                    g.refresh();
+                    g.record_partial_settlement(
+                        &r,
+                        &note,
+                        deadline.remaining_ms().unwrap_or(0),
+                        error.as_deref(),
+                    );
                 }
             }
         }
@@ -1500,6 +1489,55 @@ mod tests {
         g.finish(&r, Some(Uuid::new_v4()), None, None).unwrap();
         assert_eq!(g.stages[2].attempts[0].state, "partial");
         assert_eq!(g.state, "partial");
+    }
+    #[test]
+    fn retained_copy_settlement_keeps_partial_and_requires_safe_linker_proof() {
+        let mut g = coverage_partial_dump_group();
+        let relation = g.stages[2].attempts[0].relation.clone();
+        let artifact = g.stages[2].attempts[0].remote_artifact_root.clone();
+        let note = serde_json::json!({
+            "admitted_write_bytes": 1000,
+            "partial": true,
+            "reason": "bound_code_copy_partial"
+        });
+        g.budget
+            .as_mut()
+            .unwrap()
+            .settle(&relation.attempt_id.to_string(), &note)
+            .unwrap();
+        g.record_partial_settlement(&relation, &note, 60000, Some("remote_collection_partial"));
+        assert_eq!(g.state, "partial");
+        assert_eq!(g.stages[2].attempts[0].state, "partial");
+        assert!(g.stages[2].attempts[0].error.is_some());
+        assert_eq!(g.stages[2].attempts[0].remote_artifact_root, artifact);
+        let reservation = g
+            .budget
+            .as_ref()
+            .unwrap()
+            .reservations
+            .iter()
+            .find(|item| item.id == relation.attempt_id.to_string())
+            .unwrap();
+        assert_eq!(reservation.status, "partial");
+        assert!(reservation.charged_bytes.is_some());
+        assert!(g.continue_after_partial("dump"));
+
+        let mut unconfirmed = g.clone();
+        unconfirmed.stages[2].attempts[0]
+            .remote_lifecycle
+            .as_mut()
+            .unwrap()["agent_exited_confirmed"] = serde_json::json!(false);
+        assert!(!unconfirmed.continue_after_partial("dump"));
+        assert!(unconfirmed.start("linker", epoch()).is_err());
+        assert_eq!(
+            unconfirmed.stages[2].attempts[0].remote_artifact_root,
+            artifact
+        );
+
+        let next = g.start("linker", epoch()).unwrap();
+        g.finish(&next, Some(Uuid::new_v4()), None, None).unwrap();
+        assert_eq!(g.state, "partial");
+        assert_eq!(g.stages[2].attempts[0].state, "partial");
     }
     #[test]
     fn static_child_quota_proof_allows_only_owned_independent_linker() {
