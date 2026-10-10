@@ -1505,12 +1505,7 @@ mod tests {
             .unwrap()
             .settle(&relation.attempt_id.to_string(), &note)
             .unwrap();
-        g.record_partial_settlement(
-            &relation,
-            &note,
-            60000,
-            Some("remote_collection_partial"),
-        );
+        g.record_partial_settlement(&relation, &note, 60000, Some("remote_collection_partial"));
         assert_eq!(g.state, "partial");
         assert_eq!(g.stages[2].attempts[0].state, "partial");
         assert!(g.stages[2].attempts[0].error.is_some());
@@ -1534,7 +1529,10 @@ mod tests {
             .unwrap()["agent_exited_confirmed"] = serde_json::json!(false);
         assert!(!unconfirmed.continue_after_partial("dump"));
         assert!(unconfirmed.start("linker", epoch()).is_err());
-        assert_eq!(unconfirmed.stages[2].attempts[0].remote_artifact_root, artifact);
+        assert_eq!(
+            unconfirmed.stages[2].attempts[0].remote_artifact_root,
+            artifact
+        );
 
         let next = g.start("linker", epoch()).unwrap();
         g.finish(&next, Some(Uuid::new_v4()), None, None).unwrap();
