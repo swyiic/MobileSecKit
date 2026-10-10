@@ -3,7 +3,8 @@ export function codeEvidenceLabel(notes?: Array<Record<string, any>>): string {
   return notes.map(note => {
     if (note.schema === 'mobilee.bound-runtime-range/v1') {
       const read = note.read || {}
-      return `${note.mapping?.path || '映射来源未知'} · 请求 ${read.requested_length ?? '未知'} B / 实际读 ${read.actual_length ?? '未知'} B / 留存 ${note.retained_file_bytes ?? '未知'} B · ${note.local_content_status === 'complete_range_hash_verified' ? '完整范围 hash 已核对' : '范围内容未验证'} · 读取 ${read.read_status || '未知'} / 落盘 ${read.write_status || '未知'} · torn ${typeof read.torn === 'boolean' ? String(read.torn) : '未知'} · ${note.source_identity_status || '实例来源未知'} · DEX/SO 解析与分类未知（范围 hash 不证明完整映射）`
+      const analysis = note.inventory_role === 'lightweight_range_ledger' ? `代码检查 ${note.inspection_status || '未知'}（详情按已验证内容关联）` : 'DEX/SO 解析与分类未知'
+      return `${note.mapping?.path || '映射来源未知'} · 请求 ${read.requested_length ?? '未知'} B / 实际读 ${read.actual_length ?? '未知'} B / 留存 ${note.retained_file_bytes ?? '未知'} B · ${note.local_content_status === 'complete_range_hash_verified' ? '完整范围 hash 已核对' : '范围内容未验证'} · 读取 ${read.read_status || '未知'} / 落盘 ${read.write_status || '未知'} · torn ${typeof read.torn === 'boolean' ? String(read.torn) : '未知'} · ${note.source_identity_status || '实例来源未知'} · ${analysis}（范围 hash 不证明完整映射）`
     }
     if (note.schema === 'kernsight.bounded-code-range/v1') {
       const read = note.read || {}
@@ -124,9 +125,10 @@ export function dexScanSummaryForObject(observations: unknown, sha: unknown): st
 }
 
 /** Scan position, stop reason, and unread tail for this file. Missing fields stay 未知. */
-export function fileScanLabel(observations: unknown, file: { relativePath?: string; relative_path?: string; codeEvidence?: Array<Record<string, any>>; code_evidence?: Array<Record<string, any>>; sha256?: string }): string {
+export function fileScanLabel(observations: unknown, file: { relativePath?: string; relative_path?: string; codeEvidence?: Array<Record<string, any>>; code_evidence?: Array<Record<string, any>>; sha256?: string }, ledger?: any): string {
   const filePath = file.relativePath || file.relative_path || ''
-  const notes = file.codeEvidence || file.code_evidence || []
+  const noteValues = file.codeEvidence || file.code_evidence
+  const notes = Array.isArray(noteValues) ? noteValues : []
   const shas: string[] = []
   const retainedShas: string[] = []
   if (typeof file.sha256 === 'string' && file.sha256) shas.push(file.sha256)
@@ -139,7 +141,12 @@ export function fileScanLabel(observations: unknown, file: { relativePath?: stri
       if (typeof value === 'string' && value && !shas.includes(value)) shas.push(value)
     }
   }
-  const lines = scanLines(observations, shas, filePath, true, file.sha256 ? [file.sha256] : retainedShas)
+  const aliasRows = notes.flatMap(note => {
+    const resolved = runtimeInventoryInspection(ledger, note)
+    return resolved ? [{ ...resolved.range, object_inspection:resolved.inspection }] : []
+  })
+  const rows = aliasRows.length ? aliasRows.concat(Array.isArray(observations) ? observations.filter(row => !record(row) || observationArtifactPath(row) !== filePath) : []) : observations
+  const lines = scanLines(rows, shas, filePath, true, file.sha256 ? [file.sha256] : retainedShas)
   return lines.length ? lines.join('；') : `来源未知 · ${dexScanSummary({})}`
 }
 
@@ -188,31 +195,184 @@ export function elfLoadCoverageLabel(value: unknown): string {
   return value === true ? '列示范围全部覆盖' : value === false ? '仍有缺口' : '未知（缺字段）'
 }
 
-/** Resolve a full class index through the exact displayed runtime source, never a stale row pointer. */
-export function runtimeDexClassMatches(ledger: any, object: any, query: string): {total:number;classes:string[];omitted:number} {
-  const direct:string[] = Array.isArray(object?.classes) ? object.classes : []
-  let classes = direct
-  if (!classes.length) {
-    const source=object?.sources?.find((s:any)=>s.kind==='runtime')
-    const row=source ? ledger?.runtime_observations?.[source.row_index] : undefined
-    const identityOk = row && row.source_report===source.source_report && row.read?.sha256===source.range_sha256 && !['package','pid','uid','birth_ns','exec_id','boot_id'].some(k=>row.source?.[k]!==source.source?.[k])
-    const dex=identityOk ? row.object_inspection?.derived_objects?.find((d:any)=>d.sha256===object.sha256 && d.length===object.bytes) : undefined
-    classes = dex?.class_index?.classes || []
-  }
-  const needle = query.toLowerCase()
-  const matches=classes.filter(c=>c.toLowerCase().includes(needle))
-  // The stored index is complete up to the producer cap. This window is only
-  // the on-screen list; `total` and `omitted` stay visible beside it.
-  const shown = matches.slice(0, 500)
-  return {total:matches.length,classes:shown,omitted:Math.max(0, matches.length-shown.length)}
+export type DexClassMatchResult = {
+  total: number | null
+  classes: string[]
+  omitted: number
+  status: 'indexed' | 'unlinked' | 'unknown'
+  offset: number
+  nextOffset: number | null
 }
 
-export function indexedDexCount(dump:any):number|null {
-  const sets=[...(dump?.dex_sets || []),...(dump?.content_dex_class_index?.objects || [])]
-  const keys=new Set(sets.filter((s:any)=>/^[a-f0-9]{64}$/i.test(s.sha256 || '') && Number.isSafeInteger(s.bytes) && s.bytes>=0).map((s:any)=>`${s.sha256}:${s.bytes}`))
-  if(keys.size || dump?.content_dex_class_index) return keys.size
-  const old=dump?.dex_index?.unique_dex ?? dump?.readable_dex
-  return Number.isSafeInteger(old) && old>=0 ? old : null
+const record = (value: any): value is Record<string, any> => Boolean(value) && typeof value === 'object' && !Array.isArray(value)
+const finiteCount = (value: any): value is number => Number.isSafeInteger(value) && value >= 0
+const dexKey = (value: any): string | null => record(value) && /^[a-f0-9]{64}$/i.test(value.sha256 || '') && finiteCount(value.bytes) ? `${value.sha256.toLowerCase()}:${value.bytes}` : null
+const strings = (value: any): value is string[] => Array.isArray(value) && value.every(item => typeof item === 'string')
+
+/** The same object inventory drives the headline and independent object list. */
+export function projectDexEvidence(dump: any): { objects: any[]; reportedCount: number | null; status: 'objects' | 'reported_count_only' | 'empty' | 'unknown'; warnings: string[] } {
+  const objects = new Map<string, any>()
+  const warnings: string[] = []
+  const sourceProjection = dump?.content_dex_class_index?.runtime_inventory_projection
+  if (record(sourceProjection) && sourceProjection.complete !== true) {
+    const count = (value: unknown) => finiteCount(value) ? String(value) : '未知'
+    warnings.push(`已验证 DEX 范围的来源关联${sourceProjection.complete === false ? '不完整' : '状态未知'}：无效 ${count(sourceProjection.invalid_rows)} 条，未列入 ${count(sourceProjection.omitted_links)} 条，未匹配 ${count(sourceProjection.unmatched_dex_links)} 条；这只说明来源关联，不代表所有范围已验证或代码分析完成。`)
+  }
+  const content = dump?.content_dex_class_index?.objects
+  const sets = dump?.dex_sets
+  if (content !== undefined && !Array.isArray(content)) warnings.push('本地结构对象明细格式无效，原记录仍保留。')
+  if (sets !== undefined && !Array.isArray(sets)) warnings.push('生产者 DEX Set 明细格式无效，原记录仍保留。')
+  for (const object of Array.isArray(content) ? content : []) {
+    const key = dexKey(object)
+    if (!key) { warnings.push('结构对象缺少有效 SHA-256/长度，未计入可展开对象。'); continue }
+    if (!Array.isArray(object.sources)) warnings.push('结构对象来源明细未知。')
+    const previous = objects.get(key)
+    const sources = Array.isArray(object.sources) ? object.sources.filter(record) : []
+    if (previous) { previous.sources.push(...sources); continue }
+    objects.set(key, { ...object, sources, legacy_observations: [], display_index_origin: 'local_content_index' })
+  }
+  for (const set of Array.isArray(sets) ? sets : []) {
+    const key = dexKey(set)
+    if (!key) { warnings.push('DEX Set 缺少有效 SHA-256/长度，未计入可展开对象。'); continue }
+    const observations = Array.isArray(set.observations) ? set.observations.filter(record) : []
+    const source = { kind: 'producer_dex_set', relative_path: typeof set.canonical_relative_path === 'string' ? set.canonical_relative_path : null, observations, verification: 'producer_record_only_not_reverified_here' }
+    const previous = objects.get(key)
+    if (previous) { previous.legacy_observations.push(source); continue }
+    const semantic = record(set.semantic) ? set.semantic : null
+    const classes = strings(semantic?.class_descriptors) ? semantic.class_descriptors : undefined
+    objects.set(key, {
+      sha256: set.sha256, bytes: set.bytes, sources: [source], legacy_observations: [],
+      classes, declared_classes: finiteCount(semantic?.class_defs) ? semantic.class_defs : null,
+      indexed_classes: classes ? classes.length : null,
+      class_index_status: classes ? (semantic?.class_descriptors_truncated ? 'producer_class_samples_truncated' : 'producer_class_samples') : 'unknown',
+      validation_status: 'unknown; producer_record_only_not_reverified_here', ownership: 'unknown',
+      display_index_origin: 'producer_dex_set',
+    })
+  }
+  const rows = Array.from(objects.values())
+  const old = dump?.dex_index?.unique_dex ?? dump?.readable_dex
+  const reported = rows.length || (finiteCount(old) ? old : (Array.isArray(content) || Array.isArray(sets) ? 0 : null))
+  return {
+    objects: rows, reportedCount: reported,
+    status: rows.length ? 'objects' : reported === null ? 'unknown' : reported > 0 ? 'reported_count_only' : 'empty',
+    warnings: Array.from(new Set(warnings)),
+  }
+}
+
+function sameMetadata(left: any, right: any): boolean {
+  if (left === right) return true
+  if (Array.isArray(left) && Array.isArray(right)) return left.length === right.length && left.every((value, index) => sameMetadata(value, right[index]))
+  if (!record(left) || !record(right)) return false
+  const keys = Object.keys(left)
+  return keys.length === Object.keys(right).length && keys.every(key => Object.prototype.hasOwnProperty.call(right, key) && sameMetadata(left[key], right[key]))
+}
+
+function isInventorySource(source: any): boolean {
+  return record(source) && (source.kind === 'runtime_range_inventory' || source.kind === 'runtime' && (source.inventory_row_index !== undefined || source.source_projection_verification !== undefined))
+}
+
+/** A lightweight alias retains its own identity; only its verified content inspection is shared. */
+export function runtimeInventoryInspection(ledger: any, source: any): { range: Record<string, any>; inspection: Record<string, any> } | null {
+  if (!record(source) || !Array.isArray(ledger?.runtime_range_inventory)) return null
+  const alias = isInventorySource(source)
+  const projectionVerification = source.kind === 'runtime' ? source.source_projection_verification : source.verification
+  if (alias && (projectionVerification !== 'current_verified_range_and_shared_content_inspection' || !finiteCount(source.inventory_row_index))) return null
+  if (!alias && (source.inventory_role !== 'lightweight_range_ledger' || source.schema !== 'mobilee.bound-runtime-range/v1')) return null
+  const candidates = alias ? [ledger.runtime_range_inventory[source.inventory_row_index]] : ledger.runtime_range_inventory
+  const sha = source.source_report_sha256
+  if (!/^[a-f0-9]{64}$/i.test(sha || '') || !finiteCount(source.source_record_index) || !record(source.source) || typeof source.relative_path !== 'string' || !source.relative_path) return null
+  if (!Array.isArray(ledger.runtime_source_diagnostics) || !ledger.runtime_source_diagnostics.some((diagnostic: any) => record(diagnostic) && diagnostic.source_report === source.source_report && diagnostic.source_report_sha256 === sha)) return null
+  const rows = candidates.filter((row: any) => record(row) && row.schema === 'mobilee.bound-runtime-range/v1' && row.inventory_role === 'lightweight_range_ledger'
+    && row.source_report === source.source_report && row.source_report_sha256 === sha && row.source_record_index === source.source_record_index
+    && row.relative_path === source.relative_path && sameMetadata(row.source, source.source)
+    && (alias ? row.read?.sha256 === source.range_sha256 && row.inspection_ref === source.inspection_ref && row.inspection_content_key === source.inspection_content_key : sameMetadata(row.read, source.read) && sameMetadata(row.mapping, source.mapping)))
+  if (rows.length !== 1) return null
+  const row = rows[0]
+  const identity = row.source
+  if (typeof identity.package !== 'string' || !identity.package || typeof identity.boot_id !== 'string' || !identity.boot_id || !['pid','uid','birth_ns','exec_id'].every(key => finiteCount(identity[key])) || !identity.pid || !identity.birth_ns) return null
+  if (row.local_content_status !== 'complete_range_hash_verified' || !finiteCount(row.inspection_ref) || !/^[a-f0-9]{64}$/i.test(row.read?.sha256 || '') || !finiteCount(row.read?.actual_length)
+      || row.inspection_content_key !== `${row.read.sha256}:${row.read.actual_length}`) return null
+  const heavy = ledger.runtime_observations?.[row.inspection_ref]
+  if (!record(heavy) || heavy.local_content_status !== 'complete_range_hash_verified' || heavy.read?.sha256 !== row.read.sha256 || heavy.read?.actual_length !== row.read.actual_length || !record(heavy.object_inspection)) return null
+  return { range:row, inspection:heavy.object_inspection }
+}
+
+function inventoryHasDex(ledger: any, source: any): boolean {
+  const resolved = runtimeInventoryInspection(ledger, source)
+  return Boolean(resolved && Array.isArray(resolved.inspection.derived_objects) && resolved.inspection.derived_objects.some((dex: any) => record(dex) && dex.kind === 'dex' && /^[a-f0-9]{64}$/i.test(dex.sha256 || '') && finiteCount(dex.length) && finiteCount(dex.source_offset) && dex.source_offset + dex.length <= resolved.range.read.actual_length))
+}
+
+/** File inventory is separate from logical objects; a container is included only through an exact selected-report or retained-note DEX relationship. */
+export function matchesReadableDexEvidence(file: any, dump: any): boolean {
+  const path = file?.relativePath || file?.relative_path
+  if (typeof path !== 'string' || !path) return false
+  if (/^(?:readable-dex\/|(?:runtime\/)?blob-dex\/|runtime\/mem-).*\.dex$/i.test(path)) return true
+  if (Array.isArray(dump?.artifacts) && dump.artifacts.some((artifact: any) => record(artifact) && artifact.kind === 'dex' && artifact.relative_path === path)) return true
+  if (Array.isArray(dump?.dex_sets) && dump.dex_sets.some((set: any) => dexKey(set) && set.canonical_relative_path === path)) return true
+  if (Array.isArray(dump?.content_dex_class_index?.objects) && dump.content_dex_class_index.objects.some((object: any) => dexKey(object) && Array.isArray(object.sources) && object.sources.some((source: any) => record(source) && source.relative_path === path && (!isInventorySource(source) || inventoryHasDex(dump?.local_storage_accounting, source))))) return true
+  const notes = file?.codeEvidence || file?.code_evidence
+  if (Array.isArray(notes) && notes.some((note: any) => note?.relative_path === path && inventoryHasDex(dump?.local_storage_accounting, note))) return true
+  return Array.isArray(notes) && notes.some((note: any) => record(note) && note.inventory_role !== 'lightweight_range_ledger' && note.relative_path === path && note.local_content_status === 'complete_range_hash_verified' && Array.isArray(note.object_inspection?.derived_objects) && note.object_inspection.derived_objects.some((object: any) => record(object) && object.kind === 'dex' && /^[a-f0-9]{64}$/i.test(object.sha256 || '') && finiteCount(object.length)))
+}
+
+/** Missing/unlinked class indexes have no measured match count. Exact qualified source identity and range/content hashes remain required. */
+export function runtimeDexClassMatches(ledger: any, object: any, query: string, offset = 0): DexClassMatchResult {
+  const unavailable = (status: 'unlinked' | 'unknown'): DexClassMatchResult => ({ total: null, classes: [], omitted: 0, status, offset: 0, nextOffset: null })
+  if (!record(object)) return unavailable('unknown')
+  let classes: string[] | undefined
+  if (object.classes !== undefined) {
+    if (!strings(object.classes)) return unavailable('unknown')
+    classes = object.classes
+  }
+  let qualified = false
+  if (!classes) {
+    const runtime = Array.isArray(ledger?.runtime_observations) ? ledger.runtime_observations.filter(record) : []
+    for (const source of Array.isArray(object.sources) ? object.sources : []) {
+      if (!record(source)) continue
+      if (isInventorySource(source)) {
+        qualified = true
+        const resolved = runtimeInventoryInspection(ledger, source)
+        if (!resolved || !finiteCount(source.source_offset) || !finiteCount(object.bytes) || source.source_offset + object.bytes > resolved.range.read.actual_length) continue
+        if (source.source_absolute_start != null && (!finiteCount(resolved.range.read.actual_start) || source.source_absolute_start !== resolved.range.read.actual_start + source.source_offset)) continue
+        for (const dex of Array.isArray(resolved.inspection.derived_objects) ? resolved.inspection.derived_objects : []) {
+          if (!record(dex) || dex.sha256 !== object.sha256 || dex.length !== object.bytes || dex.source_offset !== source.source_offset) continue
+          if (strings(dex.class_index?.classes)) { classes = dex.class_index.classes; break }
+        }
+        if (classes) break
+        continue
+      }
+      if (source.kind !== 'runtime') continue
+      const identity = source.source
+      const validIdentity = record(identity) && typeof identity.package === 'string' && !!identity.package && typeof identity.boot_id === 'string' && !!identity.boot_id && ['pid', 'uid', 'birth_ns', 'exec_id'].every(key => finiteCount(identity[key]))
+      if (!validIdentity || typeof source.source_report !== 'string' || !source.source_report || !/^[a-f0-9]{64}$/i.test(source.range_sha256 || '')) continue
+      qualified = true
+      const indexed = finiteCount(source.row_index) ? ledger?.runtime_observations?.[source.row_index] : null
+      const rows = record(indexed) ? [indexed, ...runtime.filter((row: any) => row !== indexed)] : runtime
+      for (const row of rows) {
+        if (row.source_report !== source.source_report || row.read?.sha256 !== source.range_sha256 || !record(row.source) || ['package', 'pid', 'uid', 'birth_ns', 'exec_id', 'boot_id'].some(key => row.source[key] !== identity[key])) continue
+        for (const dex of Array.isArray(row.object_inspection?.derived_objects) ? row.object_inspection.derived_objects : []) {
+          if (!record(dex) || dex.sha256 !== object.sha256 || dex.length !== object.bytes) continue
+          if (source.source_offset != null && (!finiteCount(source.source_offset) || dex.source_offset !== source.source_offset)) continue
+          const rangeLength = row.read?.actual_length ?? row.read?.actual_bytes
+          if (source.source_offset != null && finiteCount(rangeLength) && source.source_offset + object.bytes > rangeLength) continue
+          if (strings(dex.class_index?.classes)) { classes = dex.class_index.classes; break }
+        }
+        if (classes) break
+      }
+      if (classes) break
+    }
+  }
+  if (!classes) return unavailable(qualified ? 'unlinked' : 'unknown')
+  const needle = String(query || '').toLowerCase()
+  const matches = classes.filter(value => value.toLowerCase().includes(needle))
+  const start = finiteCount(offset) ? Math.min(offset, Math.max(0, matches.length - 1)) : 0
+  const shown = matches.slice(start, start + 500)
+  const nextOffset = start + shown.length < matches.length ? start + shown.length : null
+  return { total: matches.length, classes: shown, omitted: Math.max(0, matches.length - shown.length), status: 'indexed', offset: start, nextOffset }
+}
+
+export function indexedDexCount(dump: any): number | null {
+  return projectDexEvidence(dump).reportedCount
 }
 
 export function indexedElfModuleCount(dump:any):number|null {
@@ -223,10 +383,11 @@ export function indexedElfModuleCount(dump:any):number|null {
 
 /** Diagnostic objects stay searchable but never enter the checksum/declared-span verified group. */
 export function dexObjectGroups(objects:any[] = []):Array<{kind:string;label:string;objects:any[]}> {
+  const entries = Array.isArray(objects) ? objects.filter(record) : []
   const verified=(o:any)=>o.sha1_signature_verified===true && o.adler32_checksum_verified===true && o.validation_status==='checksum_and_bounded_structure_verified' && o.layout_diagnostics?.status==='declared_spans_cover_file'
   return [
-    {kind:'verified',label:'校验通过的结构对象（有界检查，仍不证明完整业务恢复）',objects:objects.filter(verified)},
-    {kind:'diagnostic',label:'诊断对象：校验失败、布局异常或未知（不进入校验通过计数）',objects:objects.filter(o=>!verified(o))},
+    {kind:'verified',label:'校验通过的结构对象（有界检查，仍不证明完整业务恢复）',objects:entries.filter(verified)},
+    {kind:'diagnostic',label:'诊断对象：校验失败、布局异常或未知（不进入校验通过计数）',objects:entries.filter(o=>!verified(o))},
   ].filter(g=>g.objects.length>0)
 }
 export function verifiedDexObjectCount(dump:any):number|null {

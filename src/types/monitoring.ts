@@ -102,6 +102,8 @@ export interface KernSightSessionReportDocument {
 export interface KernSightCaptureRequest {
   runtimePaths?:{root:string;agentPath:string;expectedSha256:string}|null
   sessionBudget?:{totalBytes:number;maxSeconds:number}|null
+  captureTime?:{maxSeconds:number;l2MaxSeconds:number}|null
+  saveTime?:{transferMaxSeconds:number;archiveMaxSeconds:number;importMaxSeconds:number}|null
   codeOnly?:boolean
   collectKeys?:boolean
   collectPrivate?:boolean
@@ -211,6 +213,35 @@ export interface KernSightEvidenceFileContent {
   truncated: boolean
   encoding: 'base64' | string
   content: string
+}
+
+export interface KernSightBoundSourcePage {
+  schema: 'mobilee.bound-source-page/v1'
+  sourceReport: string
+  sourceSha256: string
+  offset: number
+  limit: number
+  totalRecords: number
+  nextOffset: number | null
+  records: Array<{ sourceRecordIndex: number; producerRecord: unknown }>
+}
+
+export interface KernSightRuntimeRangeInventoryEntry extends Record<string, any> {
+  schema: 'mobilee.bound-runtime-range/v1'
+  inventory_role?: 'lightweight_range_ledger'
+  source_report: string
+  source_report_sha256: string
+  source_record_index: number
+  relative_path: string
+  source: Record<string, unknown>
+  mapping: Record<string, unknown>
+  read: Record<string, any>
+  local_content_status: 'complete_range_hash_verified' | 'unknown_or_failed'
+  content_verification_failure_reason?: string | null
+  inspection_status?: string
+  inspection_ref?: number | null
+  inspection_content_key?: string | null
+  inspection_summary?: Record<string, unknown>
 }
 
 export interface KernSightLocalEvidenceBundle {
@@ -411,7 +442,7 @@ export interface KernSightPackageDumpReport {
   deduplicated_bytes?: number
   mobilee_archive_coverage?: { status: 'partial' | 'unknown'; scope?: string; complete_collection?: false }
   mobilee_transport_status?: { complete: false; status: 'partial'; notes: Array<Record<string, unknown>>; scope: string }
-  local_storage_accounting?: { logical_file_bytes: number; allocated_bytes: number | null; verified_code_duplicate_bytes: number; runtime_observations?: Array<Record<string, any>>; elf_module_observations?: Array<Record<string, any>>; runtime_source_diagnostics?: Array<Record<string, unknown>>; [key: string]: unknown }
+  local_storage_accounting?: { logical_file_bytes: number; allocated_bytes: number | null; verified_code_duplicate_bytes: number; runtime_observations?: Array<Record<string, any>>; runtime_range_inventory?: KernSightRuntimeRangeInventoryEntry[]; elf_module_observations?: Array<Record<string, any>>; runtime_source_diagnostics?: Array<Record<string, unknown>>; [key: string]: unknown }
   content_dex_class_index?: { schema: string; scope: string; objects: Array<{sha256: string; bytes: number; sources: Array<Record<string, any>>; ownership: string; declared_classes: number | null; indexed_classes: number | null; omitted_classes?: number | null; classes?: string[]; declared_file_bytes?: number | null; length_matches_declared?: boolean | null; class_index_status: string; layout_diagnostics?: Record<string, any>; validation_status?: string; sha1_signature_verified?: boolean | null; adler32_checksum_verified?: boolean | null; class_hints?: Record<string, number>}> }
   apk_member_evidence?: { observations?: Array<Record<string, any>>; omitted_observations?: number; status?: string }
   storage_accounting?: string | null
@@ -456,7 +487,7 @@ export interface KernSightCaptureAttempt {
   stageRecords: Array<Record<string, unknown>>
 }
 export interface KernSightCaptureGroup {
-  budget?:{schema:string;timePlan?:{schema:string;phases:Array<{kind:string;capMs:number;stopAtParentRemainingMs?:number|null;completed?:boolean}>}|null;limits:{totalBytes:number;maxSeconds:number};deadlineUnixMs:number;reservations:Array<{id:string;kind:string;reservedBytes:number;chargedBytes:number|null;status:string}>}|null
+  budget?:{schema:string;timePlan?:{schema:string;captureMaxMs?:number;l2MaxMs?:number;captureStopAtParentRemainingMs?:number;phases:Array<{kind:string;capMs:number;stopAtParentRemainingMs?:number|null;completed?:boolean;startedUnixMs?:number;finishedUnixMs?:number;elapsedMs?:number}>}|null;limits:{totalBytes:number;maxSeconds:number};deadlineUnixMs:number;reservations:Array<{id:string;kind:string;reservedBytes:number;chargedBytes:number|null;status:string}>}|null
   schema:'mobilee.capture-group/v1';id:string;serial:string;package:string;createdUnixMs:number;cancelRequested:boolean;
   state:string;unified?:boolean;base:Record<string,unknown>;
   stages:Array<{id:string;key:string;mode:string;durationSeconds:number;launchAfterAttach:boolean;required:boolean;

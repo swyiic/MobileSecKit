@@ -1,5 +1,6 @@
 mod archive_objects;
 mod batch_transfer;
+mod bound_source_page;
 mod build_identity;
 pub mod capture_groups;
 #[cfg(test)]
@@ -461,6 +462,10 @@ pub struct KernSightSessionReport {
 pub struct KernSightCaptureRequest {
     #[serde(default)]
     session_budget: Option<session_budget::Limits>,
+    #[serde(default)]
+    capture_time: Option<session_budget::CaptureTime>,
+    #[serde(default)]
+    save_time: Option<session_budget::SaveTime>,
     #[serde(default)]
     runtime_paths: Option<runtime_paths::RuntimePaths>,
     #[serde(default)]
@@ -2486,12 +2491,13 @@ async fn dump_kernsight_package_scoped(
         if let (Some(n), Some(t)) = (s.output_budget_bytes, s.output_budget_ms) {
             dump.push_str(&format!(
                 " --output-budget-bytes {n} --output-budget-ms {}",
-                dump_policy::producer_time_ms(
+                dump_policy::producer_time_for_scope(
                     session_deadline::remaining_ms(t)?,
                     preflight_started
                         .elapsed()
                         .as_millis()
                         .min(u64::MAX as u128) as u64,
+                    s.capture_time.is_some() && s.save_time.is_some(),
                 )?
             ));
         }
@@ -2905,6 +2911,7 @@ pub async fn import_kernsight_evidence_directory(
     if !root.is_absolute() || !root.is_dir() {
         return Err("请选择含 dump-report.json 或 bounded-code-report.json 的本地绝对目录".into());
     }
+    session_budget::charge(&root, 0).map_err(|e| e.to_string())?;
     let dump_path = root.join("dump-report.json");
     let mut dump_report: Value = if dump_path.is_file() {
         let dump_text = read_bounded_text(&dump_path, 64 * 1024 * 1024)?;
@@ -2994,7 +3001,8 @@ pub async fn import_kernsight_evidence_directory(
             });
         value["mobilee_session_scope"] = serde_json::json!("explicit-parent-session-ids");
     }
-    let capture_text = std::fs::read_to_string(root.join("CAPTURE.txt")).unwrap_or_default();
+    let capture_text =
+        read_bounded_text(&root.join("CAPTURE.txt"), 64 * 1024 * 1024).unwrap_or_default();
     let (file_count, total_bytes, mut files) = local_tree_stats(&root, 50_000)?;
     dump_report["local_storage_accounting"] = storage_evidence::account(
         &root,
@@ -3003,6 +3011,7 @@ pub async fn import_kernsight_evidence_directory(
             .map(|file| (file.relative_path.clone(), file.bytes))
             .collect::<Vec<_>>(),
     );
+    session_budget::charge(&root, 0).map_err(|e| e.to_string())?;
     let static_identity_records = read_bounded_text(&root.join("static-references.json"), 16384)
         .ok().and_then(|text|serde_json::from_str::<Value>(&text).ok())
         .and_then(|v|v["objects"].as_array().cloned()).unwrap_or_default()
@@ -3036,6 +3045,7 @@ pub async fn import_kernsight_evidence_directory(
             }
         }
     }
+    session_budget::charge(&root, 0).map_err(|e| e.to_string())?;
     let mut content_dex_class_index = dex_class_index::objects(
         dump_report["local_storage_accounting"]["runtime_observations"]
             .as_array()
@@ -3049,6 +3059,37 @@ pub async fn import_kernsight_evidence_directory(
             .map(|r| r["mobilee_capture_group"]["id"].clone())
             .unwrap_or(Value::Null),
     );
+    if let Some(inventory) =
+        dump_report["local_storage_accounting"]["runtime_range_inventory"].as_array()
+    {
+        dex_class_index::attach_inventory_sources(
+            &root,
+            &mut content_dex_class_index,
+            dump_report["local_storage_accounting"]["runtime_observations"]
+                .as_array()
+                .map(Vec::as_slice)
+                .unwrap_or_default(),
+            inventory,
+            &package,
+            &session_report
+                .as_ref()
+                .map(|r| r["mobilee_capture_group"]["id"].clone())
+                .unwrap_or(Value::Null),
+        )?;
+        if content_dex_class_index["runtime_inventory_projection"]["complete"] == false {
+            let ledger = &mut dump_report["local_storage_accounting"];
+            ledger["runtime_analysis_complete"] = serde_json::json!(false);
+            if let Some(reasons) = ledger["runtime_analysis_partial_reasons"].as_object_mut() {
+                // This counts a projection-level issue; per-record counts stay
+                // in runtime_inventory_projection and the original ledger.
+                reasons.insert(
+                    "inventory_source_projection_incomplete".into(),
+                    serde_json::json!(1),
+                );
+            }
+        }
+    }
+    session_budget::charge(&root, 0).map_err(|e| e.to_string())?;
     if let Some(notes) = dump_report
         .get("warnings")
         .and_then(|value| value.as_array())
@@ -3085,6 +3126,7 @@ pub async fn import_kernsight_evidence_directory(
     }
     if let Some(observations) = dump_report["local_storage_accounting"]["observations"].as_array() {
         for file in &mut files {
+            session_budget::charge(&root, 0).map_err(|e| e.to_string())?;
             file.code_evidence = observations
                 .iter()
                 .filter(|note| note["relative_path"].as_str() == Some(&file.relative_path))
@@ -3105,19 +3147,32 @@ pub async fn import_kernsight_evidence_directory(
             }
         }
     }
-    if let Some(ranges) = dump_report["local_storage_accounting"]["runtime_observations"].as_array()
+    // New imports retain every eligible metadata row separately from the
+    // bounded canonical heavy-analysis pool. Link the light rows to files;
+    // copying full class arrays here would duplicate analysis per alias.
+    if let Some(ranges) = dump_report["local_storage_accounting"]
+        .get("runtime_range_inventory")
+        .and_then(Value::as_array)
+        .or_else(|| dump_report["local_storage_accounting"]["runtime_observations"].as_array())
     {
+        let mut ranges_by_path: BTreeMap<&str, Vec<&Value>> = BTreeMap::new();
+        for range in ranges {
+            session_budget::charge(&root, 0).map_err(|e| e.to_string())?;
+            if let Some(path) = range["relative_path"].as_str() {
+                ranges_by_path.entry(path).or_default().push(range);
+            }
+        }
         for file in &mut files {
-            file.code_evidence.extend(
-                ranges
-                    .iter()
-                    .filter(|note| note["relative_path"].as_str() == Some(&file.relative_path))
-                    .cloned(),
-            );
+            session_budget::charge(&root, 0).map_err(|e| e.to_string())?;
+            if let Some(rows) = ranges_by_path.get(file.relative_path.as_str()) {
+                file.code_evidence
+                    .extend(rows.iter().map(|row| (*row).clone()));
+            }
         }
     }
     if let Some(ranges) = dump_report["bounded_code"]["ranges"].as_array() {
         for file in &mut files {
+            session_budget::charge(&root, 0).map_err(|e| e.to_string())?;
             if !(file.relative_path.len() == 12
                 && file.relative_path.starts_with("range-")
                 && file.relative_path.ends_with(".bin")
@@ -3153,6 +3208,7 @@ pub async fn import_kernsight_evidence_directory(
                     == dump_report["bounded_code"]["total_persisted_file_bytes"].as_u64()
         );
     }
+    session_budget::charge(&root, 0).map_err(|e| e.to_string())?;
     Ok(KernSightLocalEvidenceBundle {
         root: root.to_string_lossy().into_owned(),
         package,
@@ -3380,6 +3436,13 @@ fn is_mobilee_sdk_namespace(path: &str) -> bool {
 }
 
 fn collect_archive_files(root: &Path) -> Result<Vec<(PathBuf, String, u64)>, String> {
+    collect_archive_files_scoped(root, root)
+}
+fn collect_archive_files_scoped(
+    root: &Path,
+    checkpoint: &Path,
+) -> Result<Vec<(PathBuf, String, u64)>, String> {
+    session_budget::charge(checkpoint, 0).map_err(|e| e.to_string())?;
     let canonical_root = root
         .canonicalize()
         .map_err(|error| format!("证据目录不可访问：{error}"))?;
@@ -3387,9 +3450,11 @@ fn collect_archive_files(root: &Path) -> Result<Vec<(PathBuf, String, u64)>, Str
     let mut files = Vec::new();
     let mut total_bytes = 0u64;
     while let Some(directory) = pending.pop() {
+        session_budget::charge(checkpoint, 0).map_err(|e| e.to_string())?;
         for entry in
             std::fs::read_dir(&directory).map_err(|error| format!("无法遍历证据目录：{error}"))?
         {
+            session_budget::charge(checkpoint, 0).map_err(|e| e.to_string())?;
             let entry = entry.map_err(|error| format!("无法读取证据目录项：{error}"))?;
             let path = entry.path();
             let file_type = entry
@@ -3439,6 +3504,7 @@ fn collect_archive_files(root: &Path) -> Result<Vec<(PathBuf, String, u64)>, Str
         }
     }
     files.sort_by(|left, right| left.1.cmp(&right.1));
+    session_budget::charge(checkpoint, 0).map_err(|e| e.to_string())?;
     Ok(files)
 }
 
@@ -3797,8 +3863,29 @@ async fn pull_kernsight_package_evidence_with_objects(
         paths,
         known_objects,
         None,
+        false,
     )
     .await
+}
+fn received_evidence_bundle(
+    local_root: &Path,
+    package: &str,
+) -> Result<KernSightLocalEvidenceBundle, String> {
+    let dump_report = serde_json::from_str::<Value>(&read_bounded_text(
+        &local_root.join("dump-report.json"),
+        64 * 1024 * 1024,
+    )?)
+    .map_err(|error| format!("已接收的 dump-report.json 无法读取：{error}"))?;
+    Ok(KernSightLocalEvidenceBundle {
+        root: local_root.to_string_lossy().into_owned(),
+        package: package.to_owned(),
+        file_count: 0,
+        total_bytes: 0,
+        dump_report,
+        session_report: None,
+        capture_text: String::new(),
+        files: Vec::new(),
+    })
 }
 async fn pull_kernsight_package_evidence_with_plan(
     serial: String,
@@ -3808,6 +3895,7 @@ async fn pull_kernsight_package_evidence_with_plan(
     paths: Option<&runtime_paths::RuntimePaths>,
     known_objects: BTreeMap<(String, u64), PathBuf>,
     maximum_unique_bytes: Option<u64>,
+    defer_index: bool,
 ) -> Result<KernSightLocalEvidenceBundle, String> {
     validate_serial(&serial)?;
     validate_package(&package)?;
@@ -3872,6 +3960,9 @@ async fn pull_kernsight_package_evidence_with_plan(
         }
         // Existing evidence is read-only. Avoid adb nesting another source
         // directory into an already populated target on repeated pulls.
+        if defer_index {
+            return received_evidence_bundle(&local_root, &package);
+        }
         return import_kernsight_evidence_directory(local_root.to_string_lossy().into_owned())
             .await;
     }
@@ -3961,6 +4052,11 @@ async fn pull_kernsight_package_evidence_with_plan(
             }
         }
         batch_transfer::transfer(&serial, &remote, &local_root, &plan.rows, known_objects).await?;
+        // Parent save indexes under the import lease. Doing it here spends the
+        // rest of the transfer lease and discards a finished copy.
+        if defer_index {
+            return received_evidence_bundle(&local_root, &package);
+        }
         return import_kernsight_evidence_directory(local_root.to_string_lossy().into_owned())
             .await;
     }
@@ -4025,6 +4121,7 @@ pub async fn save_kernsight_group_evidence(
         g.serial,
         g.package,
         output.to_string_lossy().into_owned(),
+        true,
     )
     .await
 }
@@ -4038,14 +4135,21 @@ pub async fn pull_kernsight_package_archive(
     output_path: String,
 ) -> Result<KernSightLocalEvidenceBundle, String> {
     let groups = parent_id.map(|_| capture_groups::root(&app)).transpose()?;
-    pull_kernsight_package_archive_at(groups, parent_id, serial, package, output_path).await
+    // A chosen export copies evidence that already exists. It does not spend
+    // or extend the capture output reservation.
+    pull_kernsight_package_archive_at(groups, parent_id, serial, package, output_path, false).await
 }
+const UNCHARGED_EXPORT_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+const UNCHARGED_TRANSFER_MS: u64 = 600_000;
+const UNCHARGED_ARCHIVE_MS: u64 = 120_000;
+const UNCHARGED_IMPORT_MS: u64 = 120_000;
 async fn pull_kernsight_package_archive_at(
     group_root: Option<PathBuf>,
     parent_id: Option<Uuid>,
     serial: String,
     package: String,
     output_path: String,
+    charge_parent: bool,
 ) -> Result<KernSightLocalEvidenceBundle, String> {
     let mut group = parent_id
         .map(|id| {
@@ -4059,7 +4163,7 @@ async fn pull_kernsight_package_archive_at(
         .transpose()?;
     let runtime_only = group
         .as_ref()
-        .is_some_and(|g| capture_groups::export_root(g).is_err() && !g.session_ids().is_empty());
+        .is_some_and(capture_groups::retained_runtime_only);
     let remote = if runtime_only {
         None
     } else {
@@ -4072,8 +4176,19 @@ async fn pull_kernsight_package_archive_at(
     if !output.is_absolute() {
         return Err("MobileE 证据包输出文件必须是绝对路径".into());
     }
-    if output.exists() || PathBuf::from(format!("{}.budget.json", output.display())).exists() {
-        return Err("输出归档或预算回执已存在；请选择新路径，保留原文件".into());
+    // The save dialog already asks before replacing. A finished parent pull
+    // replaces that chosen archive instead of making the user invent a new name.
+    for path in [
+        output.clone(),
+        PathBuf::from(format!("{}.budget.json", output.display())),
+    ] {
+        if !path.exists() {
+            continue;
+        }
+        if !path.is_file() {
+            return Err(format!("输出路径不是可替换的文件：{}", path.display()));
+        }
+        std::fs::remove_file(&path).map_err(|error| format!("无法替换已有归档：{error}"))?;
     }
     if let Some(parent) = output.parent() {
         std::fs::create_dir_all(parent)
@@ -4087,14 +4202,23 @@ async fn pull_kernsight_package_archive_at(
         b"ME evidence transfer in progress. This file will be replaced atomically.\n",
     )
     .map_err(|error| format!("无法创建拉取进度文件：{error}"))?;
-    let allocations = if let Some(g) = group.as_mut() {
-        capture_groups::reserve_export_at(
-            group_root.as_deref().ok_or("parent 根缺失")?,
-            g,
-            &output,
-        )?
+    let allocations = if charge_parent {
+        if let Some(g) = group.as_mut() {
+            capture_groups::reserve_export_at(
+                group_root.as_deref().ok_or("parent 根缺失")?,
+                g,
+                &output,
+            )?
+        } else {
+            None
+        }
     } else {
-        None
+        Some((
+            UNCHARGED_EXPORT_BYTES,
+            UNCHARGED_EXPORT_BYTES,
+            UNCHARGED_EXPORT_BYTES,
+            UNCHARGED_TRANSFER_MS,
+        ))
     };
     let staging = std::env::temp_dir().join(format!("mobilee-pull-{}", Uuid::new_v4()));
     if let Err(error) = std::fs::create_dir_all(&staging) {
@@ -4113,11 +4237,15 @@ async fn pull_kernsight_package_archive_at(
         let Some(a) = allocations.as_ref() else {
             return Ok(None);
         };
-        let ms = capture_groups::begin_export_time_at(
-            group_root.as_deref().ok_or("parent 根缺失")?,
-            group.as_mut().ok_or("parent 缺失")?,
-            "transfer",
-        )?;
+        let ms = if charge_parent {
+            capture_groups::begin_export_time_at(
+                group_root.as_deref().ok_or("parent 根缺失")?,
+                group.as_mut().ok_or("parent 缺失")?,
+                "transfer",
+            )?
+        } else {
+            a.3
+        };
         session_budget::Guard::install(vec![staging.clone()], a.0.saturating_sub(65536), ms)
             .map(Some)
             .map_err(|e| e.to_string())
@@ -4142,7 +4270,8 @@ async fn pull_kernsight_package_archive_at(
     let payload_limit = allocations
         .as_ref()
         .map(|a| planned_transfer_payload_limit(a.0, a.1, a.2));
-    let bundle = if runtime_only {
+    let bundle = run_save_phase(if charge_parent { group.as_ref() } else { None }, "transfer", async {
+    if runtime_only {
         async {
         let root = staging.join(&package);
         std::fs::create_dir_all(&root).map_err(|e| e.to_string())?;
@@ -4150,7 +4279,7 @@ async fn pull_kernsight_package_archive_at(
         session_budget::write_json(root.join("dump-report.json"), &serde_json::json!({
             "schema_version":"mobilee.retained-runtime-analysis/v1", "package":package,
             "dump_id":null,"source_parent_id":g.id,"collection_status":"partial","artifacts":[],
-            "warnings":["ME adapter for retained runtime sessions only; no package dump was produced; missing DEX/SO coverage remains unknown"],
+            "warnings":["ME adapter contains confirmed runtime sessions only; Dump artifacts are unconfirmed and originals may remain on the device; missing DEX/SO coverage remains unknown"],
             "dump_stage_state":g.stages.iter().find(|s|s.key=="dump").and_then(|s|s.attempts.last()).map(|a|a.state.as_str()).unwrap_or("not_started")
         })).map_err(|e|e.to_string())?;
         import_kernsight_evidence_directory(root.to_string_lossy().into_owned()).await
@@ -4164,9 +4293,11 @@ async fn pull_kernsight_package_archive_at(
             runtime_paths_from_group(group.as_ref())?.as_ref(),
             BTreeMap::new(),
             payload_limit,
+            true,
         )
         .await
-    };
+    }
+    }).await;
     let bundle = match bundle {
         Ok(bundle) => bundle,
         Err(error) => {
@@ -4174,8 +4305,145 @@ async fn pull_kernsight_package_archive_at(
                 let _ = std::fs::remove_dir_all(&staging);
             }
             let _ = std::fs::remove_file(&partial);
+            if charge_parent {
+                if let Some(g) = group.as_mut() {
+                    if let Some(guard) = transfer_guard.as_ref() {
+                        let mut note =
+                            serde_json::to_value(guard.receipt()).map_err(|e| e.to_string())?;
+                        note["partial"] = serde_json::json!(true);
+                        capture_groups::settle_export_at(
+                            group_root.as_deref().ok_or("parent 根缺失")?,
+                            g,
+                            &output,
+                            "transfer",
+                            &note,
+                        )?;
+                        capture_groups::release_unstarted_export_at(
+                            group_root.as_deref().ok_or("parent 根缺失")?,
+                            g,
+                            &output,
+                            &["archive", "import"],
+                        )?;
+                        retain_transport_partial(
+                            &staging.join(&package),
+                            &package,
+                            g,
+                            &note,
+                            &error,
+                        )?;
+                    }
+                }
+            }
+            return Err(format!(
+                "{error}；partial 已保留，可按本地目录导入：{}",
+                staging.join(&package).display()
+            ));
+        }
+    };
+    // A finished copy must leave the transfer lease before session replay.
+    // Indexing stays on the import lease. Replaying inside the leftover seconds
+    // was marking a complete pull partial and skipping archive.
+    let mut transfer_guard = transfer_guard;
+    let mut transfer_copy_settled = false;
+    let copy_note = transfer_guard
+        .as_ref()
+        .map(|guard| serde_json::to_value(guard.receipt()).map_err(|e| e.to_string()))
+        .transpose()?;
+    if copy_note
+        .as_ref()
+        .is_some_and(|note| note["partial"] != true)
+    {
+        if charge_parent {
             if let Some(g) = group.as_mut() {
-                if let Some(guard) = transfer_guard.as_ref() {
+                capture_groups::settle_export_at(
+                    group_root.as_deref().ok_or("parent 根缺失")?,
+                    g,
+                    &output,
+                    "transfer",
+                    copy_note.as_ref().ok_or("传输回执缺失")?,
+                )?;
+            }
+        }
+        transfer_copy_settled = true;
+        transfer_guard = None;
+    }
+    let retained_limit =
+        if runtime_only || group.as_ref().is_some_and(|g| !g.session_ids().is_empty()) {
+            runtime_retained_json_limit(allocations.as_ref())
+        } else {
+            RETAINED_SESSION_JSON_LIMIT
+        };
+    let session_result = if transfer_copy_settled {
+        Ok(append_device_sessions_to_package_evidence_with_limit(
+            &serial,
+            &package,
+            Path::new(&bundle.root),
+            group.as_ref(),
+            retained_limit,
+        )
+        .await)
+    } else {
+        run_save_phase(
+            if charge_parent { group.as_ref() } else { None },
+            "transfer",
+            async {
+                let result = match session_budget::remaining_ms(Path::new(&bundle.root), 120000) {
+                    Ok(session_ms) => {
+                        timeout(
+                            Duration::from_millis(session_ms),
+                            append_device_sessions_to_package_evidence_with_limit(
+                                &serial,
+                                &package,
+                                Path::new(&bundle.root),
+                                group.as_ref(),
+                                retained_limit,
+                            ),
+                        )
+                        .await
+                    }
+                    Err(error) => Ok(Err(error.to_string())),
+                };
+                Ok(result)
+            },
+        )
+        .await
+        .unwrap_or_else(|e| Ok(Err(e)))
+    };
+    let mut session_error = match session_result {
+        Err(_) => Some("关联会话处理超过原transfer剩余期限，未续期".to_owned()),
+        Ok(Err(error)) => Some(error),
+        Ok(Ok(())) => transfer_guard.as_ref().and_then(|_| {
+            session_budget::remaining_ms(Path::new(&bundle.root), u64::MAX)
+                .err()
+                .map(|e| e.to_string())
+        }),
+    };
+    if charge_parent && !transfer_copy_settled {
+        if let Some(g) = group.as_ref() {
+            if let Err(error) = g.budget.as_ref().ok_or("parent预算缺失")?.check_time_phase(
+                "transfer",
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_err(|e| e.to_string())?
+                    .as_millis() as u64,
+            ) {
+                session_error = Some(error);
+            }
+        }
+    }
+    if let Some(error) = session_error {
+        if transfer_copy_settled {
+            let note = serde_json::json!({
+                "schema": "mobilee.session-replay-note/v1",
+                "reason": error.chars().take(2000).collect::<String>()
+            });
+            let _ = std::fs::write(
+                Path::new(&bundle.root).join("session-replay-note.json"),
+                serde_json::to_vec(&note).unwrap_or_default(),
+            );
+        } else {
+            if charge_parent {
+                if let (Some(g), Some(guard)) = (group.as_mut(), transfer_guard.as_ref()) {
                     let mut note =
                         serde_json::to_value(guard.receipt()).map_err(|e| e.to_string())?;
                     note["partial"] = serde_json::json!(true);
@@ -4192,104 +4460,48 @@ async fn pull_kernsight_package_archive_at(
                         &output,
                         &["archive", "import"],
                     )?;
-                    retain_transport_partial(&staging.join(&package), &package, g, &note, &error)?;
+                    retain_transport_partial(Path::new(&bundle.root), &package, g, &note, &error)?;
                 }
-                return Err(format!(
-                    "{error}；partial 已保留，可按本地目录导入：{}",
-                    staging.join(&package).display()
-                ));
             }
-            return Err(error);
-        }
-    };
-    let retained_limit =
-        if runtime_only || group.as_ref().is_some_and(|g| !g.session_ids().is_empty()) {
-            runtime_retained_json_limit(allocations.as_ref())
-        } else {
-            RETAINED_SESSION_JSON_LIMIT
-        };
-    let session_result = match session_budget::remaining_ms(Path::new(&bundle.root), 120000) {
-        Ok(session_ms) => {
-            timeout(
-                Duration::from_millis(session_ms),
-                append_device_sessions_to_package_evidence_with_limit(
-                    &serial,
-                    &package,
-                    Path::new(&bundle.root),
-                    group.as_ref(),
-                    retained_limit,
-                ),
-            )
-            .await
-        }
-        Err(error) => Ok(Err(error.to_string())),
-    };
-    let mut session_error = match session_result {
-        Err(_) => Some("关联会话处理超过原transfer剩余期限，未续期".to_owned()),
-        Ok(Err(error)) => Some(error),
-        Ok(Ok(())) => transfer_guard.as_ref().and_then(|_| {
-            session_budget::remaining_ms(Path::new(&bundle.root), u64::MAX)
-                .err()
-                .map(|e| e.to_string())
-        }),
-    };
-    if let Some(g) = group.as_ref() {
-        if let Err(error) = g.budget.as_ref().ok_or("parent预算缺失")?.check_time_phase(
-            "transfer",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map_err(|e| e.to_string())?
-                .as_millis() as u64,
-        ) {
-            session_error = Some(error);
+            let _ = std::fs::remove_file(&partial);
+            return Err(format!(
+                "包文件已保留，关联会话未完成：{error}；可按本地目录导入：{}",
+                bundle.root
+            ));
         }
     }
-    if let Some(error) = session_error {
-        if let (Some(g), Some(guard)) = (group.as_mut(), transfer_guard.as_ref()) {
-            let mut note = serde_json::to_value(guard.receipt()).map_err(|e| e.to_string())?;
-            note["partial"] = serde_json::json!(true);
-            capture_groups::settle_export_at(
-                group_root.as_deref().ok_or("parent 根缺失")?,
-                g,
-                &output,
-                "transfer",
-                &note,
-            )?;
-            capture_groups::release_unstarted_export_at(
-                group_root.as_deref().ok_or("parent 根缺失")?,
-                g,
-                &output,
-                &["archive", "import"],
-            )?;
-            retain_transport_partial(Path::new(&bundle.root), &package, g, &note, &error)?;
-        }
-        let _ = std::fs::remove_file(&partial);
-        return Err(format!(
-            "包文件已保留，关联会话未完成：{error}；可按本地目录导入：{}",
-            bundle.root
-        ));
-    }
-    if let Some(g) = transfer_guard.as_ref() {
-        let note = serde_json::to_value(g.receipt()).map_err(|e| e.to_string())?;
-        if let Some(group) = group.as_mut() {
-            capture_groups::settle_export_at(
-                group_root.as_deref().ok_or("parent 根缺失")?,
-                group,
-                &output,
-                "transfer",
-                &note,
-            )?;
+    if charge_parent {
+        if let Some(g) = transfer_guard.as_ref() {
+            let note = serde_json::to_value(g.receipt()).map_err(|e| e.to_string())?;
+            if let Some(group) = group.as_mut() {
+                capture_groups::settle_export_at(
+                    group_root.as_deref().ok_or("parent 根缺失")?,
+                    group,
+                    &output,
+                    "transfer",
+                    &note,
+                )?;
+            }
         }
     }
     drop(transfer_guard);
     let archive_setup = (|| -> Result<(), String> {
         if let Some((_, archive_cap, import_cap, _)) = allocations {
-            let ms = capture_groups::begin_export_time_at(
-                group_root.as_deref().ok_or("parent 根缺失")?,
-                group.as_mut().ok_or("parent 缺失")?,
-                "archive",
-            )?;
-            let mut note = serde_json::json!({"schema":"mobilee.archive-output-limits/v1","archive_bytes":archive_cap,"import_bytes":import_cap,"max_ms":ms,"deadline_unix_ms":group.as_ref().and_then(|g|g.budget.as_ref()).map(|b|b.deadline_unix_ms)});
+            let ms = if charge_parent {
+                capture_groups::begin_export_time_at(
+                    group_root.as_deref().ok_or("parent 根缺失")?,
+                    group.as_mut().ok_or("parent 缺失")?,
+                    "archive",
+                )?
+            } else {
+                UNCHARGED_ARCHIVE_MS
+            };
+            let mut note = archive_output_limits_note(
+                group.as_ref().and_then(|g| g.budget.as_ref()),
+                archive_cap,
+                import_cap,
+                ms,
+            );
             note["parent_id"] = serde_json::json!(parent_id);
             std::fs::write(
                 Path::new(&bundle.root).join("archive-output-limits.json"),
@@ -4311,55 +4523,71 @@ async fn pull_kernsight_package_archive_at(
         let _ = std::fs::remove_file(&partial);
         return Err(format!("归档未启动：{error}；源目录保留：{}", bundle.root));
     }
-    let mut archive_result = write_kernsight_evidence_archive(Path::new(&bundle.root), &output)
-        .and_then(|_| archive_objects::share_fresh_pull(Path::new(&bundle.root), &output));
-    if let Some(g) = group.as_mut() {
-        if let Err(error) = g.budget.as_ref().ok_or("parent预算缺失")?.check_time_phase(
-            "archive",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map_err(|e| e.to_string())?
-                .as_millis() as u64,
-        ) {
-            archive_result = Err(error);
-        }
-        let path = PathBuf::from(format!("{}.budget.json", output.display()));
-        let receipt_result = (|| -> Result<(), String> {
-            if path.is_file() {
-                let mut note: Value = serde_json::from_str(&read_bounded_text(&path, 65536)?)
-                    .map_err(|e| e.to_string())?;
-                if archive_result.is_err() {
-                    note["partial"] = serde_json::json!(true);
-                    note["host_time_fence_or_share_error"] =
-                        serde_json::json!(archive_result.as_ref().err());
-                }
-                capture_groups::settle_export_at(
-                    group_root.as_deref().ok_or("parent 根缺失")?,
-                    g,
-                    &output,
-                    "archive",
-                    &note,
-                )?;
-            } else {
-                return Err("本次归档预算回执缺失，计量未知".into());
+    let mut archive_result = run_save_phase(
+        if charge_parent { group.as_ref() } else { None },
+        "archive",
+        async {
+            write_kernsight_evidence_archive(Path::new(&bundle.root), &output)
+                .and_then(|_| archive_objects::share_fresh_pull(Path::new(&bundle.root), &output))
+        },
+    )
+    .await;
+    if charge_parent {
+        if let Some(g) = group.as_mut() {
+            capture_groups::finish_export_time_at(
+                group_root.as_deref().ok_or("parent根缺失")?,
+                g,
+                "archive",
+            )?;
+            if let Err(error) = g.budget.as_ref().ok_or("parent预算缺失")?.check_time_phase(
+                "archive",
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_err(|e| e.to_string())?
+                    .as_millis() as u64,
+            ) {
+                archive_result = Err(error);
             }
-            Ok(())
-        })();
-        if let Err(error) = receipt_result {
-            archive_result = Err(match archive_result {
-                Err(cause) => format!("{cause}；归档计量未确认：{error}"),
-                Ok(_) => format!("归档计量未确认：{error}"),
-            });
+            let path = PathBuf::from(format!("{}.budget.json", output.display()));
+            let receipt_result = (|| -> Result<(), String> {
+                if path.is_file() {
+                    let mut note: Value = serde_json::from_str(&read_bounded_text(&path, 65536)?)
+                        .map_err(|e| e.to_string())?;
+                    if archive_result.is_err() {
+                        note["partial"] = serde_json::json!(true);
+                        note["host_time_fence_or_share_error"] =
+                            serde_json::json!(archive_result.as_ref().err());
+                    }
+                    capture_groups::settle_export_at(
+                        group_root.as_deref().ok_or("parent 根缺失")?,
+                        g,
+                        &output,
+                        "archive",
+                        &note,
+                    )?;
+                } else {
+                    return Err("本次归档预算回执缺失，计量未知".into());
+                }
+                Ok(())
+            })();
+            if let Err(error) = receipt_result {
+                archive_result = Err(match archive_result {
+                    Err(cause) => format!("{cause}；归档计量未确认：{error}"),
+                    Ok(_) => format!("归档计量未确认：{error}"),
+                });
+            }
         }
     }
     if let Err(error) = archive_result {
-        if let Some(g) = group.as_mut() {
-            capture_groups::release_unstarted_export_at(
-                group_root.as_deref().ok_or("parent 根缺失")?,
-                g,
-                &output,
-                &["import"],
-            )?;
+        if charge_parent {
+            if let Some(g) = group.as_mut() {
+                capture_groups::release_unstarted_export_at(
+                    group_root.as_deref().ok_or("parent 根缺失")?,
+                    g,
+                    &output,
+                    &["import"],
+                )?;
+            }
         }
         let _ = std::fs::remove_file(&partial);
         return Err(format!("{error}；已保存源目录仍可导入：{}", bundle.root));
@@ -4367,13 +4595,16 @@ async fn pull_kernsight_package_archive_at(
     // The directory already contains the bytes represented by the newly written
     // archive. Re-index it in place instead of immediately extracting the archive
     // into a second multi-gigabyte cache.
-    let import_guard = if let (Some(_), Some((_, _, import_cap, _))) = (group.as_ref(), allocations)
-    {
-        let remaining = capture_groups::begin_export_time_at(
-            group_root.as_deref().ok_or("parent 根缺失")?,
-            group.as_mut().ok_or("parent 缺失")?,
-            "import",
-        );
+    let import_guard = if let Some((_, _, import_cap, _)) = allocations {
+        let remaining = if charge_parent {
+            capture_groups::begin_export_time_at(
+                group_root.as_deref().ok_or("parent 根缺失")?,
+                group.as_mut().ok_or("parent 缺失")?,
+                "import",
+            )
+        } else {
+            Ok(UNCHARGED_IMPORT_MS)
+        };
         match remaining {
             Ok(ms) => match session_budget::Guard::install(
                 vec![PathBuf::from(&bundle.root)],
@@ -4382,22 +4613,26 @@ async fn pull_kernsight_package_archive_at(
             ) {
                 Ok(guard) => Some(guard),
                 Err(error) => {
+                    if charge_parent {
+                        capture_groups::release_unstarted_export_after_lease_at(
+                            group_root.as_deref().ok_or("parent 根缺失")?,
+                            group.as_mut().ok_or("parent缺失")?,
+                            &output,
+                            &["import"],
+                        )?;
+                    }
+                    return Err(format!("导入未启动，源目录和归档保留：{error}"));
+                }
+            },
+            Err(error) => {
+                if charge_parent {
                     capture_groups::release_unstarted_export_after_lease_at(
                         group_root.as_deref().ok_or("parent 根缺失")?,
                         group.as_mut().ok_or("parent缺失")?,
                         &output,
                         &["import"],
                     )?;
-                    return Err(format!("导入未启动，源目录和归档保留：{error}"));
                 }
-            },
-            Err(error) => {
-                capture_groups::release_unstarted_export_after_lease_at(
-                    group_root.as_deref().ok_or("parent 根缺失")?,
-                    group.as_mut().ok_or("parent缺失")?,
-                    &output,
-                    &["import"],
-                )?;
                 return Err(format!(
                     "{error}；归档和源目录保留，未启动导入：{}",
                     bundle.root
@@ -4408,37 +4643,46 @@ async fn pull_kernsight_package_archive_at(
         None
     };
     let imported_root = PathBuf::from(&bundle.root);
-    let mut result = import_kernsight_evidence_directory(bundle.root).await;
+    let mut result = run_save_phase(
+        if charge_parent { group.as_ref() } else { None },
+        "import",
+        import_kernsight_evidence_directory(bundle.root),
+    )
+    .await;
     if import_guard.is_some() {
         if let Err(error) = session_budget::remaining_ms(&imported_root, u64::MAX) {
             result = Err(format!("{error}；导入超过阶段额度，保留结果并拒绝完整成功"));
         }
     }
-    if let Some(g) = group.as_ref() {
-        if let Err(error) = g.budget.as_ref().ok_or("parent预算缺失")?.check_time_phase(
-            "import",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map_err(|e| e.to_string())?
-                .as_millis() as u64,
-        ) {
-            result = Err(format!(
-                "{error}；导入处理跨过原父或阶段期限，保留已写入结果，拒绝完整成功"
-            ));
+    if charge_parent {
+        if let Some(g) = group.as_ref() {
+            if let Err(error) = g.budget.as_ref().ok_or("parent预算缺失")?.check_time_phase(
+                "import",
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map_err(|e| e.to_string())?
+                    .as_millis() as u64,
+            ) {
+                result = Err(format!(
+                    "{error}；导入处理跨过原父或阶段期限，保留已写入结果，拒绝完整成功"
+                ));
+            }
         }
     }
-    if let (Some(g), Some(guard)) = (group.as_mut(), import_guard.as_ref()) {
-        let mut note = serde_json::to_value(guard.receipt()).map_err(|e| e.to_string())?;
-        if result.is_err() {
-            note["partial"] = serde_json::json!(true);
+    if charge_parent {
+        if let (Some(g), Some(guard)) = (group.as_mut(), import_guard.as_ref()) {
+            let mut note = serde_json::to_value(guard.receipt()).map_err(|e| e.to_string())?;
+            if result.is_err() {
+                note["partial"] = serde_json::json!(true);
+            }
+            capture_groups::settle_export_at(
+                group_root.as_deref().ok_or("parent 根缺失")?,
+                g,
+                &output,
+                "import",
+                &note,
+            )?;
         }
-        capture_groups::settle_export_at(
-            group_root.as_deref().ok_or("parent 根缺失")?,
-            g,
-            &output,
-            "import",
-            &note,
-        )?;
     }
     result
 }
@@ -4736,6 +4980,33 @@ async fn append_device_sessions_to_package_evidence_with_limit(
     Ok(())
 }
 
+/// Independent read-only browsing of retained metadata; this does not resume
+/// a capture, perform payload analysis, or renew an earlier parent contract.
+#[tauri::command]
+pub async fn read_local_kernsight_bound_source_page(
+    root: String,
+    package: String,
+    source_report: String,
+    offset: usize,
+    limit: usize,
+    expected_sha256: Option<String>,
+) -> Result<Value, String> {
+    validate_package(&package)?;
+    let deadline = session_deadline::Deadline::new(Duration::from_secs(10));
+    deadline
+        .run(async {
+            bound_source_page::read_page(
+                Path::new(&root),
+                &package,
+                &source_report,
+                offset,
+                limit,
+                expected_sha256.as_deref(),
+            )
+        })
+        .await
+}
+
 #[tauri::command]
 pub async fn read_local_kernsight_evidence_file(
     root: String,
@@ -4855,6 +5126,14 @@ fn validate_evidence_relative_path(path: &str) -> Result<(), String> {
 }
 
 fn read_bounded_text(path: &Path, max_bytes: u64) -> Result<String, String> {
+    read_bounded_text_scoped(path, max_bytes, path)
+}
+fn read_bounded_text_scoped(
+    path: &Path,
+    max_bytes: u64,
+    checkpoint: &Path,
+) -> Result<String, String> {
+    session_budget::charge(checkpoint, 0).map_err(|e| e.to_string())?;
     let metadata = path
         .metadata()
         .map_err(|error| format!("无法读取 {}：{error}", path.display()))?;
@@ -4865,21 +5144,35 @@ fn read_bounded_text(path: &Path, max_bytes: u64) -> Result<String, String> {
             max_bytes / 1024 / 1024
         ));
     }
-    std::fs::read_to_string(path).map_err(|error| format!("无法读取 {}：{error}", path.display()))
+    let source =
+        File::open(path).map_err(|error| format!("无法读取 {}：{error}", path.display()))?;
+    let mut text = String::new();
+    session_budget::CheckedReader::new(source, checkpoint)
+        .take(max_bytes.saturating_add(1))
+        .read_to_string(&mut text)
+        .map_err(|error| format!("无法读取 {}：{error}", path.display()))?;
+    if text.len() as u64 > max_bytes {
+        return Err(format!("{} 实际读取超过有限字节上限", path.display()));
+    }
+    session_budget::charge(checkpoint, 0).map_err(|e| e.to_string())?;
+    Ok(text)
 }
 
 fn local_tree_stats(
     root: &Path,
     max_files: u64,
 ) -> Result<(u64, u64, Vec<KernSightLocalEvidenceFile>), String> {
+    session_budget::charge(root, 0).map_err(|e| e.to_string())?;
     let mut stack = vec![root.to_path_buf()];
     let mut files = 0_u64;
     let mut bytes = 0_u64;
     let mut catalog = Vec::new();
     while let Some(directory) = stack.pop() {
+        session_budget::charge(root, 0).map_err(|e| e.to_string())?;
         for entry in std::fs::read_dir(&directory)
             .map_err(|error| format!("无法扫描 {}：{error}", directory.display()))?
         {
+            session_budget::charge(root, 0).map_err(|e| e.to_string())?;
             let entry = entry.map_err(|error| format!("本地证据目录项无效：{error}"))?;
             if entry
                 .file_type()
@@ -4926,13 +5219,14 @@ fn local_tree_stats(
     // which the UI treats as unknown, never as successful or complete.
     let mut notes = Vec::new();
     for file in &catalog {
+        session_budget::charge(root, 0).map_err(|e| e.to_string())?;
         if (file.relative_path.starts_with("runtime/plaintext/")
             || file.relative_path.starts_with("runtime/crypto-windows/"))
             && file.relative_path.ends_with(".json")
             && file.bytes <= 256 * 1024
         {
-            if let Ok(bytes) = std::fs::read(root.join(&file.relative_path)) {
-                if let Ok(mut value) = serde_json::from_slice::<Value>(&bytes) {
+            if let Ok(text) = read_bounded_text(&root.join(&file.relative_path), 256 * 1024) {
+                if let Ok(mut value) = serde_json::from_str::<Value>(&text) {
                     if matches!(
                         value["schema"].as_str(),
                         Some("kernsight.memory-window/v1" | "kernsight.memory-read/v1")
@@ -4945,6 +5239,7 @@ fn local_tree_stats(
         }
     }
     for file in &mut catalog {
+        session_budget::charge(root, 0).map_err(|e| e.to_string())?;
         for (note_path, value) in &notes {
             let parent = note_path
                 .rsplit_once('/')
@@ -4966,6 +5261,7 @@ fn local_tree_stats(
         }
     }
     catalog.sort_by(|left, right| left.relative_path.cmp(&right.relative_path));
+    session_budget::charge(root, 0).map_err(|e| e.to_string())?;
     Ok((files, bytes, catalog))
 }
 
@@ -5942,6 +6238,223 @@ mod retained_transfer_plan_tests {
             std::fs::read(root.join("dump-report.json")).unwrap(),
             original
         );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+}
+
+/// Run every v5 save operation under its first fixed lease. Legacy contracts
+/// retain their original adapter behavior and cannot acquire a new v5 clock.
+async fn run_save_phase<T>(
+    group: Option<&capture_groups::Group>,
+    kind: &str,
+    future: impl std::future::Future<Output = Result<T, String>>,
+) -> Result<T, String> {
+    let deadline = group
+        .and_then(|g| g.budget.as_ref())
+        .filter(|b| {
+            b.time_plan
+                .as_ref()
+                .is_some_and(|p| p.schema == "mobilee.session-time-plan/v5")
+        })
+        .map(|b| b.phase_deadline(kind))
+        .transpose()?;
+    match deadline {
+        Some(d) => d.run(future).await,
+        None => future.await,
+    }
+}
+
+/// v5 timestamps are display provenance. Its live archive guard is clipped by
+/// the original CURRENT phase Instant, so a wall jump cannot cancel or renew it.
+fn archive_output_limits_note(
+    budget: Option<&session_budget::Contract>,
+    archive_cap: u64,
+    import_cap: u64,
+    max_ms: u64,
+) -> Value {
+    let mut note = serde_json::json!({"schema":"mobilee.archive-output-limits/v1",
+        "archive_bytes":archive_cap,"import_bytes":import_cap,"max_ms":max_ms});
+    let key = if budget
+        .and_then(|b| b.time_plan.as_ref())
+        .is_some_and(|p| p.schema == "mobilee.session-time-plan/v5")
+    {
+        "deadline_display_unix_ms"
+    } else {
+        "deadline_unix_ms"
+    };
+    note[key] = serde_json::json!(budget.map(|b| b.deadline_unix_ms));
+    note
+}
+
+#[cfg(test)]
+mod manual_time_v5_archive_clock {
+    use super::*;
+    fn budget() -> session_budget::Contract {
+        session_budget::Contract::new_explicit_with_time(
+            session_budget::Limits {
+                total_bytes: 4294967296,
+                max_seconds: 38,
+            },
+            1,
+            true,
+            &[15, 90, 15],
+            session_budget::CaptureTime {
+                max_seconds: 30,
+                l2_max_seconds: 1,
+            },
+            session_budget::SaveTime {
+                transfer_max_seconds: 1,
+                archive_max_seconds: 1,
+                import_max_seconds: 1,
+            },
+        )
+        .unwrap()
+    }
+    fn source() -> (PathBuf, PathBuf) {
+        let root = std::env::temp_dir().join(format!("me-v5-archive-clock-{}", Uuid::new_v4()));
+        let source = root.join("source");
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::write(source.join("dump-report.json"), b"{\"package\":\"org.example.clock\",\"dump_id\":\"fixture\",\"collection_status\":\"partial\"}").unwrap();
+        std::fs::write(source.join("raw.bin"), b"retained real bytes").unwrap();
+        (root, source)
+    }
+    fn write_note(source: &Path, c: &session_budget::Contract, ms: u64) -> Value {
+        let note = archive_output_limits_note(Some(c), 2097152, 2097152, ms);
+        std::fs::write(
+            source.join("archive-output-limits.json"),
+            serde_json::to_vec(&note).unwrap(),
+        )
+        .unwrap();
+        note
+    }
+    #[tokio::test]
+    async fn v5_stale_wall_metadata_does_not_cancel_live_archive_and_all_source_hashes_match() {
+        use std::io::Read;
+        let (root, source) = source();
+        let output = root.join("retained.mee");
+        let mut c = budget();
+        let token = c.deadline_token;
+        assert!(c.deadline_unix_ms < now_millis());
+        let ms = c.begin_time_phase("archive", now_millis()).unwrap();
+        let note = write_note(&source, &c, ms);
+        assert!(note.get("deadline_unix_ms").is_none());
+        assert_eq!(note["deadline_display_unix_ms"], c.deadline_unix_ms);
+        let files = collect_archive_files(&source).unwrap();
+        let original = files
+            .iter()
+            .map(|(p, _, _)| std::fs::read(p).unwrap())
+            .collect::<Vec<_>>();
+        c.phase_deadline("archive")
+            .unwrap()
+            .run(async { write_kernsight_evidence_archive(&source, &output) })
+            .await
+            .unwrap();
+        let mut zip = zip::ZipArchive::new(File::open(&output).unwrap()).unwrap();
+        let mut manifest_text = String::new();
+        zip.by_name("manifest.json")
+            .unwrap()
+            .read_to_string(&mut manifest_text)
+            .unwrap();
+        let manifest: Value = serde_json::from_str(&manifest_text).unwrap();
+        assert_eq!(manifest["outputLimits"], note);
+        for ((path, relative, _), bytes) in files.iter().zip(&original) {
+            let hash = format!("{:x}", Sha256::digest(bytes));
+            let reference = manifest["references"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|v| v["path"] == *relative)
+                .unwrap();
+            assert_eq!(reference["sha256"], hash);
+            let mut archived = Vec::new();
+            zip.by_name(&format!("objects/{hash}.bin"))
+                .unwrap()
+                .read_to_end(&mut archived)
+                .unwrap();
+            assert_eq!(archived, *bytes);
+            assert_eq!(std::fs::read(path).unwrap(), *bytes);
+        }
+        assert_eq!(c.deadline_token, token);
+        drop(zip);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+    #[tokio::test]
+    async fn real_archive_phase_expiry_and_legacy_wall_expiry_preserve_sources() {
+        let (root, source) = source();
+        let output = root.join("expired.mee");
+        let mut c = budget();
+        let ms = c.begin_time_phase("archive", now_millis()).unwrap();
+        write_note(&source, &c, ms);
+        let phase = c.phase_deadline("archive").unwrap();
+        tokio::time::sleep(Duration::from_millis(1100)).await;
+        let error = phase
+            .run(async { write_kernsight_evidence_archive(&source, &output) })
+            .await
+            .unwrap_err();
+        assert!(error.contains("parent_deadline_exhausted"));
+        assert!(c.deadline().unwrap().check().is_ok());
+        assert!(!output.exists());
+        assert_eq!(
+            std::fs::read(source.join("raw.bin")).unwrap(),
+            b"retained real bytes"
+        );
+        let legacy = session_budget::Contract::new_planned_with_time(
+            session_budget::Limits {
+                total_bytes: 4294967296,
+                max_seconds: 900,
+            },
+            1,
+            true,
+            &[15, 90, 15],
+        )
+        .unwrap();
+        let note = write_note(&source, &legacy, 1000);
+        assert_eq!(note["deadline_unix_ms"], legacy.deadline_unix_ms);
+        let error = legacy
+            .deadline()
+            .unwrap()
+            .run(async { write_kernsight_evidence_archive(&source, &output) })
+            .await
+            .unwrap_err();
+        assert!(error.contains("invalid output budget scope"));
+        assert!(!output.exists());
+        assert_eq!(
+            std::fs::read(source.join("raw.bin")).unwrap(),
+            b"retained real bytes"
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod cooperative_import_deadline_tests {
+    use super::*;
+    #[tokio::test]
+    async fn expired_guard_rejects_directory_scan_text_and_import_without_changing_source() {
+        let root = std::env::temp_dir().join(format!("me-directory-check-{}", Uuid::new_v4()));
+        std::fs::create_dir(&root).unwrap();
+        let original = br#"{"package":"org.example.fixture", "artifacts":[]}"#;
+        let path = root.join("dump-report.json");
+        std::fs::write(&path, original).unwrap();
+        let guard = session_budget::Guard::install(vec![root.clone()], 1000000, 1).unwrap();
+        std::thread::sleep(Duration::from_millis(8));
+        assert!(local_tree_stats(&root, 50000)
+            .unwrap_err()
+            .contains("time_budget_exhausted"));
+        assert!(collect_archive_files(&root)
+            .unwrap_err()
+            .contains("time_budget_exhausted"));
+        assert!(read_bounded_text(&path, 65536)
+            .unwrap_err()
+            .contains("time_budget_exhausted"));
+        assert!(
+            import_kernsight_evidence_directory(root.to_string_lossy().into_owned())
+                .await
+                .unwrap_err()
+                .contains("time_budget_exhausted")
+        );
+        assert_eq!(std::fs::read(path).unwrap(), original);
+        assert_eq!(guard.receipt().admitted_write_bytes, 0);
         std::fs::remove_dir_all(root).unwrap();
     }
 }

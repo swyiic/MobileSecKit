@@ -80,6 +80,7 @@ async fn approved_calculator_parent_60s_64mib() {
         serial.clone(),
         g.package.clone(),
         out.join("calculator.mee").to_string_lossy().into_owned(),
+        true,
     )
     .await;
     let summary = match export {

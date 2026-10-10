@@ -65,6 +65,31 @@ fn raw_output(result: &KernSightCaptureResult) -> RawOutput {
     output
 }
 
+pub(super) fn coverage_observation(stderr: &str) -> Option<String> {
+    let poll = stderr.lines().find_map(|line| {
+        let value: Value = serde_json::from_str(line).ok()?;
+        (value["schema"] == "kernsight.perf-poll-budget/v1" && value["coverage_partial"] == true)
+            .then_some(value)
+    })?;
+    let drain = stderr.lines().find_map(|line| {
+        let value: Value = serde_json::from_str(line).ok()?;
+        (value["schema"] == "kernsight.capture-drain/v1").then_some(value)
+    });
+    let lost = drain
+        .as_ref()
+        .and_then(|value| value["lost_samples"].as_u64())
+        .unwrap_or(0);
+    let unread = drain
+        .as_ref()
+        .is_some_and(|value| value["unknown_tail"] == true)
+        || poll["unread_tail_possible"] == true;
+    let skipped = poll["budget_skipped_raw"].as_u64().unwrap_or(0);
+    Some(format!(
+        "覆盖记录：内核丢样 {lost}；未读尾部 {}；适配器省略 {skipped}。采集已结束，这些数留给分析。",
+        if unread { "有" } else { "无" }
+    ))
+}
+
 pub(super) fn partial_stage_error(
     stage: &str,
     reason: &str,

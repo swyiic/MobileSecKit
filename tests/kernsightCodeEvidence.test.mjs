@@ -4,7 +4,7 @@ import { readFileSync } from 'node:fs'
 import ts from 'typescript'
 const source=readFileSync(new URL('../src/services/kernsightCodeEvidence.ts',import.meta.url),'utf8')
 const js=ts.transpileModule(source,{compilerOptions:{module:ts.ModuleKind.ESNext}}).outputText
-const {dexObjectGroups,verifiedDexObjectCount,indexedElfModuleCount,indexedDexCount,runtimeDexClassMatches,codeEvidenceLabel,allocatedEvidenceLabel,ownershipEvidenceEntries,codeNoiseLayers,archiveCoverageLabel,elfLoadCoverageLabel,dexScanSummary,dexScanSummaryForObject,fileScanLabel}=await import(`data:text/javascript;base64,${Buffer.from(js).toString('base64')}`)
+const {projectDexEvidence,matchesReadableDexEvidence,dexObjectGroups,verifiedDexObjectCount,indexedElfModuleCount,indexedDexCount,runtimeDexClassMatches,codeEvidenceLabel,allocatedEvidenceLabel,ownershipEvidenceEntries,codeNoiseLayers,archiveCoverageLabel,elfLoadCoverageLabel,dexScanSummary,dexScanSummaryForObject,fileScanLabel}=await import(`data:text/javascript;base64,${Buffer.from(js).toString('base64')}`)
 test('legacy code has no invented source or success',()=>{assert.equal(codeEvidenceLabel(), '');assert.equal(codeEvidenceLabel([{}]),'代码来源未知')})
 test('member provenance is distinct from verified retained bytes and business ownership',()=>{const label=codeEvidenceLabel([{schema:'kernsight.apk-member-evidence/v1',source:{zip_member:'classes.dex',apk_sha256:'a'.repeat(64)},transformation:'repair_dex/v1',local_content_status:'complete_file_hash_verified',ownership:{category:'mixed',reasons:['1 SDK + 99 app']}}]);assert.match(label,/classes.dex.*repair_dex.*保留文件完整 hash 已核对.*混合/);assert.match(label,/APK 原成员未在本地重解包核对/)})
 
@@ -202,16 +202,16 @@ test('ELF load coverage never upgrades missing fields or whole-file completeness
 
 test('class index search retains all classes and rejects stale instance pointers',()=>{
  const identity={package:'com.pkg',pid:1,birth_ns:2,uid:3,exec_id:4,boot_id:'boot'}
- const source={kind:'runtime',row_index:0,source_report:'window',range_sha256:'range',source:identity}
+ const source={kind:'runtime',row_index:0,source_report:'window',range_sha256:'a'.repeat(64),source:identity}
  const object={sha256:'object',bytes:10,sources:[source]}
- const row={source_report:'window',read:{sha256:'range'},source:identity,object_inspection:{derived_objects:[{sha256:'object',length:10,class_index:{classes:Array.from({length:8201},(_,i)=>`Lpkg/Class${i};`)}}]}}
+ const row={source_report:'window',read:{sha256:'a'.repeat(64)},source:identity,object_inspection:{derived_objects:[{sha256:'object',length:10,class_index:{classes:Array.from({length:8201},(_,i)=>`Lpkg/Class${i};`)}}]}}
  assert.equal(runtimeDexClassMatches({runtime_observations:[row]},object,'').total,8201)
  assert.equal(runtimeDexClassMatches({runtime_observations:[row]},object,'').classes.length,500)
  assert.equal(runtimeDexClassMatches({runtime_observations:[row]},object,'').omitted,7701)
  assert.equal(runtimeDexClassMatches({runtime_observations:[row]},object,'Class8200;').total,1)
  assert.equal(runtimeDexClassMatches({runtime_observations:[row]},object,'Class8200;').classes.length,1)
  assert.equal(runtimeDexClassMatches({runtime_observations:[row]},object,'Class8200;').omitted,0)
- assert.equal(runtimeDexClassMatches({runtime_observations:[{...row,source:{...identity,pid:99}}]},object,'').total,0)
+ assert.equal(runtimeDexClassMatches({runtime_observations:[{...row,source:{...identity,pid:99}}]},object,'').total,null)
 })
 
 test('package DEX count includes runtime and deduplicates same static content',()=>{
@@ -237,4 +237,72 @@ test('failed, layout-anomalous and old missing-field objects are diagnostic only
  assert.equal(verifiedDexObjectCount({content_dex_class_index:{objects}}),1)
  assert.equal(verifiedDexObjectCount({content_dex_class_index:{objects:[failed,layout,old]}}),0)
  assert.equal(verifiedDexObjectCount({}),null);assert.equal(objects.length,4)
+})
+
+
+test('forty logical objects drive the same headline and independent list, preserving diagnostic rows', () => {
+ const objects = Array.from({length:40},(_,i)=>({sha256:i.toString(16).padStart(64,'0'),bytes:i+1,sources:[],classes:[],validation_status:'unknown'}))
+ const dump={content_dex_class_index:{objects},dex_sets:[objects[0]]}
+ assert.equal(indexedDexCount(dump),40)
+ assert.equal(projectDexEvidence(dump).objects.length,40)
+ assert.equal(dexObjectGroups(projectDexEvidence(dump).objects).find(x=>x.kind==='diagnostic').objects.length,40)
+ for(const object of objects)assert.equal(runtimeDexClassMatches({},object,'unmatched').total,0)
+})
+test('producer sets still render when the local content index is absent or empty', () => {
+ const set={sha256:'b'.repeat(64),bytes:50,canonical_relative_path:'runtime/bound-one.code',semantic:{class_defs:3,class_descriptors:['Llegacy/One;'],class_descriptors_truncated:true}}
+ for(const content of [undefined,{objects:[]}]) {
+  const dump={dex_sets:[set],content_dex_class_index:content}
+  const projected=projectDexEvidence(dump)
+  assert.equal(projected.objects.length,1);assert.equal(indexedDexCount(dump),1)
+  assert.match(projected.objects[0].class_index_status,/truncated/)
+  assert.match(projected.objects[0].validation_status,/unknown/)
+  assert.equal(projected.objects[0].ownership,'unknown')
+ }
+ assert.equal(projectDexEvidence({readable_dex:40}).status,'reported_count_only')
+ assert.equal(projectDexEvidence({readable_dex:40}).objects.length,0)
+})
+test('physical DEX relationships use the selected report and never every bound container', () => {
+ const file=relativePath=>({relativePath,bytes:100})
+ const report={artifacts:[{kind:'dex',relative_path:'runtime/bound-dex.code'}],dex_sets:[{sha256:'c'.repeat(64),bytes:5,canonical_relative_path:'runtime/another-dex.code'}]}
+ assert.equal(matchesReadableDexEvidence(file('readable-dex/classes.dex'),report),true)
+ assert.equal(matchesReadableDexEvidence(file('runtime/bound-dex.code'),report),true)
+ assert.equal(matchesReadableDexEvidence(file('runtime/another-dex.code'),report),true)
+ assert.equal(matchesReadableDexEvidence(file('runtime/bound-elf.code'),report),false)
+ assert.equal(matchesReadableDexEvidence(file('runtime/bound-dex.code'),{}),false)
+ assert.equal(matchesReadableDexEvidence(file('runtime/mem-only.bin'),{}),false)
+ assert.equal(matchesReadableDexEvidence(file('readable-dex/note.json'),{}),false)
+ const note={relative_path:'runtime/by-note.code',local_content_status:'complete_range_hash_verified',object_inspection:{derived_objects:[{kind:'dex',sha256:'d'.repeat(64),length:5}]}}
+ assert.equal(matchesReadableDexEvidence({...file(note.relative_path),codeEvidence:[note]},{}),true)
+ assert.equal(matchesReadableDexEvidence({...file('runtime/wrong.code'),codeEvidence:[note]},{}),false)
+ assert.equal(matchesReadableDexEvidence({...file(note.relative_path),codeEvidence:[{...note,local_content_status:'unknown'}]},{}),false)
+})
+test('qualified independent sources and reordered rows remain searchable without PID or basename fallback', () => {
+ const identity={package:'com.pkg',pid:1,birth_ns:2,uid:3,exec_id:4,boot_id:'boot'}
+ const source={kind:'runtime',row_index:0,source_report:'runtime/report.json',range_sha256:'e'.repeat(64),source:identity,source_offset:10}
+ const object={sha256:'f'.repeat(64),bytes:10,sources:[{...source,source_report:'stale'},source]}
+ const row={source_report:source.source_report,read:{sha256:source.range_sha256,actual_length:100},source:identity,object_inspection:{derived_objects:[{sha256:object.sha256,length:10,source_offset:10,class_index:{classes:['Lexact/Found;']}}]}}
+ const result=runtimeDexClassMatches({runtime_observations:[{},row]},object,'Found')
+ assert.equal(result.status,'indexed');assert.equal(result.total,1)
+ assert.equal(runtimeDexClassMatches({runtime_observations:[row]},object,'absent').total,0)
+ assert.equal(runtimeDexClassMatches({runtime_observations:[{...row,source:{...identity,exec_id:99}}]},object,'').status,'unlinked')
+ assert.equal(runtimeDexClassMatches({runtime_observations:[{...row,source:{...identity,exec_id:99}}]},object,'').total,null)
+ assert.equal(runtimeDexClassMatches({runtime_observations:[row]},{...object,sources:[{...source,source:{pid:1}}]},'').status,'unknown')
+ assert.equal(runtimeDexClassMatches({runtime_observations:[row]},{...object,sources:[{...source,source_offset:90}]},'').total,null)
+})
+test('real class paging reaches the tail and a new query resets its own window', () => {
+ const object={classes:Array.from({length:8201},(_,i)=>`Lpkg/Class${i};`)}
+ const first=runtimeDexClassMatches({},object,'')
+ assert.equal(first.total,8201);assert.equal(first.classes.length,500);assert.equal(first.nextOffset,500)
+ const tail=runtimeDexClassMatches({},object,'',8000)
+ assert.equal(tail.offset,8000);assert.equal(tail.classes.length,201);assert.equal(tail.nextOffset,null)
+ const search=runtimeDexClassMatches({},object,'Class8200;')
+ assert.deepEqual(search.classes,['Lpkg/Class8200;']);assert.equal(search.total,1)
+})
+test('malformed object and class/source fields stay unknown without rendering crashes', () => {
+ const projection=projectDexEvidence({content_dex_class_index:{objects:[null,{sha256:'a'.repeat(64),bytes:1,sources:null,classes:['ok',null]}]},dex_sets:{}})
+ assert.equal(projection.objects.length,1);assert.ok(projection.warnings.length)
+ assert.equal(runtimeDexClassMatches({},projection.objects[0],'').status,'unknown')
+ assert.equal(runtimeDexClassMatches({},null,'').total,null)
+ assert.equal(projectDexEvidence({}).status,'unknown')
+ assert.equal(projectDexEvidence({content_dex_class_index:{objects:[]}}).status,'empty')
 })

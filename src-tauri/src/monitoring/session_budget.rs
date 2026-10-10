@@ -3,7 +3,7 @@ use serde::Serialize;
 use std::{
     collections::BTreeMap,
     fs::{File, OpenOptions},
-    io::{self, Write},
+    io::{self, Read, Seek, SeekFrom, Write},
     path::{Component, Path, PathBuf},
     sync::{Mutex, OnceLock},
     time::{Duration, Instant},
@@ -395,16 +395,49 @@ impl Write for BudgetFile {
         charge(&self.path, 0)
     }
 }
+/// Cooperative checks use the existing phase and output scope. A single
+/// blocking read/seek cannot be preempted; its result is rejected after expiry.
+/// Reads retain their full validation and never charge payload as output writes.
+pub(super) struct CheckedReader<R> {
+    inner: R,
+    checkpoint: PathBuf,
+}
+impl<R> CheckedReader<R> {
+    pub(super) fn new(inner: R, checkpoint: &Path) -> Self {
+        Self {
+            inner,
+            checkpoint: checkpoint.to_owned(),
+        }
+    }
+}
+impl<R: Read> Read for CheckedReader<R> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        charge(&self.checkpoint, 0)?;
+        let limit = buf.len().min(65536);
+        let result = self.inner.read(&mut buf[..limit]);
+        charge(&self.checkpoint, 0)?;
+        result
+    }
+}
+impl<R: Seek> Seek for CheckedReader<R> {
+    fn seek(&mut self, position: SeekFrom) -> io::Result<u64> {
+        charge(&self.checkpoint, 0)?;
+        let result = self.inner.seek(position);
+        charge(&self.checkpoint, 0)?;
+        result
+    }
+}
 pub fn copy(src: impl AsRef<Path>, dest: impl AsRef<Path>) -> io::Result<u64> {
-    if !states()
-        .lock()
-        .map_err(|_| io::Error::other("budget lock"))?
-        .values()
-        .any(|s| s.roots.iter().any(|r| dest.as_ref().starts_with(r)))
+    if super::session_deadline::current().is_none()
+        && !states()
+            .lock()
+            .map_err(|_| io::Error::other("budget lock"))?
+            .values()
+            .any(|s| s.roots.iter().any(|r| dest.as_ref().starts_with(r)))
     {
         return std::fs::copy(src, dest);
     }
-    let mut src = File::open(src)?;
+    let mut src = CheckedReader::new(File::open(src)?, dest.as_ref());
     let mut dest = BudgetFile::create(dest)?;
     io::copy(&mut src, &mut dest)
 }
@@ -426,6 +459,42 @@ impl Default for Limits {
             total_bytes: 2 * 1024 * 1024 * 1024,
             max_seconds: 300,
         }
+    }
+}
+#[derive(Clone, Debug, Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CaptureTime {
+    pub max_seconds: u64,
+    pub l2_max_seconds: u64,
+}
+#[derive(Clone, Debug, Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SaveTime {
+    pub transfer_max_seconds: u64,
+    pub archive_max_seconds: u64,
+    pub import_max_seconds: u64,
+}
+impl CaptureTime {
+    fn validate(&self) -> Result<(), String> {
+        if !(30..=3600).contains(&self.max_seconds)
+            || !(1..=self.max_seconds).contains(&self.l2_max_seconds)
+        {
+            return Err("采集时限须30–3600秒，L2须1秒以上且不超过采集总时限；未延长".into());
+        }
+        Ok(())
+    }
+}
+impl SaveTime {
+    fn caps_ms(&self) -> Result<[u64; 3], String> {
+        let seconds = [
+            self.transfer_max_seconds,
+            self.archive_max_seconds,
+            self.import_max_seconds,
+        ];
+        if seconds.iter().any(|n| !(1..=3600).contains(n)) {
+            return Err("保存各阶段时限须1–3600秒整数；未延长".into());
+        }
+        Ok(seconds.map(|n| n * 1000))
     }
 }
 #[derive(Clone, Debug, Serialize, serde::Deserialize)]
@@ -467,20 +536,99 @@ pub struct TimePhase {
     /// Parent remaining-time coordinate, not a new clock/token.
     pub stop_at_parent_remaining_ms: Option<u64>,
     pub completed: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub started_unix_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub finished_unix_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub elapsed_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub started_at_parent_remaining_ms: Option<u64>,
 }
 #[derive(Clone, Debug, Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct TimePlan {
     pub schema: String,
     pub final_reserve_ms: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capture_max_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub l2_max_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capture_stop_at_parent_remaining_ms: Option<u64>,
     pub phases: Vec<TimePhase>,
 }
 fn manager_reserve() -> u64 {
     2 * 1024 * 1024
 }
+fn export_kind(kind: &str) -> bool {
+    matches!(kind, "transfer" | "archive" | "import" | "terminal")
+}
+fn save_windows() -> &'static Mutex<BTreeMap<uuid::Uuid, super::session_deadline::Deadline>> {
+    static WINDOWS: OnceLock<Mutex<BTreeMap<uuid::Uuid, super::session_deadline::Deadline>>> =
+        OnceLock::new();
+    WINDOWS.get_or_init(|| Mutex::new(BTreeMap::new()))
+}
 impl Contract {
     pub fn deadline(&self) -> Result<super::session_deadline::Deadline, String> {
         super::session_deadline::Deadline::lookup(self.deadline_token)
+    }
+    /// A restarted app has no capture clock. Export of an already finished parent
+    /// gets one process-local save window and does not receive a new capture token.
+    fn detached_save_window(&self) -> Result<super::session_deadline::Deadline, String> {
+        let token = self.deadline_token.ok_or_else(|| {
+            "parent_deadline_unknown: 编排进程重启/旧合同，不能重建总时限；保留证据，新采集须新父会话"
+                .to_owned()
+        })?;
+        let mut windows = save_windows()
+            .lock()
+            .map_err(|_| "budget lock".to_owned())?;
+        if let Some(window) = windows.get(&token) {
+            return Ok(window.clone());
+        }
+        let mut ms = self
+            .time_plan
+            .as_ref()
+            .map(|plan| {
+                plan.phases
+                    .iter()
+                    .filter(|phase| export_kind(&phase.kind))
+                    .map(|phase| phase.cap_ms)
+                    .sum()
+            })
+            .unwrap_or(500_000);
+        if ms < 30_000 {
+            ms = 30_000;
+        }
+        if ms > 900_000 {
+            ms = 900_000;
+        }
+        let window = super::session_deadline::Deadline::new(std::time::Duration::from_millis(ms));
+        windows.insert(token, window.clone());
+        Ok(window)
+    }
+    pub fn export_remaining_ms(&self, kind: &str) -> Result<u64, String> {
+        let cap = self
+            .time_plan
+            .as_ref()
+            .and_then(|plan| plan.phases.iter().find(|phase| phase.kind == kind))
+            .map(|phase| phase.cap_ms)
+            .unwrap_or(255_000);
+        let left = self.detached_save_window()?.remaining_ms()?;
+        let grant = left.min(cap);
+        if grant == 0 {
+            return Err("parent_deadline_exhausted".into());
+        }
+        Ok(grant)
+    }
+    fn detached_export_phase(
+        &self,
+        kind: &str,
+    ) -> Result<super::session_deadline::Deadline, String> {
+        let window = self.detached_save_window()?;
+        let left = window.remaining_ms()?;
+        let grant = self.export_remaining_ms(kind)?.min(left);
+        window.before_parent_remaining(left - grant)
     }
     pub fn validate(&self) -> Result<(), String> {
         if self.schema != "mobilee.session-output-budget/v1"
@@ -655,8 +803,15 @@ impl Contract {
             }))
     }
     pub fn reserve(&mut self, id: String, kind: &str, now: u64) -> Result<(u64, u64), String> {
-        let monotonic_ms = self.deadline()?.remaining_ms()?;
-        if now >= self.deadline_unix_ms {
+        let monotonic_ms = match self.deadline() {
+            Ok(clock) => clock.remaining_ms()?,
+            Err(error) if export_kind(kind) && error.contains("parent_deadline_unknown") => {
+                self.detached_save_window()?.remaining_ms()?
+            }
+            Err(error) => return Err(error),
+        };
+        if !self.time_plan.as_ref().is_some_and(TimePlan::explicit) && now >= self.deadline_unix_ms
+        {
             return Err("parent_deadline_exhausted".into());
         }
         if self
@@ -668,7 +823,17 @@ impl Contract {
         }
         let allowance = if self.time_plan.is_some() {
             if matches!(kind, "transfer" | "archive" | "import") {
-                self.collection_remaining_ms(now)?
+                if self.time_plan.as_ref().is_some_and(TimePlan::explicit) {
+                    match self.parent_remaining_ms(now) {
+                        Ok(ms) => ms,
+                        Err(error) if error.contains("parent_deadline_unknown") => {
+                            self.detached_save_window()?.remaining_ms()?
+                        }
+                        Err(error) => return Err(error),
+                    }
+                } else {
+                    self.collection_remaining_ms(now)?
+                }
             } else {
                 self.begin_time_phase(kind, now)?
             }
@@ -727,7 +892,33 @@ impl Contract {
         });
         Ok((quota, allowance))
     }
+    /// Reuse this kind's existing export slot for another pull. The reserved
+    /// byte quota stays the same; only the path and the previous charge move.
+    pub fn retarget_unfinished_export(&mut self, kind: &str, id: String) {
+        let slot = self.reservations.iter_mut().find(|reservation| {
+            reservation.kind == kind
+                && matches!(
+                    reservation.status.as_str(),
+                    "partial" | "not_started" | "reserved" | "admitted_plus_terminal_reserve"
+                )
+        });
+        let Some(slot) = slot else {
+            return;
+        };
+        slot.id = id;
+        if slot.status != "reserved" {
+            slot.charged_bytes = None;
+            slot.status = "reserved".into();
+        }
+    }
     pub fn settle(&mut self, id: &str, receipt: &serde_json::Value) -> Result<(), String> {
+        let timing_kind = self
+            .reservations
+            .iter()
+            .find(|r| r.id == id)
+            .map(|r| r.kind.clone())
+            .ok_or("没有预算预留")?;
+        self.finish_phase_timing(&timing_kind, super::now_millis())?;
         let r = self
             .reservations
             .iter_mut()
@@ -1357,6 +1548,15 @@ fn planned_dump_ms(total_ms: u64) -> u64 {
 
 impl TimePlan {
     fn validate(&self, total_ms: u64) -> Result<(), String> {
+        if self.schema == "mobilee.session-time-plan/v5" {
+            return self.validate_explicit(total_ms);
+        }
+        if self.capture_max_ms.is_some()
+            || self.l2_max_ms.is_some()
+            || self.capture_stop_at_parent_remaining_ms.is_some()
+        {
+            return Err("旧时间计划不能附加新采集期限".into());
+        }
         let (archive_ms, import_ms, final_ms) = match self.schema.as_str() {
             "mobilee.session-time-plan/v1" => (60000, 75000, 140000),
             "mobilee.session-time-plan/v2"
@@ -1483,6 +1683,9 @@ impl Contract {
             }
             .into(),
             final_reserve_ms: final_ms,
+            capture_max_ms: None,
+            l2_max_ms: None,
+            capture_stop_at_parent_remaining_ms: None,
             phases: caps
                 .into_iter()
                 .map(|(kind, cap_ms)| TimePhase {
@@ -1490,6 +1693,10 @@ impl Contract {
                     cap_ms,
                     stop_at_parent_remaining_ms: None,
                     completed: false,
+                    started_unix_ms: None,
+                    finished_unix_ms: None,
+                    elapsed_ms: None,
+                    started_at_parent_remaining_ms: None,
                 })
                 .collect(),
         });
@@ -1498,10 +1705,15 @@ impl Contract {
     }
     fn parent_remaining_ms(&self, now: u64) -> Result<u64, String> {
         let mono = self.deadline()?.remaining_ms()?;
+        // v5 wall timestamps are receipts, never a second expiry clock. The
+        // original monotonic token remains authoritative across either wall jump.
+        if self.time_plan.as_ref().is_some_and(TimePlan::explicit) {
+            return Ok(mono);
+        }
         if now >= self.deadline_unix_ms {
             return Err("parent_deadline_exhausted".into());
         }
-        // New leases use only the monotonic coordinate; wall-clock rollback cannot renew them.
+        // Retained v1-v4 contracts keep their original wall expiry compatibility.
         Ok(if self.time_plan.is_some() {
             mono
         } else {
@@ -1516,7 +1728,10 @@ impl Contract {
         };
         plan.validate(self.limits.max_seconds * 1000)?;
         remaining
-            .checked_sub(plan.final_reserve_ms)
+            .checked_sub(
+                plan.capture_stop_at_parent_remaining_ms
+                    .unwrap_or(plan.final_reserve_ms),
+            )
             .filter(|n| *n > 0)
             .ok_or_else(|| {
                 format!(
@@ -1546,6 +1761,39 @@ impl Contract {
                 .map(|n| n.min(plan.phases[index].cap_ms))
                 .filter(|n| *n > 0)
                 .ok_or("phase_time_exhausted: 不重置原阶段期限".into());
+        }
+        if plan.explicit() {
+            let held = if collection_kind(kind) {
+                plan.capture_stop_at_parent_remaining_ms
+                    .ok_or("采集截止点缺失")?
+            } else {
+                let order = ["transfer", "archive", "import", "terminal"];
+                let rank = order
+                    .iter()
+                    .position(|p| *p == kind)
+                    .ok_or("未知保存阶段")?;
+                plan.phases
+                    .iter()
+                    .filter(|p| {
+                        !p.completed
+                            && order
+                                .iter()
+                                .position(|k| *k == p.kind)
+                                .is_some_and(|i| i > rank)
+                    })
+                    .map(|p| p.cap_ms)
+                    .sum()
+            };
+            let grant = remaining
+                .checked_sub(held)
+                .filter(|n| *n > 0)
+                .ok_or("parent_deadline_exhausted: capture or later save boundary")?
+                .min(plan.phases[index].cap_ms);
+            let phase = &mut plan.phases[index];
+            phase.stop_at_parent_remaining_ms = Some(remaining - grant);
+            phase.started_at_parent_remaining_ms = Some(remaining);
+            phase.started_unix_ms = Some(now);
+            return Ok(grant);
         }
         let held = plan
             .phases
@@ -1951,6 +2199,27 @@ impl TimePlan {
         if durations.len() != 3 {
             return Err("时间计划观察窗口缺失".into());
         }
+        if self.explicit() {
+            let padding = if durations[1] > 30 { 15 } else { 10 };
+            let caps = if separate {
+                vec![
+                    ("l0", (durations[0] + 10) * 1000),
+                    ("l1", (durations[1] + padding) * 1000),
+                    ("linker", (durations[2] + 10) * 1000),
+                ]
+            } else {
+                vec![("unified", (durations.iter().sum::<u64>() + 15) * 1000)]
+            };
+            if caps.iter().any(|(kind, cap)| {
+                !self
+                    .phases
+                    .iter()
+                    .any(|p| p.kind == *kind && p.cap_ms == *cap)
+            }) {
+                return Err("显式时间计划与观察配置不一致".into());
+            }
+            return Ok(());
+        }
         let l1_padding = if matches!(
             self.schema.as_str(),
             "mobilee.session-time-plan/v2"
@@ -2005,9 +2274,24 @@ impl Contract {
     /// Completion fence: read the first lease without starting, renewing or settling it.
     pub fn check_time_phase(&self, kind: &str, now: u64) -> Result<(), String> {
         if self.time_plan.is_none() {
-            return self.deadline()?.check();
+            return match self.deadline() {
+                Ok(clock) => clock.check(),
+                Err(error) if export_kind(kind) && error.contains("parent_deadline_unknown") => {
+                    self.detached_save_window()?.check()
+                }
+                Err(error) => Err(error),
+            };
         }
-        let remaining = self.parent_remaining_ms(now)?;
+        let remaining = match self.parent_remaining_ms(now) {
+            Ok(ms) => ms,
+            // The capture clock died with the process. A finished export already
+            // ran under its own save window; that is not an incomplete archive.
+            Err(error) if export_kind(kind) && error.contains("parent_deadline_unknown") => {
+                self.detached_save_window()?.check()?;
+                return Ok(());
+            }
+            Err(error) => return Err(error),
+        };
         let plan = self.time_plan.as_ref().unwrap();
         plan.validate(self.limits.max_seconds * 1000)?;
         let phase = plan
@@ -2142,6 +2426,7 @@ impl Contract {
             return Err("已有计量/未知终态，不能记为未启动".into());
         }
         let kind = r.kind.clone();
+        self.finish_phase_timing(&kind, super::now_millis())?;
         if let Some(plan) = self.time_plan.as_mut() {
             let phase = plan
                 .phases
@@ -2339,5 +2624,586 @@ mod coordinated_export_tests {
             &[15, 90, 15]
         )
         .is_err());
+    }
+}
+
+fn collection_kind(kind: &str) -> bool {
+    matches!(kind, "l0" | "l1" | "linker" | "unified" | "dump")
+}
+impl TimePlan {
+    fn explicit(&self) -> bool {
+        self.schema == "mobilee.session-time-plan/v5"
+    }
+    fn validate_explicit(&self, total_ms: u64) -> Result<(), String> {
+        let capture = self.capture_max_ms.ok_or("缺显式采集时限")?;
+        let l2 = self.l2_max_ms.ok_or("缺显式L2时限")?;
+        if !(30_000..=3_600_000).contains(&capture) || l2 == 0 || l2 > capture {
+            return Err("显式采集/L2时限无效".into());
+        }
+        let mut names = std::collections::BTreeSet::new();
+        for p in &self.phases {
+            if !names.insert(p.kind.as_str())
+                || p.cap_ms == 0
+                || p.cap_ms > 3_600_000
+                || p.stop_at_parent_remaining_ms.is_some_and(|n| n > total_ms)
+                || p.started_at_parent_remaining_ms
+                    .is_some_and(|n| n > total_ms)
+                || (p.started_unix_ms.is_some() != p.started_at_parent_remaining_ms.is_some())
+                || (p.finished_unix_ms.is_some() != p.elapsed_ms.is_some())
+                || (p.finished_unix_ms.is_some() && p.started_unix_ms.is_none())
+                || (p.stop_at_parent_remaining_ms.is_some()
+                    != p.started_at_parent_remaining_ms.is_some())
+                || p.stop_at_parent_remaining_ms
+                    .zip(p.started_at_parent_remaining_ms)
+                    .is_some_and(|(stop, start)| {
+                        stop > start
+                            || start - stop > p.cap_ms
+                            || (collection_kind(&p.kind)
+                                && self
+                                    .capture_stop_at_parent_remaining_ms
+                                    .is_some_and(|n| stop < n))
+                    })
+            {
+                return Err("显式阶段身份/计时坐标无效".into());
+            }
+        }
+        let separate = names.contains("l0")
+            && names.contains("l1")
+            && names.contains("linker")
+            && !names.contains("unified");
+        let unified = names.contains("unified")
+            && !names.contains("l0")
+            && !names.contains("l1")
+            && !names.contains("linker");
+        if !(separate || unified) || names.len() != if separate { 8 } else { 6 } {
+            return Err("显式阶段组合无效".into());
+        }
+        let cap = |kind: &str| {
+            self.phases
+                .iter()
+                .find(|p| p.kind == kind)
+                .map(|p| p.cap_ms)
+                .ok_or("缺显式保存/快照阶段")
+        };
+        let transfer = cap("transfer")?;
+        let archive = cap("archive")?;
+        let import = cap("import")?;
+        let terminal = cap("terminal")?;
+        let post = transfer + archive + import + terminal;
+        if terminal != 5000
+            || cap("dump")? != l2
+            || capture + post != total_ms
+            || self.capture_stop_at_parent_remaining_ms != Some(post)
+            || self.final_reserve_ms != archive + import + terminal
+        {
+            return Err("显式采集/保存时限总和不匹配；未隐式延长".into());
+        }
+        Ok(())
+    }
+}
+impl Contract {
+    pub fn new_explicit_with_time(
+        limits: Limits,
+        now: u64,
+        separate: bool,
+        durations: &[u64],
+        capture: CaptureTime,
+        save: SaveTime,
+    ) -> Result<Self, String> {
+        capture.validate()?;
+        let post = save.caps_ms()?;
+        if durations.len() != 3 || durations.iter().any(|n| !(1..=300).contains(n)) {
+            return Err("无效观察时间配置".into());
+        }
+        if limits.max_seconds.checked_mul(1000).ok_or("总时限溢出")?
+            != capture.max_seconds * 1000 + post.iter().sum::<u64>() + 5000
+        {
+            return Err("总流程时限必须等于采集、保存三阶段及终态5秒之和；未隐式延长".into());
+        }
+        let mut c = Self::new_planned(limits, now, separate)?;
+        for slot in &mut c.reservations {
+            if matches!(slot.kind.as_str(), "archive" | "import") {
+                slot.reserved_bytes = c.limits.total_bytes / 4;
+            }
+        }
+        c.coordinated_exports = true;
+        if c.remaining() < if separate { 4 * 131072 } else { 2 * 131072 } {
+            return Err("协调采集/导出容量不足；未启动".into());
+        }
+        let padding = if durations[1] > 30 { 15 } else { 10 };
+        let mut caps = if separate {
+            vec![
+                ("l0", (durations[0] + 10) * 1000),
+                ("l1", (durations[1] + padding) * 1000),
+                ("linker", (durations[2] + 10) * 1000),
+            ]
+        } else {
+            vec![("unified", (durations.iter().sum::<u64>() + 15) * 1000)]
+        };
+        caps.extend([
+            ("dump", capture.l2_max_seconds * 1000),
+            ("transfer", post[0]),
+            ("archive", post[1]),
+            ("import", post[2]),
+            ("terminal", 5000),
+        ]);
+        c.time_plan = Some(TimePlan {
+            schema: "mobilee.session-time-plan/v5".into(),
+            final_reserve_ms: post[1] + post[2] + 5000,
+            capture_max_ms: Some(capture.max_seconds * 1000),
+            l2_max_ms: Some(capture.l2_max_seconds * 1000),
+            capture_stop_at_parent_remaining_ms: Some(post.iter().sum::<u64>() + 5000),
+            phases: caps
+                .into_iter()
+                .map(|(kind, cap_ms)| TimePhase {
+                    kind: kind.into(),
+                    cap_ms,
+                    stop_at_parent_remaining_ms: None,
+                    completed: false,
+                    started_unix_ms: None,
+                    finished_unix_ms: None,
+                    elapsed_ms: None,
+                    started_at_parent_remaining_ms: None,
+                })
+                .collect(),
+        });
+        c.validate()?;
+        c.time_plan
+            .as_ref()
+            .unwrap()
+            .validate_observations(separate, durations)?;
+        Ok(c)
+    }
+    /// Fixed collection domain derived from the parent's original Instant.
+    pub fn collection_deadline(&self) -> Result<super::session_deadline::Deadline, String> {
+        let parent = self.deadline()?;
+        match self.time_plan.as_ref().filter(|p| p.explicit()) {
+            Some(plan) => parent.before_parent_remaining(
+                plan.capture_stop_at_parent_remaining_ms
+                    .ok_or("缺采集截止点")?,
+            ),
+            None => Ok(parent),
+        }
+    }
+    /// Read the first phase lease only. Never reconstruct now+old_grant.
+    pub fn phase_deadline(&self, kind: &str) -> Result<super::session_deadline::Deadline, String> {
+        let parent = match self.deadline() {
+            Ok(clock) => clock,
+            Err(error) if export_kind(kind) && error.contains("parent_deadline_unknown") => {
+                return self.detached_export_phase(kind);
+            }
+            Err(error) => return Err(error),
+        };
+        let Some(plan) = self.time_plan.as_ref().filter(|p| p.explicit()) else {
+            return Ok(parent);
+        };
+        let phase = plan
+            .phases
+            .iter()
+            .find(|p| p.kind == kind)
+            .ok_or("缺阶段期限")?;
+        if phase.completed {
+            if export_kind(kind) {
+                return self.detached_export_phase(kind);
+            }
+            return Err("时间阶段已终结".into());
+        }
+        parent.before_parent_remaining(phase.stop_at_parent_remaining_ms.ok_or("阶段期限未开始")?)
+    }
+    pub fn finish_phase_timing(&mut self, kind: &str, now: u64) -> Result<(), String> {
+        let Some(plan) = self.time_plan.as_ref().filter(|p| p.explicit()) else {
+            return Ok(());
+        };
+        let Some(phase) = plan.phases.iter().find(|p| p.kind == kind) else {
+            return Err("缺阶段计时".into());
+        };
+        if phase.finished_unix_ms.is_some() || phase.started_unix_ms.is_none() {
+            return Ok(());
+        }
+        let elapsed = self
+            .deadline()?
+            .elapsed_from_remaining(phase.started_at_parent_remaining_ms.ok_or("缺原计时坐标")?)?;
+        let phase = self
+            .time_plan
+            .as_mut()
+            .unwrap()
+            .phases
+            .iter_mut()
+            .find(|p| p.kind == kind)
+            .unwrap();
+        phase.finished_unix_ms = Some(now);
+        phase.elapsed_ms = Some(elapsed);
+        Ok(())
+    }
+    pub fn validate_explicit_configuration(
+        &self,
+        capture: &CaptureTime,
+        save: &SaveTime,
+    ) -> Result<(), String> {
+        let plan = self.time_plan.as_ref().ok_or("缺时间计划")?;
+        if !plan.explicit() {
+            return Err("配置与旧时间计划不匹配".into());
+        }
+        capture.validate()?;
+        let post = save.caps_ms()?;
+        if plan.capture_max_ms != Some(capture.max_seconds * 1000)
+            || plan.l2_max_ms != Some(capture.l2_max_seconds * 1000)
+            || ["transfer", "archive", "import"]
+                .iter()
+                .zip(post)
+                .any(|(kind, cap)| {
+                    !plan
+                        .phases
+                        .iter()
+                        .any(|p| p.kind == *kind && p.cap_ms == cap)
+                })
+        {
+            return Err("原请求与显式时间计划不一致".into());
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod manual_time_v5 {
+    use super::*;
+    fn explicit(capture: u64, l2: u64) -> Contract {
+        Contract::new_explicit_with_time(
+            Limits {
+                total_bytes: 4 * 1024 * 1024 * 1024,
+                max_seconds: capture + 255 + 120 + 120 + 5,
+            },
+            super::super::now_millis(),
+            true,
+            &[15, 90, 15],
+            CaptureTime {
+                max_seconds: capture,
+                l2_max_seconds: l2,
+            },
+            SaveTime {
+                transfer_max_seconds: 255,
+                archive_max_seconds: 120,
+                import_max_seconds: 120,
+            },
+        )
+        .unwrap()
+    }
+    #[test]
+    fn explicit_capture_and_l2_are_not_inferred_from_whole_flow() {
+        let c = explicit(400, 15);
+        assert_eq!(c.limits.max_seconds, 900);
+        let p = c.time_plan.as_ref().unwrap();
+        assert_eq!(p.capture_max_ms, Some(400000));
+        assert_eq!(p.l2_max_ms, Some(15000));
+        assert_eq!(
+            p.phases.iter().find(|p| p.kind == "dump").unwrap().cap_ms,
+            15000
+        );
+        assert_eq!(p.capture_stop_at_parent_remaining_ms, Some(500000));
+        let mut limits = c.limits.clone();
+        limits.max_seconds = 901;
+        assert!(Contract::new_explicit_with_time(
+            limits,
+            super::super::now_millis(),
+            true,
+            &[15, 90, 15],
+            CaptureTime {
+                max_seconds: 400,
+                l2_max_seconds: 15
+            },
+            SaveTime {
+                transfer_max_seconds: 255,
+                archive_max_seconds: 120,
+                import_max_seconds: 120
+            }
+        )
+        .is_err());
+    }
+    #[test]
+    fn fixed_capture_expiry_refuses_collection_but_allows_original_save_budget() {
+        let mut c = explicit(30, 15);
+        c.deadline_token = Some(super::super::session_deadline::Deadline::register(
+            Duration::from_millis(500040),
+        ));
+        let token = c.deadline_token;
+        let (_, grant) = c
+            .reserve("l1".into(), "l1", super::super::now_millis())
+            .unwrap();
+        assert!(grant <= 40);
+        assert_eq!(
+            c.time_plan
+                .as_ref()
+                .unwrap()
+                .phases
+                .iter()
+                .find(|p| p.kind == "l1")
+                .unwrap()
+                .cap_ms,
+            105000
+        );
+        let phase = c.phase_deadline("l1").unwrap();
+        std::thread::sleep(Duration::from_millis(50));
+        assert!(phase.check().is_err());
+        assert!(c.collection_deadline().is_err());
+        assert!(c
+            .reserve("new-dump".into(), "dump", super::super::now_millis())
+            .is_err());
+        assert!(c
+            .reserve(
+                "export:transfer".into(),
+                "transfer",
+                super::super::now_millis()
+            )
+            .is_ok());
+        let transfer = c
+            .begin_time_phase("transfer", super::super::now_millis())
+            .unwrap();
+        assert!(transfer <= 255000 && transfer > 254000);
+        assert_eq!(token, c.deadline_token);
+        c.finish_phase_timing("l1", super::super::now_millis())
+            .unwrap();
+        let p = c
+            .time_plan
+            .as_ref()
+            .unwrap()
+            .phases
+            .iter()
+            .find(|p| p.kind == "l1")
+            .unwrap();
+        assert!(p.elapsed_ms.unwrap() >= 50);
+        assert!(p.finished_unix_ms.is_some());
+    }
+    #[test]
+    fn preflight_and_repeat_phase_lookup_spend_first_absolute_boundary() {
+        let mut c = explicit(30, 15);
+        c.deadline_token = Some(super::super::session_deadline::Deadline::register(
+            Duration::from_millis(500060),
+        ));
+        c.reserve("l0".into(), "l0", super::super::now_millis())
+            .unwrap();
+        let stop = c.time_plan.as_ref().unwrap().phases[0].stop_at_parent_remaining_ms;
+        let first = c.phase_deadline("l0").unwrap();
+        std::thread::sleep(Duration::from_millis(25));
+        let second = c.phase_deadline("l0").unwrap();
+        assert!(second.remaining_ms().unwrap() <= 35);
+        assert_eq!(
+            stop,
+            c.time_plan.as_ref().unwrap().phases[0].stop_at_parent_remaining_ms
+        );
+        std::thread::sleep(Duration::from_millis(40));
+        assert!(first.check().is_err());
+        assert!(second.check().is_err());
+        assert!(c
+            .begin_time_phase("l0", super::super::now_millis())
+            .is_err());
+    }
+    #[test]
+    fn legacy_receipts_keep_original_caps_and_unknown_actual_time() {
+        let c = Contract::new_planned_with_time(
+            Limits {
+                total_bytes: 4 * 1024 * 1024 * 1024,
+                max_seconds: 900,
+            },
+            super::super::now_millis(),
+            true,
+            &[15, 90, 15],
+        )
+        .unwrap();
+        let v = serde_json::to_value(&c).unwrap();
+        assert_eq!(v["timePlan"]["schema"], "mobilee.session-time-plan/v4");
+        assert!(v["timePlan"].get("captureMaxMs").is_none());
+        assert!(v["timePlan"]["phases"][0].get("elapsedMs").is_none());
+        let decoded: Contract = serde_json::from_value(v.clone()).unwrap();
+        decoded.validate().unwrap();
+        assert_eq!(serde_json::to_value(decoded).unwrap(), v);
+    }
+    #[test]
+    fn malformed_explicit_coordinates_and_restart_cannot_renew() {
+        let mut c = explicit(400, 245);
+        c.time_plan
+            .as_mut()
+            .unwrap()
+            .capture_stop_at_parent_remaining_ms = Some(499999);
+        assert!(c.validate().is_err());
+        let mut c = explicit(400, 245);
+        c.deadline_token = None;
+        assert!(c.collection_deadline().is_err());
+        assert!(c
+            .reserve("l0".into(), "l0", super::super::now_millis())
+            .is_err());
+    }
+    #[test]
+    fn wall_forward_jump_cannot_expire_or_renew_v5_first_lease() {
+        let mut c = explicit(400, 15);
+        let token = c.deadline_token;
+        let wall_deadline = c.deadline_unix_ms;
+        let jumped_now = wall_deadline.saturating_add(1);
+        let first = c.begin_time_phase("l0", jumped_now).unwrap();
+        let boundary = c.time_plan.as_ref().unwrap().phases[0].stop_at_parent_remaining_ms;
+        std::thread::sleep(Duration::from_millis(5));
+        let (_, repeat) = c.reserve("l0-wall-jump".into(), "l0", u64::MAX).unwrap();
+        assert!(first <= 25000 && repeat < first);
+        assert_eq!(
+            boundary,
+            c.time_plan.as_ref().unwrap().phases[0].stop_at_parent_remaining_ms
+        );
+        assert!(c
+            .reserve("save-wall-jump".into(), "transfer", u64::MAX)
+            .is_ok());
+        assert!(c.begin_time_phase("transfer", u64::MAX).unwrap() <= 255000);
+        assert_eq!(token, c.deadline_token);
+        assert_eq!(wall_deadline, c.deadline_unix_ms);
+        c.validate().unwrap();
+    }
+    #[test]
+    fn legacy_forward_wall_expiry_keeps_original_behavior() {
+        let mut legacy = Contract::new_planned_with_time(
+            Limits {
+                total_bytes: 4294967296,
+                max_seconds: 900,
+            },
+            1,
+            true,
+            &[15, 90, 15],
+        )
+        .unwrap();
+        let jumped_now = legacy.deadline_unix_ms + 1;
+        assert!(legacy.deadline().unwrap().check().is_ok());
+        assert!(legacy.begin_time_phase("l0", jumped_now).is_err());
+        assert!(legacy
+            .reserve("legacy-wall-jump".into(), "l0", jumped_now)
+            .is_err());
+        legacy.time_plan = None;
+        assert!(legacy
+            .reserve("legacy-no-plan".into(), "l0", jumped_now)
+            .is_err());
+    }
+    #[test]
+    fn v5_real_monotonic_expiry_rejects_reserve_even_after_wall_rollback() {
+        let mut c = explicit(30, 1);
+        c.deadline_token = Some(super::super::session_deadline::Deadline::register(
+            Duration::from_millis(15),
+        ));
+        let token = c.deadline_token;
+        std::thread::sleep(Duration::from_millis(25));
+        assert!(c
+            .parent_remaining_ms(0)
+            .unwrap_err()
+            .contains("parent_deadline_exhausted"));
+        assert!(c.begin_time_phase("dump", 0).is_err());
+        assert!(c.reserve("expired-save".into(), "transfer", 0).is_err());
+        assert_eq!(c.deadline_token, token);
+    }
+}
+
+#[cfg(test)]
+mod cooperative_read_deadline_tests {
+    use super::*;
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
+    struct SlowReader {
+        calls: Arc<AtomicUsize>,
+        delay: Duration,
+    }
+    impl Read for SlowReader {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            std::thread::sleep(self.delay);
+            if buf.is_empty() {
+                return Ok(0);
+            }
+            buf[0] = b'x';
+            Ok(1)
+        }
+    }
+    fn scope() -> PathBuf {
+        std::env::temp_dir().join(format!("me-read-check-{}", uuid::Uuid::new_v4()))
+    }
+    #[test]
+    fn expired_guard_refuses_before_any_underlying_read() {
+        let path = scope();
+        let guard = Guard::install(vec![path.clone()], 0, 1).unwrap();
+        std::thread::sleep(Duration::from_millis(8));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut reader = CheckedReader::new(
+            SlowReader {
+                calls: calls.clone(),
+                delay: Duration::ZERO,
+            },
+            &path,
+        );
+        assert!(reader
+            .read(&mut [0; 1])
+            .unwrap_err()
+            .to_string()
+            .contains("time_budget_exhausted"));
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert_eq!(guard.receipt().admitted_write_bytes, 0);
+        assert!(guard.receipt().partial);
+        assert_eq!(
+            guard.receipt().reason.as_deref(),
+            Some("time_budget_exhausted")
+        );
+    }
+    #[test]
+    fn blocking_read_overrun_is_rejected_before_next_read_or_success() {
+        let path = scope();
+        let guard = Guard::install(vec![path.clone()], 0, 10).unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut reader = CheckedReader::new(
+            SlowReader {
+                calls: calls.clone(),
+                delay: Duration::from_millis(30),
+            },
+            &path,
+        );
+        let mut bytes = Vec::new();
+        assert!(reader
+            .read_to_end(&mut bytes)
+            .unwrap_err()
+            .to_string()
+            .contains("time_budget_exhausted"));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(bytes.is_empty());
+        assert_eq!(guard.receipt().admitted_write_bytes, 0);
+    }
+    #[test]
+    fn complete_reads_and_seek_keep_bytes_without_write_charge() {
+        let path = scope();
+        let guard = Guard::install(vec![path.clone()], 0, 1000).unwrap();
+        let bytes = vec![0x5a; 150000];
+        let mut reader = CheckedReader::new(io::Cursor::new(&bytes), &path);
+        let mut block = vec![0; 100000];
+        assert_eq!(reader.read(&mut block).unwrap(), 65536);
+        reader.seek(SeekFrom::Start(0)).unwrap();
+        let mut all = Vec::new();
+        reader.read_to_end(&mut all).unwrap();
+        assert_eq!(all, bytes);
+        assert_eq!(guard.receipt().admitted_write_bytes, 0);
+        assert!(!guard.receipt().partial);
+    }
+    #[tokio::test]
+    async fn original_phase_expiry_rejects_slow_read_without_cancelling_parent() {
+        let parent = super::super::session_deadline::Deadline::new(Duration::from_secs(1));
+        let phase = parent.before_parent_remaining(900).unwrap();
+        let path = scope();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let result = phase
+            .run(async {
+                let mut reader = CheckedReader::new(
+                    SlowReader {
+                        calls: calls.clone(),
+                        delay: Duration::from_millis(150),
+                    },
+                    &path,
+                );
+                reader.read(&mut [0; 1]).map_err(|e| e.to_string())
+            })
+            .await;
+        assert!(result.unwrap_err().contains("parent_deadline_exhausted"));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(parent.check().is_ok());
     }
 }

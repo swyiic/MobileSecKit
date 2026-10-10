@@ -54,6 +54,7 @@ const backendCalls=[]
 let readMode='success', resolvePending
 const group=(id)=>({schema:'mobilee.capture-group/v1',id,serial:'mock-only-no-device',package:'org.example.app',createdUnixMs:1791500000000,state:'partial',cancelRequested:false,unified:false,base:{},budget:{limits:{maxSeconds:900,totalBytes:8589934592},reservations:[],timePlan:{schema:'mobilee.session-time-plan/v4',phases:[{kind:'l0',capMs:25000},{kind:'l1',capMs:105000},{kind:'linker',capMs:25000},{kind:'dump',capMs:245000},{kind:'transfer',capMs:255000},{kind:'archive',capMs:120000},{kind:'import',capMs:120000},{kind:'terminal',capMs:5000}]}},stages:[{id:`stage-${id}`,key:'l1',mode:'tls',durationSeconds:90,launchAfterAttach:false,required:true,attempts:[{relation:{parentId:id,stageId:`stage-${id}`,attemptId:`attempt-${id}`,attempt:1,stageKey:'l1'},state:'partial',startedUnixMs:1791500000000,finishedUnixMs:1791500090000,sessionId:`session-${id}`,error:'real loss preserved'}]}]})
 const groups=[group('parent-a'),group('parent-b')]
+groups[1].budget.timePlan={schema:'mobilee.session-time-plan/v5',captureMaxMs:400000,l2MaxMs:245000,captureStopAtParentRemainingMs:500000,phases:[{kind:'transfer',capMs:255000,startedUnixMs:1791500100000,finishedUnixMs:1791500112500,elapsedMs:12500,completed:true},{kind:'archive',capMs:120000,completed:false},{kind:'import',capMs:120000,startedUnixMs:1791500112500,completed:false}]}
 const report=id=>({sessionId:`session-${id}`,reportSchema:'fixture',report:{session_id:`session-${id}`,execution_complete:true,mode_counts:{observe:5,inspect:2},quality:{lost_records:17},processes:[],limitations:['fixture coverage remains partial']}})
 globalThis.__runtimeFeedbackBackend=new Proxy({
   listKernSightGroups:async()=>groups,
@@ -114,12 +115,27 @@ test('switching sessions removes old report and nested details; old responses ca
 test('stored time plan is shown separately from observed windows and elapsed stage execution',async()=>{
   const ledger=find(n=>hasClass(n,'ks-time-ledger'),row('parent-a'))
   assert.match(text(ledger),/mobilee.session-time-plan\/v4/)
-  assert.match(text(ledger),/L2 快照上限 245s/)
-  assert.match(text(ledger),/保存传输上限 255s/)
+  assert.match(text(ledger),/L2 快照配置上限 245s/)
+  assert.match(text(ledger),/保存传输配置上限 255s/)
   assert.match(text(ledger),/L1 90s = 90s/)
-  assert.match(text(ledger),/阶段执行耗时/)
+  assert.match(text(ledger),/记录时间间隔/);assert.match(text(ledger),/实际耗时见上方阶段计时/);assert.match(find(n=>n.tag==='strong'&&text(n).includes('记录时间间隔'),ledger).props.title,/系统时钟调整会影响/);
   assert.match(text(ledger),/第 1 次90s/)
-  assert.match(text(ledger),/实际耗时若无原始字段则未知/)
+  assert.match(text(ledger),/实际耗时未知（原记录无字段）/)
+})
+
+test('v5 recorded actual timing stays distinct from caps and not-started or running phases',async()=>{
+  await click(summary('parent-b'))
+  const ledger=find(n=>hasClass(n,'ks-time-ledger'),row('parent-b'))
+  assert.match(text(ledger),/总采集上限 400s/)
+  assert.match(text(ledger),/保存传输配置上限 255s实际耗时 12.5s/)
+  assert.match(text(ledger),/归档配置上限 120s尚未开始/)
+  assert.match(text(ledger),/导入配置上限 120s计时中/)
+  const technical=find(n=>hasClass(n,'ks-group-technical'),row('parent-b'))
+  assert.match(text(technical),/本主会话尚未导入本地技术证据/)
+  const idCopy=find(n=>n.tag==='button'&&n.props['aria-label']==='复制完整主会话 ID',row('parent-b'))
+  assert.match(idCopy.props.title,/parent-b/)
+  assert.equal(text(childButton('parent-b')),'展开子证据')
+  await click(summary('parent-a'))
 })
 
 test('child read failure remains by its button and preserved loss is never converted to complete coverage',async()=>{

@@ -143,6 +143,14 @@ fn confirmed_helper_quota(poll: &Value) -> bool {
         })
 }
 
+/// Adapter budget omission is a counted gap, not kernel loss and not an empty ring.
+fn confirmed_adapter_omission(poll: &Value) -> bool {
+    poll["coverage_reasons"]["adapter_budget_omission"] == true
+        && poll["budget_skipped_raw"]
+            .as_u64()
+            .is_some_and(|omitted| omitted > 0 && omitted <= u64::from(u32::MAX))
+}
+
 // Queue coverage is independent of closed-producer and original-source safety.
 // Require explicit, internally consistent diagnostics; never infer absent fields.
 fn safe_closed_coverage(drain: &Value, poll: &Value) -> bool {
@@ -164,7 +172,8 @@ fn safe_closed_coverage(drain: &Value, poll: &Value) -> bool {
         && (drain["lost_samples"].as_u64().is_some_and(|n| n > 0)
             || drain["unknown_tail"] == true
             || poll["unread_tail_possible"] == true
-            || confirmed_helper_quota(poll))
+            || confirmed_helper_quota(poll)
+            || confirmed_adapter_omission(poll))
 }
 pub(super) fn authorize_phase(proof: Option<Value>, safe: bool) -> Option<Value> {
     if !safe {
@@ -420,6 +429,15 @@ mod tests {
         g.finish(&linker, Some(Uuid::new_v4()), None, None).unwrap();
         assert_eq!(g.state, "partial");
         assert_eq!(g.stages[1].attempts[0].state, "partial");
+
+        let omitted = json!({"schema":"kernsight.perf-poll-budget/v1","scope_failures":0,"perf_read_failures":0,"coverage_partial":true,"unread_tail_possible":false,"budget_skipped_raw":12,"coverage_reasons":{"adapter_budget_omission":true}});
+        assert!(safe_closed_coverage(&drain, &omitted));
+        let mut zero = omitted.clone();
+        zero["budget_skipped_raw"] = json!(0);
+        assert!(!safe_closed_coverage(&drain, &zero));
+        let mut unsafe_scope = omitted.clone();
+        unsafe_scope["scope_failures"] = json!(1);
+        assert!(!safe_closed_coverage(&drain, &unsafe_scope));
 
         for invalid in [
             json!({"producer_stopped":false}),

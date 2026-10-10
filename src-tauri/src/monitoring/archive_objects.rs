@@ -13,7 +13,14 @@ struct Reference {
     bytes: u64,
 }
 fn digest(path: &Path, expected: u64) -> Result<String, String> {
-    let mut source = File::open(path).map_err(|e| format!("读取失败 {}: {e}", path.display()))?;
+    digest_scoped(path, expected, path)
+}
+fn digest_scoped(path: &Path, expected: u64, checkpoint: &Path) -> Result<String, String> {
+    session_budget::charge(checkpoint, 0).map_err(|e| e.to_string())?;
+    let mut source = session_budget::CheckedReader::new(
+        File::open(path).map_err(|e| format!("读取失败 {}: {e}", path.display()))?,
+        checkpoint,
+    );
     let mut hash = Sha256::new();
     let mut count = 0u64;
     let mut buf = [0; 65536];
@@ -35,9 +42,12 @@ fn digest(path: &Path, expected: u64) -> Result<String, String> {
     }
     Ok(format!("{:x}", hash.finalize()))
 }
-fn equal(a: &Path, b: &Path) -> Result<bool, String> {
-    let mut a = File::open(a).map_err(|e| e.to_string())?;
-    let mut b = File::open(b).map_err(|e| e.to_string())?;
+fn equal_scoped(a: &Path, b: &Path, checkpoint: &Path) -> Result<bool, String> {
+    session_budget::charge(checkpoint, 0).map_err(|e| e.to_string())?;
+    let mut a =
+        session_budget::CheckedReader::new(File::open(a).map_err(|e| e.to_string())?, checkpoint);
+    let mut b =
+        session_budget::CheckedReader::new(File::open(b).map_err(|e| e.to_string())?, checkpoint);
     let mut x = [0; 65536];
     let mut y = [0; 65536];
     loop {
@@ -59,6 +69,7 @@ pub(super) fn write_local_retained(root: &Path, output: &Path) -> Result<(), Str
     write_scoped(root, output, true)
 }
 fn write_scoped(root: &Path, output: &Path, offline_retained: bool) -> Result<(), String> {
+    session_budget::charge(output, 0).map_err(|e| e.to_string())?;
     if output.exists() {
         return Err("输出归档已存在；保留原件，请使用新路径或只读导入复用".into());
     }
@@ -113,10 +124,11 @@ fn write_scoped(root: &Path, output: &Path, offline_retained: bool) -> Result<()
         })
         .transpose()
         .map_err(|e| e.to_string())?;
-    let files = collect_archive_files(root)?;
-    let report: Value = serde_json::from_str(&read_bounded_text(
+    let files = collect_archive_files_scoped(root, output)?;
+    let report: Value = serde_json::from_str(&read_bounded_text_scoped(
         &root.join("dump-report.json"),
         64 * 1024 * 1024,
+        output,
     )?)
     .map_err(|e| e.to_string())?;
     let package = report["package"].as_str().ok_or("dump 缺包身份")?;
@@ -125,9 +137,10 @@ fn write_scoped(root: &Path, output: &Path, offline_retained: bool) -> Result<()
     let mut refs = Vec::with_capacity(files.len());
     for (path, relative, n) in files {
         validate_evidence_relative_path(&relative)?;
-        let hash = digest(&path, n)?;
+        session_budget::charge(output, 0).map_err(|e| e.to_string())?;
+        let hash = digest_scoped(&path, n, output)?;
         if let Some((prior, len)) = objects.get(&hash) {
-            if *len != n || !equal(prior, &path)? {
+            if *len != n || !equal_scoped(prior, &path, output)? {
                 return Err("完整 hash/实际字节冲突，拒绝内容合并".into());
             }
         } else {
@@ -147,12 +160,14 @@ fn write_scoped(root: &Path, output: &Path, offline_retained: bool) -> Result<()
                 || r.path.ends_with(".pending")
         })
         || root.join("capture-group.json").is_file()
-            && serde_json::from_str::<Value>(&read_bounded_text(
+            && serde_json::from_str::<Value>(&read_bounded_text_scoped(
                 &root.join("capture-group.json"),
                 capture_groups::MAX_CAPTURE_GROUP_BYTES,
+                output,
             )?)
             .map_err(|e| e.to_string())?["state"]
                 == "partial";
+    session_budget::charge(output, 0).map_err(|e| e.to_string())?;
     let coverage = json!({"status":if partial {"partial"} else {"unknown"},"scope":"all retained paths only; missing producer/transport bytes are not in this archive","complete_collection":false,"hash_verification_scope":"every archived object and path reference; not process or application coverage"});
     let manifest = serde_json::json!({"schemaVersion":SCHEMA,"package":package,"dumpId":report["dump_id"],"fileCount":refs.len(),"uncompressedBytes":refs.iter().map(|r|r.bytes).sum::<u64>(),"objectCount":objects.len(),"objectBytes":objects.values().map(|(_,n)|n).sum::<u64>(),"storageRepresentation":"full-sha256-objects-and-path-references/v1","references":refs,"outputLimits":limits,"coverage":coverage});
     let metadata_bytes =
@@ -164,6 +179,7 @@ fn write_scoped(root: &Path, output: &Path, offline_retained: bool) -> Result<()
     }
 
     let bytes = serde_json::to_vec(&manifest).map_err(|e| e.to_string())?;
+    session_budget::charge(output, 0).map_err(|e| e.to_string())?;
     if bytes.len() > 64 * 1024 * 1024 {
         return Err("引用清单超过64MiB，未丢弃来源路径".into());
     }
@@ -216,7 +232,10 @@ fn write_scoped(root: &Path, output: &Path, offline_retained: bool) -> Result<()
             writer
                 .start_file(format!("objects/{hash}.bin"), options)
                 .map_err(|e| e.to_string())?;
-            let mut source = File::open(path).map_err(|e| format!("归档源读取失败：{e}"))?;
+            let mut source = session_budget::CheckedReader::new(
+                File::open(path).map_err(|e| format!("归档源读取失败：{e}"))?,
+                output,
+            );
             let mut actual = Sha256::new();
             let mut count = 0u64;
             let mut buf = [0; 65536];
@@ -242,7 +261,11 @@ fn write_scoped(root: &Path, output: &Path, offline_retained: bool) -> Result<()
         }
         let file = writer.finish().map_err(|e| format!("归档落盘失败：{e}"))?;
         file.sync_all().map_err(|e| e.to_string())?;
+        session_budget::charge(output, 0).map_err(|e| e.to_string())?;
         std::fs::rename(&temporary, output).map_err(|e| format!("归档发布到本地路径失败：{e}"))?;
+        // A single rename can cross the boundary. Keep its complete output but
+        // reject an in-budget phase success; never remove the final archive.
+        session_budget::charge(output, 0).map_err(|e| e.to_string())?;
         Ok(())
     })();
     if let Some(g) = _guard.as_ref() {
@@ -259,8 +282,11 @@ fn write_scoped(root: &Path, output: &Path, offline_retained: bool) -> Result<()
     result
 }
 pub(super) fn is_v2(path: &Path) -> Result<bool, String> {
-    let mut archive =
-        ZipArchive::new(File::open(path).map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
+    let mut archive = ZipArchive::new(session_budget::CheckedReader::new(
+        File::open(path).map_err(|e| e.to_string())?,
+        path,
+    ))
+    .map_err(|e| e.to_string())?;
     let mut manifest = archive
         .by_name("manifest.json")
         .map_err(|e| e.to_string())?;
@@ -268,8 +294,7 @@ pub(super) fn is_v2(path: &Path) -> Result<bool, String> {
         return Err("证据清单超过安全上限".into());
     }
     let mut text = String::new();
-    manifest
-        .by_ref()
+    session_budget::CheckedReader::new(&mut manifest, path)
         .take(64 * 1024 * 1024 + 1)
         .read_to_string(&mut text)
         .map_err(|e| e.to_string())?;
@@ -277,6 +302,7 @@ pub(super) fn is_v2(path: &Path) -> Result<bool, String> {
         return Err("清单实际读取超过预算".into());
     }
     let value: Value = serde_json::from_str(&text).map_err(|e| e.to_string())?;
+    session_budget::charge(path, 0).map_err(|e| e.to_string())?;
     Ok(value["schemaVersion"] == SCHEMA)
 }
 pub(super) fn restore(path: &Path) -> Result<PathBuf, String> {
@@ -296,8 +322,11 @@ fn restore_with_source(path: &Path, reuse_source: Option<&Path>) -> Result<PathB
     let root = staging.join("evidence");
     let pool = staging.join("objects");
     let result = (|| {
-        let mut archive = ZipArchive::new(File::open(path).map_err(|e| e.to_string())?)
-            .map_err(|e| e.to_string())?;
+        let mut archive = ZipArchive::new(session_budget::CheckedReader::new(
+            File::open(path).map_err(|e| e.to_string())?,
+            &staging,
+        ))
+        .map_err(|e| e.to_string())?;
         if archive.len() > MAX_EVIDENCE_ARCHIVE_FILES + 1 {
             return Err("归档对象数超过上限".into());
         }
@@ -309,8 +338,7 @@ fn restore_with_source(path: &Path, reuse_source: Option<&Path>) -> Result<PathB
                 return Err("清单超过上限".into());
             }
             let mut text = String::new();
-            source
-                .by_ref()
+            session_budget::CheckedReader::new(&mut source, &staging)
                 .take(64 * 1024 * 1024 + 1)
                 .read_to_string(&mut text)
                 .map_err(|e| e.to_string())?;
@@ -319,6 +347,7 @@ fn restore_with_source(path: &Path, reuse_source: Option<&Path>) -> Result<PathB
             }
             serde_json::from_str(&text).map_err(|e| e.to_string())?
         };
+        session_budget::charge(&staging, 0).map_err(|e| e.to_string())?;
         if manifest["schemaVersion"] != SCHEMA {
             return Err("不支持的引用归档版本".into());
         }
@@ -349,6 +378,7 @@ fn restore_with_source(path: &Path, reuse_source: Option<&Path>) -> Result<PathB
         let mut objects = BTreeMap::new();
         let mut logical = 0u64;
         for r in &refs {
+            session_budget::charge(&staging, 0).map_err(|e| e.to_string())?;
             validate_evidence_relative_path(&r.path)?;
             if !paths.insert(r.path.clone())
                 || r.sha256.len() != 64
@@ -408,6 +438,7 @@ fn restore_with_source(path: &Path, reuse_source: Option<&Path>) -> Result<PathB
             }
             let canonical = root.canonicalize().map_err(|e| e.to_string())?;
             for r in &refs {
+                session_budget::charge(&staging, 0).map_err(|e| e.to_string())?;
                 let path = root.join(&r.path);
                 if std::fs::symlink_metadata(&path)
                     .map_err(|e| e.to_string())?
@@ -417,11 +448,12 @@ fn restore_with_source(path: &Path, reuse_source: Option<&Path>) -> Result<PathB
                         .canonicalize()
                         .map_err(|e| e.to_string())?
                         .starts_with(&canonical)
-                    || digest(&path, r.bytes)? != r.sha256
+                    || digest_scoped(&path, r.bytes, &staging)? != r.sha256
                 {
                     return Err("已有缓存内容变化；保留旧缓存及原归档，不当作成功复用".into());
                 }
             }
+            session_budget::charge(&staging, 0).map_err(|e| e.to_string())?;
             return Ok(root.clone());
         }
         let mut reuse = BTreeMap::<String, PathBuf>::new();
@@ -435,6 +467,7 @@ fn restore_with_source(path: &Path, reuse_source: Option<&Path>) -> Result<PathB
             }
             let canonical = source.canonicalize().map_err(|e| e.to_string())?;
             for r in &refs {
+                session_budget::charge(&staging, 0).map_err(|e| e.to_string())?;
                 let p = source.join(&r.path);
                 let canonical_file = p.canonicalize().map_err(|e| e.to_string())?;
                 if std::fs::symlink_metadata(&p)
@@ -442,7 +475,7 @@ fn restore_with_source(path: &Path, reuse_source: Option<&Path>) -> Result<PathB
                     .file_type()
                     .is_symlink()
                     || !canonical_file.starts_with(&canonical)
-                    || digest(&canonical_file, r.bytes)? != r.sha256
+                    || digest_scoped(&canonical_file, r.bytes, &staging)? != r.sha256
                 {
                     return Err("已导出源内容改变或范围未知，保留原件，拒绝复用".into());
                 }
@@ -456,7 +489,8 @@ fn restore_with_source(path: &Path, reuse_source: Option<&Path>) -> Result<PathB
         let mut observed = BTreeSet::new();
         let mut reused_objects = 0_usize;
         for index in 0..archive.len() {
-            let mut entry = archive.by_index(index).map_err(|e| e.to_string())?;
+            session_budget::charge(&staging, 0).map_err(|e| e.to_string())?;
+            let entry = archive.by_index(index).map_err(|e| e.to_string())?;
             if entry.name() == "manifest.json" {
                 if !observed.insert("manifest".into()) {
                     return Err("重复清单".into());
@@ -495,6 +529,7 @@ fn restore_with_source(path: &Path, reuse_source: Option<&Path>) -> Result<PathB
                         .map_err(|e| e.to_string())?,
                 )
             };
+            let mut entry = session_budget::CheckedReader::new(entry, &staging);
             let mut actual = Sha256::new();
             let mut count = 0u64;
             let mut buf = [0; 65536];
@@ -521,15 +556,18 @@ fn restore_with_source(path: &Path, reuse_source: Option<&Path>) -> Result<PathB
                 return Err("对象短读/完整hash失败".into());
             }
             if let Some(file) = file.as_ref() {
+                session_budget::charge(&staging, 0).map_err(|e| e.to_string())?;
                 file.sync_all().map_err(|e| e.to_string())?;
+                session_budget::charge(&staging, 0).map_err(|e| e.to_string())?;
             }
-            if reused && digest(&pool.join(&hash), expected)? != hash {
+            if reused && digest_scoped(&pool.join(&hash), expected, &staging)? != hash {
                 return Err("复用源在归档核验期间变化，拒绝成功".into());
             }
         }
         let mut linked = 0usize;
         let mut copied = 0usize;
         for r in &refs {
+            session_budget::charge(&staging, 0).map_err(|e| e.to_string())?;
             let target = root.join(&r.path);
             if let Some(parent) = target.parent() {
                 std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
@@ -558,7 +596,9 @@ fn restore_with_source(path: &Path, reuse_source: Option<&Path>) -> Result<PathB
         )
         .map_err(|e| e.to_string())?;
         session_budget::write(staging.join("archive-cache-identity.json"),serde_json::to_vec(&serde_json::json!({"schema":"mobilee.archive-cache/v1","sha256":archive_hash,"bytes":archive_len,"references":refs.len(),"reuse":"full-source-sha-and-every-original-path-verified"})).map_err(|e|e.to_string())?).map_err(|e|e.to_string())?;
+        session_budget::charge(&staging, 0).map_err(|e| e.to_string())?;
         std::fs::remove_dir_all(&pool).map_err(|e| e.to_string())?;
+        session_budget::charge(&staging, 0).map_err(|e| e.to_string())?;
         Ok(root.clone())
     })();
     if result.is_err() && owned {
@@ -835,6 +875,7 @@ mod tests {
 /// Link via a new name and atomically replace a verified identical alias;
 /// never unlink a source first or mutate an imported/user evidence directory.
 pub(super) fn share_fresh_pull(root: &Path, archive_path: &Path) -> Result<(), String> {
+    session_budget::charge(root, 0).map_err(|e| e.to_string())?;
     let owner = root
         .parent()
         .and_then(|p| p.file_name())
@@ -843,8 +884,11 @@ pub(super) fn share_fresh_pull(root: &Path, archive_path: &Path) -> Result<(), S
         .and_then(|p| Uuid::parse_str(p).ok())
         .ok_or("仅允许本次 fresh pull 缓存内容共享")?;
     let _ = owner;
-    let mut archive = ZipArchive::new(File::open(archive_path).map_err(|e| e.to_string())?)
-        .map_err(|e| e.to_string())?;
+    let mut archive = ZipArchive::new(session_budget::CheckedReader::new(
+        File::open(archive_path).map_err(|e| e.to_string())?,
+        root,
+    ))
+    .map_err(|e| e.to_string())?;
     let mut manifest = archive
         .by_name("manifest.json")
         .map_err(|e| e.to_string())?;
@@ -852,8 +896,7 @@ pub(super) fn share_fresh_pull(root: &Path, archive_path: &Path) -> Result<(), S
         return Err("引用清单超过预算".into());
     }
     let mut text = String::new();
-    manifest
-        .by_ref()
+    session_budget::CheckedReader::new(&mut manifest, root)
         .take(64 * 1024 * 1024 + 1)
         .read_to_string(&mut text)
         .map_err(|e| e.to_string())?;
@@ -867,16 +910,18 @@ pub(super) fn share_fresh_pull(root: &Path, archive_path: &Path) -> Result<(), S
     let refs: Vec<Reference> =
         serde_json::from_value(value["references"].clone()).map_err(|e| e.to_string())?;
     for r in &refs {
+        session_budget::charge(root, 0).map_err(|e| e.to_string())?;
         validate_evidence_relative_path(&r.path)?;
-        if digest(&root.join(&r.path), r.bytes)? != r.sha256 {
+        if digest_scoped(&root.join(&r.path), r.bytes, root)? != r.sha256 {
             return Err("fresh pull 内容已变；未合并".into());
         }
     }
     let mut objects = BTreeMap::<String, PathBuf>::new();
     for r in refs {
+        session_budget::charge(root, 0).map_err(|e| e.to_string())?;
         let target = root.join(r.path);
         if let Some(source) = objects.get(&r.sha256) {
-            if !equal(source, &target)? {
+            if !equal_scoped(source, &target, root)? {
                 return Err("完整实际字节冲突；未覆盖来源".into());
             }
             let scratch = target.with_extension(format!("share-{}", Uuid::new_v4()));
@@ -896,6 +941,7 @@ pub(super) fn share_fresh_pull(root: &Path, archive_path: &Path) -> Result<(), S
             objects.insert(r.sha256, target);
         }
     }
+    session_budget::charge(root, 0).map_err(|e| e.to_string())?;
     Ok(())
 }
 
@@ -1282,5 +1328,85 @@ mod retained_closeout_acceptance {
         assert!(archive_elapsed_ms < 120000 && import_elapsed_ms < 120000);
         assert_ne!(archive_receipt["partial"], true);
         assert!(!receipt.partial);
+    }
+}
+
+#[cfg(test)]
+mod cooperative_archive_deadline_tests {
+    use super::*;
+    fn fixture() -> PathBuf {
+        let root = std::env::temp_dir().join(format!("me-archive-read-check-{}", Uuid::new_v4()));
+        std::fs::create_dir(&root).unwrap();
+        std::fs::write(
+            root.join("dump-report.json"),
+            serde_json::to_vec(&json!({"package":"org.example.fixture", "dump_id":Uuid::new_v4()}))
+                .unwrap(),
+        )
+        .unwrap();
+        std::fs::write(root.join("source.bin"), vec![0x42; 150000]).unwrap();
+        root
+    }
+    #[test]
+    fn source_hash_and_equal_use_output_scope_without_charging_reads() {
+        let root = fixture();
+        let output = root.with_extension("mee");
+        let file = root.join("source.bin");
+        let expected = digest(&file, 150000).unwrap();
+        let guard = session_budget::Guard::install(vec![output.clone()], 0, 1000).unwrap();
+        assert_eq!(digest_scoped(&file, 150000, &output).unwrap(), expected);
+        assert!(equal_scoped(&file, &file, &output).unwrap());
+        assert_eq!(guard.receipt().admitted_write_bytes, 0);
+        guard.constrain_time(1).unwrap();
+        std::thread::sleep(Duration::from_millis(8));
+        assert!(digest_scoped(&file, 150000, &output)
+            .unwrap_err()
+            .contains("time_budget_exhausted"));
+        assert!(equal_scoped(&file, &file, &output)
+            .unwrap_err()
+            .contains("time_budget_exhausted"));
+        assert_eq!(digest(&file, 150000).unwrap(), expected);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn expired_archive_preparation_never_publishes_and_keeps_source() {
+        let root = fixture();
+        let output = root.with_extension("mee");
+        let before = digest(&root.join("source.bin"), 150000).unwrap();
+        let guard = session_budget::Guard::install(vec![output.clone()], 1_000_000, 1).unwrap();
+        std::thread::sleep(Duration::from_millis(8));
+        assert!(write(&root, &output)
+            .unwrap_err()
+            .contains("time_budget_exhausted"));
+        assert!(!output.exists());
+        assert!(!PathBuf::from(format!("{}.part", output.display())).exists());
+        assert_eq!(digest(&root.join("source.bin"), 150000).unwrap(), before);
+        assert_eq!(guard.receipt().admitted_write_bytes, 0);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn complete_source_restore_then_expired_cached_restore_is_not_success() {
+        let root = fixture();
+        let output = root.with_extension("mee");
+        write(&root, &output).unwrap();
+        let archive_len = std::fs::metadata(&output).unwrap().len();
+        let archive_hash = digest(&output, archive_len).unwrap();
+        let restored = restore_from_export_source(&output, &root).unwrap();
+        assert_eq!(
+            digest(&restored.join("source.bin"), 150000).unwrap(),
+            digest(&root.join("source.bin"), 150000).unwrap()
+        );
+        let staging = restored.parent().unwrap().to_path_buf();
+        let guard = session_budget::Guard::install(vec![staging.clone()], 1_000_000, 1).unwrap();
+        std::thread::sleep(Duration::from_millis(8));
+        assert!(restore(&output)
+            .unwrap_err()
+            .contains("time_budget_exhausted"));
+        assert!(restored.join("source.bin").is_file());
+        assert_eq!(digest(&output, archive_len).unwrap(), archive_hash);
+        assert_eq!(guard.receipt().admitted_write_bytes, 0);
+        drop(guard);
+        std::fs::remove_dir_all(staging).unwrap();
+        std::fs::remove_file(output).unwrap();
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

@@ -15,6 +15,7 @@ import type {
   KernSightMirrorStatus,
   KernSightEventPage,
   KernSightEvidenceFileContent,
+  KernSightBoundSourcePage,
   KernSightLocalEvidenceBundle,
   KernSightPackageDumpReport,
   KernSightSessionReportDocument,
@@ -73,6 +74,8 @@ export const monitoringBackend = {
     invoke<KernSightLocalEvidenceBundle>('pull_kernsight_package_evidence', { serial, package: packageName, destination }),
   pullKernSightPackageArchive: (serial: string, packageName: string, outputPath: string, parentId?:string) =>
     invoke<KernSightLocalEvidenceBundle>('pull_kernsight_package_archive', { serial, package: packageName, outputPath, parentId:parentId||null }),
+  localKernSightBoundSourcePage: (root: string, packageName: string, sourceReport: string, offset = 0, limit = 100, expectedSha256: string | null = null) =>
+    invoke<KernSightBoundSourcePage>('read_local_kernsight_bound_source_page', { root, package: packageName, sourceReport, offset, limit, expectedSha256 }),
   localKernSightEvidenceFile: (root: string, packageName: string, relativePath: string, maxBytes = 1_048_576) =>
     invoke<KernSightEvidenceFileContent>('read_local_kernsight_evidence_file', { root, package: packageName, relativePath, maxBytes }),
 }

@@ -17,10 +17,10 @@ use uuid::Uuid;
 pub struct Deadline(Arc<Inner>);
 struct Inner {
     at: Instant,
-    cancelled: AtomicBool,
-    changed: Notify,
-    children: AtomicUsize,
-    cleanup_failed: AtomicBool,
+    cancelled: Arc<AtomicBool>,
+    changed: Arc<Notify>,
+    children: Arc<AtomicUsize>,
+    cleanup_failed: Arc<AtomicBool>,
 }
 static PARENTS: OnceLock<Mutex<BTreeMap<Uuid, Deadline>>> = OnceLock::new();
 tokio::task_local! { static CURRENT: Deadline; }
@@ -28,11 +28,46 @@ impl Deadline {
     pub fn new(duration: Duration) -> Self {
         Self(Arc::new(Inner {
             at: Instant::now() + duration,
-            cancelled: AtomicBool::new(false),
-            changed: Notify::new(),
-            children: AtomicUsize::new(0),
-            cleanup_failed: AtomicBool::new(false),
+            cancelled: Arc::new(AtomicBool::new(false)),
+            changed: Arc::new(Notify::new()),
+            children: Arc::new(AtomicUsize::new(0)),
+            cleanup_failed: Arc::new(AtomicBool::new(false)),
         }))
+    }
+    /// Derive a fixed boundary from the original parent clock. No registration,
+    /// rolling now+duration lease or cancellation reset is permitted.
+    pub fn before_parent_remaining(&self, remaining_ms: u64) -> Result<Self, String> {
+        self.check()?;
+        let at = self
+            .0
+            .at
+            .checked_sub(Duration::from_millis(remaining_ms))
+            .ok_or("phase_deadline_invalid")?;
+        if Instant::now() >= at {
+            return Err("parent_deadline_exhausted: fixed capture/phase boundary".into());
+        }
+        Ok(Self(Arc::new(Inner {
+            at,
+            cancelled: Arc::clone(&self.0.cancelled),
+            changed: Arc::clone(&self.0.changed),
+            children: Arc::clone(&self.0.children),
+            cleanup_failed: Arc::clone(&self.0.cleanup_failed),
+        })))
+    }
+    /// Monotonic elapsed time from a recorded parent remaining-time coordinate;
+    /// available after expiry for truthful terminal accounting.
+    pub fn elapsed_from_remaining(&self, started_remaining_ms: u64) -> Result<u64, String> {
+        let started = self
+            .0
+            .at
+            .checked_sub(Duration::from_millis(started_remaining_ms))
+            .ok_or("phase_start_invalid")?;
+        Ok(u64::try_from(
+            Instant::now()
+                .saturating_duration_since(started)
+                .as_millis(),
+        )
+        .unwrap_or(u64::MAX))
     }
     pub fn register(duration: Duration) -> Uuid {
         let token = Uuid::new_v4();
@@ -727,5 +762,108 @@ mod tests {
         assert!(is_stop(&e));
         assert!(start.elapsed() >= Duration::from_millis(60));
         // Intentional negative guarantee: synchronous blocked IO cannot be killed by a Future.
+    }
+}
+
+#[cfg(test)]
+mod manual_time_v5_deadline {
+    use super::*;
+    #[tokio::test]
+    async fn outer_parent_cancel_reaps_phase_owned_stream_and_shared_counter() {
+        use tokio::io::AsyncReadExt;
+        let parent = Deadline::new(Duration::from_secs(10));
+        let phase = parent.before_parent_remaining(1000).unwrap();
+        assert!(Arc::ptr_eq(&parent.0.children, &phase.0.children));
+        assert!(Arc::ptr_eq(
+            &parent.0.cleanup_failed,
+            &phase.0.cleanup_failed
+        ));
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+        let outer = parent.clone();
+        let task = tokio::spawn(async move {
+            outer
+                .run(async move {
+                    phase
+                        .run(async move {
+                            let mut cmd = Command::new("/bin/sh");
+                            cmd.args(["-c", "printf x; sleep 30"]);
+                            stream_output(
+                                cmd,
+                                Duration::from_secs(30),
+                                move |mut stdout| async move {
+                                    let mut b = [0u8; 1];
+                                    stdout.read_exact(&mut b).await.map_err(|e| e.to_string())?;
+                                    let _ = ready_tx.send(());
+                                    let mut rest = Vec::new();
+                                    stdout
+                                        .read_to_end(&mut rest)
+                                        .await
+                                        .map_err(|e| e.to_string())?;
+                                    Ok::<(), String>(())
+                                },
+                            )
+                            .await
+                        })
+                        .await
+                })
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(3), ready_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(parent.0.children.load(Ordering::SeqCst), 1);
+        parent.cancel();
+        let error = tokio::time::timeout(Duration::from_secs(3), task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap_err();
+        assert!(error.contains("parent_cancelled"));
+        assert!(error.contains("owned_host_children_reaped=true"));
+        assert_eq!(parent.0.children.load(Ordering::SeqCst), 0);
+        assert!(!parent.0.cleanup_failed.load(Ordering::SeqCst));
+    }
+    #[tokio::test]
+    async fn fixed_phase_timeout_preserves_accepted_prefix_and_reaps_child() {
+        use tokio::io::AsyncReadExt;
+        let parent = Deadline::new(Duration::from_millis(200));
+        let phase = parent.before_parent_remaining(150).unwrap();
+        let prefix = Arc::new(Mutex::new(Vec::new()));
+        let accepted = Arc::clone(&prefix);
+        let result = parent
+            .run(phase.run(async move {
+                let mut cmd = Command::new("/bin/sh");
+                cmd.args(["-c", "printf retained; sleep 30"]);
+                stream_output(cmd, Duration::from_secs(30), move |mut stdout| async move {
+                    let mut b = [0u8; 8];
+                    stdout.read_exact(&mut b).await.map_err(|e| e.to_string())?;
+                    accepted.lock().unwrap().extend_from_slice(&b);
+                    let mut rest = Vec::new();
+                    stdout
+                        .read_to_end(&mut rest)
+                        .await
+                        .map_err(|e| e.to_string())?;
+                    Ok::<(), String>(())
+                })
+                .await
+            }))
+            .await;
+        assert!(result.unwrap_err().contains("parent_deadline_exhausted"));
+        assert_eq!(prefix.lock().unwrap().as_slice(), b"retained");
+        assert_eq!(parent.0.children.load(Ordering::SeqCst), 0);
+        assert!(parent.check().is_ok());
+    }
+    #[test]
+    fn original_instant_clipping_is_fixed_and_failed_cleanup_propagates() {
+        let parent = Deadline::new(Duration::from_millis(100));
+        let phase = parent.before_parent_remaining(20).unwrap();
+        let original = phase.0.at;
+        std::thread::sleep(Duration::from_millis(10));
+        assert_eq!(parent.before_parent_remaining(20).unwrap().0.at, original);
+        phase.0.cleanup_failed.store(true, Ordering::SeqCst);
+        assert!(parent.0.cleanup_failed.load(Ordering::SeqCst));
+        parent.cancel();
+        assert!(phase.check().unwrap_err().contains("parent_cancelled"));
     }
 }

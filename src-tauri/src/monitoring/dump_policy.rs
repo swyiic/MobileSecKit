@@ -38,6 +38,15 @@ pub(super) fn producer_time_ms(grant_ms: u64, preflight_ms: u64) -> Result<u64, 
         })
 }
 
+/// A fixed v5 scope already spent preflight on the original absolute clock.
+/// Legacy callers still supply the original numeric grant and must deduct it.
+pub(super) fn producer_time_for_scope(
+    remaining_ms: u64,
+    preflight_ms: u64,
+    fixed_scope: bool,
+) -> Result<u64, String> {
+    producer_time_ms(remaining_ms, if fixed_scope { 0 } else { preflight_ms })
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -82,6 +91,18 @@ mod tests {
         }
     }
 
+    #[test]
+    fn manual_time_v5_fixed_scope_spends_preflight_once() {
+        assert_eq!(
+            producer_time_for_scope(241_000, 4_000, true).unwrap(),
+            231_000
+        );
+        assert_eq!(
+            producer_time_for_scope(245_000, 4_000, false).unwrap(),
+            231_000
+        );
+        assert!(producer_time_for_scope(10_000, 0, true).is_err());
+    }
     #[test]
     fn contradictory_policy_is_rejected() {
         assert!(dump_launch_flag(false, true, false).is_err());

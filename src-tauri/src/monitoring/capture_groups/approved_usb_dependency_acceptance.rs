@@ -219,6 +219,7 @@ async fn usb79_single_parent_body() {
                     Some(&paths),
                     BTreeMap::new(),
                     Some(cap),
+                    false,
                 )
                 .await?;
                 bundle_root = Some(PathBuf::from(&b.root));

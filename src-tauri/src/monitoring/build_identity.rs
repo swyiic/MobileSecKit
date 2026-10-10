@@ -32,12 +32,33 @@ pub(super) fn parse(
         .as_str()
         .filter(|s| matches!(s.len(), 40 | 64) && s.bytes().all(|b| b.is_ascii_hexdigit()));
     let dirty = note["agent_git_dirty"].as_bool();
+    let reported = note["agent_build_version"].as_str()?;
     let expected = match (source, commit, dirty) {
-        ("git" | "override", Some(commit), Some(dirty)) => format!(
-            "{handshake_version}+{}{}",
-            &commit[..7],
-            if dirty { ".dirty" } else { "" }
-        ),
+        ("git" | "override", Some(commit), Some(dirty_flag)) => {
+            let short = &commit[..7];
+            let underscore = format!("{handshake_version}_{short}");
+            let plus = format!("{handshake_version}+{short}");
+            let legacy_dirty = format!("{plus}.dirty");
+            let fresh = reported
+                .strip_prefix(&format!("{plus}+"))
+                .is_some_and(|suffix| {
+                    suffix.len() == 8 && suffix.bytes().all(|byte| byte.is_ascii_hexdigit())
+                });
+            let build_token = reported
+                .strip_prefix(&format!("{handshake_version}_"))
+                .is_some_and(|suffix| {
+                    suffix.len() == 8 && suffix.bytes().all(|byte| byte.is_ascii_hexdigit())
+                });
+            if reported == underscore
+                || reported == plus
+                || build_token
+                || (dirty_flag && (reported == legacy_dirty || fresh))
+            {
+                reported.to_owned()
+            } else {
+                return None;
+            }
+        }
         ("git", Some(commit), None) if note["agent_git_dirty"].is_null() => {
             format!("{handshake_version}+{}.dirty-unknown", &commit[..7])
         }
@@ -48,7 +69,7 @@ pub(super) fn parse(
         }
         _ => return None,
     };
-    if note["agent_build_version"].as_str()? != expected {
+    if reported != expected {
         return None;
     }
     Some(AgentBuildIdentity {
@@ -73,6 +94,19 @@ mod tests {
     fn accepts_identity_even_when_capture_capability_is_refused() {
         let build = parse(Some(0), &note().to_string(), "0.2.12").unwrap();
         assert_eq!(build.version, "0.2.12+03e97b4.dirty");
+        let mut fresh = note();
+        fresh["agent_build_version"] = "0.2.12+03e97b4+707c2f0f".into();
+        let fresh_build = parse(Some(0), &fresh.to_string(), "0.2.12").unwrap();
+        assert_eq!(fresh_build.version, "0.2.12+03e97b4+707c2f0f");
+        fresh["agent_build_version"] = "0.2.12_03e97b4".into();
+        assert_eq!(
+            parse(Some(0), &fresh.to_string(), "0.2.12")
+                .unwrap()
+                .version,
+            "0.2.12_03e97b4"
+        );
+        fresh["agent_build_version"] = "0.2.12+03e97b4+short".into();
+        assert!(parse(Some(0), &fresh.to_string(), "0.2.12").is_none());
         assert_eq!(build.git_commit.unwrap().len(), 40);
         assert_eq!(build.git_dirty, Some(true));
         assert_eq!(build.binary_sha256.unwrap().len(), 64);

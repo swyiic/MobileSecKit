@@ -127,7 +127,7 @@ export function captureAttemptDiagnostics(group: KernSightCaptureGroup, attempt:
   const rawTail = text(attempt.diagnosticTail)
   if (diagnostic?.terminalRecord != null && !terminal) warnings.push('结构化终态未匹配当前生命周期、token、父会话与原始终态字段；原记录保留，未用于确认本次终态。')
   if (terminal?.dumpCoverageOmitted === true) warnings.push('dump 覆盖证明超过终态摘要额度，详情未复制到摘要；原记录仍在生命周期 JSON 中。这里只确认基础终态，不证明完整覆盖，也不能授权继续采集。')
-  if (coverage.length) warnings.push('输出预算、drain 与 poll 记录仅作诊断计数；不证明完整采集，也不能授权继续采集。')
+  if (coverage.length) warnings.push('输出预算、drain 与 poll 记录是分析用的计数。采集进程已经返回时，这些数字不把本次采集判成失败。')
   const rawTailTruncated = diagnostic?.rawTailTruncated === true || /\[(?:stderr|stdout) tail; earlier output omitted\]/.test(rawTail || '')
   if ((note?.qualification_failure != null && !savedReceipt) || (diagnostic?.source === 'remote_lifecycle' && diagnostic.record != null && !retainedReceipt)) {
     warnings.push('结构化失败回执格式无效，或身份未匹配当前生命周期、token 与父会话；未将其用作本次失败原因，原记录保留在诊断 JSON 中。')

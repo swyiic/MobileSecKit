@@ -154,8 +154,9 @@ export function qualifiedSourceLabel(note?: Record<string, unknown> | null): str
   return `此前生产者具体来源：${q.sources.map((s: any) => `${s.package} PID ${s.pid} birth ${s.birth_ns} exec ${s.exec_id}`).join('；')}；dump 会重新核验，不保证无撕裂或完整恢复`
 }
 
-/** An older native backend must reject isolation before executing any device work. */
-export function captureGroupIPC(request: Pick<KernSightCaptureRequest, 'runtimePaths'>): string {
+/** Older native backends must reject explicit timing/isolation before any device work. */
+export function captureGroupIPC(request: Pick<KernSightCaptureRequest, 'runtimePaths' | 'captureTime' | 'saveTime'>): string {
+  if (request.captureTime || request.saveTime) return 'begin_kernsight_timed_group'
   return request.runtimePaths ? 'begin_kernsight_isolated_group' : 'begin_kernsight_group'
 }
 

@@ -1,6 +1,6 @@
 <template>
   <div ref="container" class="full-value" :class="{ 'full-value-mono': monospace }" @mouseenter="showPreview" @mouseleave="deferHide" @focusin="showPreview" @focusout="deferHide">
-    <button v-if="value" type="button" class="full-value-text" :disabled="copying" :aria-label="`复制完整${label}`" :aria-describedby="previewVisible ? previewId : undefined" :title="`${label}：点击或按 Enter 复制完整值`" @click.stop="copy" @keydown.esc.stop="hidePreview">{{ value }}</button>
+    <button v-if="value" type="button" class="full-value-text" :disabled="copying" :aria-label="`复制完整${label}`" :aria-describedby="previewVisible ? previewId : undefined" :title="`${label}：${value}（点击或按 Enter 复制完整值）`" @click.stop="copy" @keydown.esc.stop="hidePreview">{{ displayValue ?? value }}</button>
     <p v-else class="full-value-empty">{{ emptyText }}</p>
     <span v-if="feedback" class="full-value-feedback" :role="failed ? 'alert' : 'status'">{{ feedback }}</span>
     <Teleport to="body">
@@ -14,7 +14,7 @@
 
 <script setup lang="ts">
 import { onBeforeUnmount, onMounted, ref, useId, watch } from 'vue'
-const props = withDefaults(defineProps<{ value?: string | null; label: string; monospace?: boolean; emptyText?: string }>(), { emptyText: '未知（未提供）' })
+const props = withDefaults(defineProps<{ value?: string | null; displayValue?: string; label: string; monospace?: boolean; emptyText?: string }>(), { emptyText: '未知（未提供）' })
 const container = ref<HTMLElement>()
 const previewId = useId()
 const previewVisible = ref(false)

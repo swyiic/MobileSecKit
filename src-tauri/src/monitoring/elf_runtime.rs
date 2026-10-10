@@ -1,6 +1,6 @@
 //! Bounded ELF64 PT_LOAD views over verified ranges; never fills holes or reconstructs a file.
 use serde_json::{json, Value};
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, path::Path};
 
 fn u16(b: &[u8], n: usize) -> Option<u16> {
     Some(u16::from_le_bytes(
@@ -65,11 +65,17 @@ pub(super) fn header(b: &[u8]) -> Option<Value> {
         json!({"status":"bounded_elf64_header_and_program_table","machine":u16(b,18)?,"header_bytes":end,"loads":loads,"section_table_offset":shoff,"section_table_bytes":shbytes,"complete_file_parsed":false}),
     )
 }
-fn gaps(start: u64, end: u64, mut ranges: Vec<(u64, u64)>) -> Vec<(u64, u64)> {
-    ranges.sort_unstable();
+// The input has already been sorted once per module, rather than once per load.
+fn gaps(
+    start: u64,
+    end: u64,
+    ranges: &[(u64, u64)],
+    checkpoint: &mut impl FnMut() -> Result<(), String>,
+) -> Result<Vec<(u64, u64)>, String> {
     let mut p = start;
     let mut out = Vec::new();
-    for (a, b) in ranges {
+    for &(a, b) in ranges {
+        checkpoint()?;
         if b <= p || a >= end {
             continue;
         }
@@ -81,11 +87,27 @@ fn gaps(start: u64, end: u64, mut ranges: Vec<(u64, u64)>) -> Vec<(u64, u64)> {
     if p < end {
         out.push((p, end));
     }
-    out
+    Ok(out)
 }
 pub(super) fn module_views(rows: &[Value]) -> Value {
+    module_views_inner(rows, &mut || Ok(())).expect("unscoped ELF analysis has no scope failure")
+}
+
+pub(super) fn module_views_scoped(root: &Path, rows: &[Value]) -> Result<Value, String> {
+    module_views_inner(rows, &mut || {
+        super::session_deadline::check()?;
+        super::session_budget::charge(root, 0).map_err(|error| error.to_string())
+    })
+}
+
+fn module_views_inner(
+    rows: &[Value],
+    checkpoint: &mut impl FnMut() -> Result<(), String>,
+) -> Result<Value, String> {
+    checkpoint()?;
     let mut groups = BTreeMap::<String, Vec<&Value>>::new();
     for r in rows {
+        checkpoint()?;
         let Some(path) = r["mapping"]["path"].as_str() else {
             continue;
         };
@@ -98,49 +120,72 @@ pub(super) fn module_views(rows: &[Value]) -> Value {
     }
     let mut modules = Vec::new();
     for rows in groups.values() {
-        let mut ambiguous = false;
-        for (i, a) in rows.iter().enumerate() {
-            for b in rows.iter().skip(i + 1) {
-                let (Some(sa), Some(na), Some(sb), Some(nb)) = (
-                    a["read"]["actual_start"].as_u64(),
-                    a["read"]["actual_length"].as_u64(),
-                    b["read"]["actual_start"].as_u64(),
-                    b["read"]["actual_length"].as_u64(),
-                ) else {
-                    ambiguous = true;
-                    continue;
-                };
-                if sa < sb.saturating_add(nb)
-                    && sb < sa.saturating_add(na)
-                    && (sa != sb || na != nb || a["read"]["sha256"] != b["read"]["sha256"])
-                {
-                    ambiguous = true;
-                }
-            }
+        checkpoint()?;
+        // Exact repeated observations do not conflict. Keep every original row
+        // for source attribution, but sort and sweep the unique interval keys.
+        let mut unique = BTreeMap::new();
+        let mut invalid_range = false;
+        for row in rows {
+            checkpoint()?;
+            let (Some(start), Some(len), Some(hash)) = (
+                row["read"]["actual_start"].as_u64(),
+                row["read"]["actual_length"].as_u64(),
+                row["read"]["sha256"]
+                    .as_str()
+                    .filter(|hash| !hash.is_empty()),
+            ) else {
+                invalid_range = true;
+                continue;
+            };
+            let Some(end) = start.checked_add(len).filter(|_| len > 0) else {
+                invalid_range = true;
+                continue;
+            };
+            unique.insert((start, len, hash), end);
         }
-        if ambiguous {
-            modules.push(json!({"schema":"mobilee.verified-elf-load-view/v1","path":rows[0]["mapping"]["path"],"source":rows[0]["source"],"source_report":rows[0]["source_report"],"all_load_file_bytes_covered":null,"all_load_memory_bytes_covered":null,"complete_file_reconstructed":false,"association":"unknown_conflicting_overlapping_ranges","segments":[],"torn":true,"ownership":"unknown"}));
+        let mut prior_end = None::<u64>;
+        let mut conflicting_overlap = false;
+        let mut intervals = Vec::with_capacity(unique.len());
+        for ((start, _, _), end) in unique {
+            checkpoint()?;
+            if prior_end.is_some_and(|prior| start < prior) {
+                conflicting_overlap = true;
+            }
+            prior_end = Some(prior_end.map_or(end, |prior| prior.max(end)));
+            intervals.push((start, end));
+        }
+        if invalid_range || conflicting_overlap {
+            modules.push(json!({"schema":"mobilee.verified-elf-load-view/v1","path":rows[0]["mapping"]["path"],"source":rows[0]["source"],"source_report":rows[0]["source_report"],"all_load_file_bytes_covered":null,"all_load_memory_bytes_covered":null,"complete_file_reconstructed":false,"association":if invalid_range {"unknown_missing_or_overflowing_range"} else {"unknown_conflicting_overlapping_ranges"},"segments":[],"torn":true,"ownership":"unknown"}));
             continue;
         }
-        let Some(first) = rows.iter().find(|r| {
-            r["object_inspection"]["elf_header"]["status"]
+        let mut first = None;
+        for row in rows {
+            checkpoint()?;
+            if row["object_inspection"]["elf_header"]["status"]
                 == "bounded_elf64_header_and_program_table"
-        }) else {
+            {
+                first = Some(*row);
+                break;
+            }
+        }
+        let Some(first) = first else {
             continue;
         };
         let h = &first["object_inspection"]["elf_header"];
         let Some(loads) = h["loads"].as_array() else {
             continue;
         };
-        let anchors: Vec<_> = loads
-            .iter()
-            .filter(|l| {
-                l["file_offset"] == 0
-                    && l["file_bytes"]
-                        .as_u64()
-                        .is_some_and(|n| n >= h["header_bytes"].as_u64().unwrap_or(u64::MAX))
-            })
-            .collect();
+        let mut anchors = Vec::new();
+        for l in loads {
+            checkpoint()?;
+            if l["file_offset"] == 0
+                && l["file_bytes"]
+                    .as_u64()
+                    .is_some_and(|n| n >= h["header_bytes"].as_u64().unwrap_or(u64::MAX))
+            {
+                anchors.push(l);
+            }
+        }
         if anchors.len() != 1 {
             continue;
         }
@@ -150,20 +195,10 @@ pub(super) fn module_views(rows: &[Value]) -> Value {
         else {
             continue;
         };
-        let intervals: Vec<_> = rows
-            .iter()
-            .filter_map(|r| {
-                Some((
-                    r["read"]["actual_start"].as_u64()?,
-                    r["read"]["actual_start"]
-                        .as_u64()?
-                        .checked_add(r["read"]["actual_length"].as_u64()?)?,
-                ))
-            })
-            .collect();
         let mut segments = Vec::new();
         let mut file_ranges = Vec::new();
         for l in loads {
+            checkpoint()?;
             let (Some(off), Some(va), Some(fs), Some(ms)) = (
                 l["file_offset"].as_u64(),
                 l["virtual_address"].as_u64(),
@@ -182,6 +217,7 @@ pub(super) fn module_views(rows: &[Value]) -> Value {
             };
             let mut sources = Vec::new();
             for r in rows {
+                checkpoint()?;
                 let (Some(a), Some(n)) = (
                     r["read"]["actual_start"].as_u64(),
                     r["read"]["actual_length"].as_u64(),
@@ -197,7 +233,7 @@ pub(super) fn module_views(rows: &[Value]) -> Value {
                     sources.push(json!({"relative_path":r["relative_path"],"sha256":r["read"]["sha256"],"source_offset":s-a,"length":e-s,"file_offset":off+(s-start),"virtual_start":s}));
                 }
             }
-            segments.push(json!({"file_offset":off,"virtual_start":start,"file_bytes":fs,"memory_bytes":ms,"file_backed_gaps":gaps(start,end,intervals.clone()),"memory_gaps":gaps(start,memend,intervals.clone()),"source_slices":sources,"derived_bytes_sha256":null,"derived_hash_status":"source_full_hashes_verified; no_new_slice_hash_budget"}));
+            segments.push(json!({"file_offset":off,"virtual_start":start,"file_bytes":fs,"memory_bytes":ms,"file_backed_gaps":gaps(start,end,&intervals,checkpoint)?,"memory_gaps":gaps(start,memend,&intervals,checkpoint)?,"source_slices":sources,"derived_bytes_sha256":null,"derived_hash_status":"source_full_hashes_verified; no_new_slice_hash_budget"}));
             file_ranges.push((off, fileend));
         }
         if segments.len() != loads.len() {
@@ -211,12 +247,28 @@ pub(super) fn module_views(rows: &[Value]) -> Value {
             .all(|s| s["memory_gaps"].as_array().is_some_and(Vec::is_empty));
         let shoff = h["section_table_offset"].as_u64().unwrap_or(0);
         let shbytes = h["section_table_bytes"].as_u64().unwrap_or(0);
-        let shgaps = gaps(shoff, shoff.saturating_add(shbytes), file_ranges);
-        let torn = rows.iter().any(|row| row["read"]["torn"] == true);
-        let limits: Vec<&str> = rows
-            .iter()
-            .filter_map(|row| row["selection_limit_reason"].as_str())
-            .collect();
+        checkpoint()?;
+        file_ranges.sort_unstable();
+        checkpoint()?;
+        let shgaps = gaps(
+            shoff,
+            shoff.saturating_add(shbytes),
+            &file_ranges,
+            checkpoint,
+        )?;
+        let mut torn = false;
+        let mut limits = Vec::new();
+        let mut verified_bytes = Some(0_u64);
+        for row in rows {
+            checkpoint()?;
+            torn |= row["read"]["torn"] == true;
+            if let Some(reason) = row["selection_limit_reason"].as_str() {
+                limits.push(reason);
+            }
+            verified_bytes = verified_bytes
+                .zip(row["read"]["actual_length"].as_u64())
+                .and_then(|(total, length)| total.checked_add(length));
+        }
         let mapping_copy = if limits.is_empty() {
             "unknown"
         } else if limits
@@ -240,9 +292,10 @@ pub(super) fn module_views(rows: &[Value]) -> Value {
         } else {
             "not_performed_on_incomplete_memory_file"
         };
-        modules.push(json!({"schema":"mobilee.verified-elf-load-view/v1","path":first["mapping"]["path"],"source":first["source"],"source_report":first["source_report"],"load_bias":bias,"verified_range_count":rows.len(),"verified_range_bytes":rows.iter().filter_map(|r|r["read"]["actual_length"].as_u64()).sum::<u64>(),"association":"inferred_from_unique_offset_zero_PT_LOAD_and_retained_header; kernel_file_offsets_not_recorded","torn":torn,"all_load_file_bytes_covered":file_complete,"all_load_memory_bytes_covered":mem_complete,"section_table_gaps":shgaps,"segments":segments,"complete_file_reconstructed":file_complete && shgaps.is_empty() && !torn,"mapping_copy":mapping_copy,"symbol_analysis":symbol_analysis,"ownership":"unknown","scope":"this producer window and listed verified ranges only"}));
+        modules.push(json!({"schema":"mobilee.verified-elf-load-view/v1","path":first["mapping"]["path"],"source":first["source"],"source_report":first["source_report"],"load_bias":bias,"verified_range_count":rows.len(),"verified_range_bytes":verified_bytes,"association":"inferred_from_unique_offset_zero_PT_LOAD_and_retained_header; kernel_file_offsets_not_recorded","torn":torn,"all_load_file_bytes_covered":file_complete,"all_load_memory_bytes_covered":mem_complete,"section_table_gaps":shgaps,"segments":segments,"complete_file_reconstructed":file_complete && shgaps.is_empty() && !torn,"mapping_copy":mapping_copy,"symbol_analysis":symbol_analysis,"ownership":"unknown","scope":"this producer window and listed verified ranges only"}));
     }
-    json!(modules)
+    checkpoint()?;
+    Ok(json!(modules))
 }
 #[cfg(test)]
 mod tests {
@@ -338,5 +391,182 @@ mod tests {
             views[0]["association"],
             "unknown_conflicting_overlapping_ranges"
         );
+    }
+
+    fn verified_row() -> Value {
+        json!({"mapping":{"path":"lib.so","inode":1},"source":{"pid":1,"birth_ns":10},"source_report":"one","read":{"actual_start":4096,"actual_length":192,"sha256":"a","torn":false},"relative_path":"runtime/a.code","local_content_status":"complete_range_hash_verified","object_inspection":{"elf_header":header(&fixture()).unwrap()}})
+    }
+
+    #[test]
+    fn exact_duplicate_ranges_preserve_sources_without_conflicting() {
+        let a = verified_row();
+        let mut b = a.clone();
+        b["relative_path"] = json!("runtime/alias.code");
+        let views = module_views(&[a, b]);
+        assert_eq!(views[0]["all_load_file_bytes_covered"], true);
+        assert_eq!(views[0]["verified_range_count"], 2);
+        assert_eq!(
+            views[0]["segments"][0]["source_slices"]
+                .as_array()
+                .unwrap()
+                .len(),
+            2
+        );
+    }
+
+    #[test]
+    fn contained_intervals_conflict_even_when_the_hash_matches() {
+        let a = verified_row();
+        let mut b = a.clone();
+        b["read"]["actual_start"] = json!(4128);
+        b["read"]["actual_length"] = json!(32);
+        let views = module_views(&[a, b]);
+        assert_eq!(
+            views[0]["association"],
+            "unknown_conflicting_overlapping_ranges"
+        );
+        assert!(views[0]["all_load_memory_bytes_covered"].is_null());
+    }
+
+    #[test]
+    fn adjacent_ranges_fill_bss_without_becoming_overlapping() {
+        let a = verified_row();
+        let mut b = a.clone();
+        b["read"]["actual_start"] = json!(4288);
+        b["read"]["actual_length"] = json!(64);
+        b["read"]["sha256"] = json!("b");
+        b["object_inspection"] = json!({});
+        let views = module_views(&[a, b]);
+        assert_eq!(views[0]["all_load_memory_bytes_covered"], true);
+        assert_ne!(
+            views[0]["association"],
+            "unknown_conflicting_overlapping_ranges"
+        );
+        assert_eq!(views[0]["section_table_gaps"], json!([[192, 256]]));
+    }
+
+    #[test]
+    fn missing_zero_and_overflowing_intervals_remain_unknown() {
+        for invalid in [
+            json!({"actual_start":4096,"sha256":"a"}),
+            json!({"actual_start":4096,"actual_length":0,"sha256":"a"}),
+            json!({"actual_start":u64::MAX,"actual_length":1,"sha256":"a"}),
+            json!({"actual_start":4096,"actual_length":192}),
+        ] {
+            let mut row = verified_row();
+            row["read"] = invalid;
+            let views = module_views(&[row]);
+            assert_eq!(
+                views[0]["association"],
+                "unknown_missing_or_overflowing_range"
+            );
+            assert!(views[0]["all_load_file_bytes_covered"].is_null());
+            assert_eq!(views[0]["complete_file_reconstructed"], false);
+        }
+    }
+
+    #[test]
+    fn inode_and_full_source_identity_do_not_merge_windows() {
+        let a = verified_row();
+        for field in ["inode", "birth_ns"] {
+            let mut b = a.clone();
+            b["read"]["actual_start"] = json!(4288);
+            b["read"]["actual_length"] = json!(64);
+            b["read"]["sha256"] = json!("b");
+            b["object_inspection"] = json!({});
+            if field == "inode" {
+                b["mapping"]["inode"] = json!(2);
+            } else {
+                b["source"]["birth_ns"] = json!(11);
+            }
+            assert_eq!(
+                module_views(&[a.clone(), b])[0]["all_load_memory_bytes_covered"],
+                false
+            );
+        }
+    }
+
+    #[test]
+    fn large_inventory_uses_a_bounded_number_of_sweep_steps() {
+        let mut rows = vec![verified_row()];
+        for index in 0..8192 {
+            let mut row = verified_row();
+            row["read"]["actual_start"] = json!(4288 + index);
+            row["read"]["actual_length"] = json!(1);
+            row["object_inspection"] = json!({});
+            rows.push(row);
+        }
+        let mut checkpoints = 0_usize;
+        let views = module_views_inner(&rows, &mut || {
+            checkpoints += 1;
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(views[0]["all_load_memory_bytes_covered"], true);
+        assert_eq!(views[0]["verified_range_count"], rows.len());
+        assert!(checkpoints <= rows.len() * 12 + 128, "{checkpoints}");
+    }
+
+    #[test]
+    fn a_scope_stop_during_group_processing_never_returns_partial_success() {
+        let rows = vec![verified_row(); 64];
+        let mut checkpoints = 0_usize;
+        let result = module_views_inner(&rows, &mut || {
+            checkpoints += 1;
+            if checkpoints == 100 {
+                Err("parent_cancelled".into())
+            } else {
+                Ok(())
+            }
+        });
+        assert_eq!(result.unwrap_err(), "parent_cancelled");
+    }
+
+    #[test]
+    fn independently_expired_guard_returns_failure_instead_of_empty_views() {
+        let root = std::env::temp_dir().join(format!("elf-guard-{}", uuid::Uuid::new_v4()));
+        let guard = super::super::session_budget::Guard::install(vec![root.clone()], 0, 1).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        assert!(super::super::session_deadline::current().is_none());
+        assert_eq!(
+            module_views_scoped(&root, &[]).unwrap_err(),
+            "time_budget_exhausted"
+        );
+        assert_eq!(
+            guard.receipt().reason.as_deref(),
+            Some("time_budget_exhausted")
+        );
+    }
+
+    #[tokio::test]
+    async fn cancellation_of_original_parent_is_fail_closed() {
+        let root = std::env::temp_dir().join(format!("elf-cancel-{}", uuid::Uuid::new_v4()));
+        let deadline =
+            super::super::session_deadline::Deadline::new(std::time::Duration::from_secs(1));
+        let result = deadline
+            .run(async {
+                deadline.cancel();
+                let error = module_views_scoped(&root, &[verified_row()]).unwrap_err();
+                assert_eq!(error, "parent_cancelled");
+                Err::<(), String>(error)
+            })
+            .await;
+        assert!(result.unwrap_err().contains("parent_cancelled"));
+    }
+
+    #[tokio::test]
+    async fn original_parent_expiry_is_fail_closed() {
+        let root = std::env::temp_dir().join(format!("elf-expiry-{}", uuid::Uuid::new_v4()));
+        let deadline =
+            super::super::session_deadline::Deadline::new(std::time::Duration::from_millis(20));
+        let result = deadline
+            .run(async {
+                std::thread::sleep(std::time::Duration::from_millis(25));
+                let error = module_views_scoped(&root, &[verified_row()]).unwrap_err();
+                assert_eq!(error, "parent_deadline_exhausted");
+                Err::<(), String>(error)
+            })
+            .await;
+        assert!(result.unwrap_err().contains("parent_deadline_exhausted"));
     }
 }

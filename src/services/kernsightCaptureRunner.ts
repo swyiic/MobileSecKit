@@ -77,6 +77,24 @@ export function captureStateLabel(state: string): string {
   return ({ planned: '待执行', running: '采集中', succeeded: '执行结束', partial: '覆盖不足（partial）', failed: '采集失败', interrupted: '已中断', unavailable: '来源不可用（未启动）', cancelled: '已取消', canceled: '已取消' } as Record<string, string>)[state] || state
 }
 
+const exportReservation = new Set(['transfer', 'archive', 'import', 'terminal'])
+
+/** Stage success is not a coverage gap. A later save reservation can still be open. */
+export function captureGroupStateLabel(group: KernSightCaptureGroup): string {
+  const required = group.stages.filter(stage => stage.required)
+  const stagesDone = required.length > 0 && required.every(stage => stage.attempts[stage.attempts.length - 1]?.state === 'succeeded')
+  const reservations = group.budget?.reservations ?? []
+  const capturePartial = reservations.some(item => item.status === 'partial' && !exportReservation.has(item.kind))
+  if (group.state === 'partial' && stagesDone && !capturePartial) {
+    const saveOpen = ['transfer', 'archive', 'import'].some(kind => {
+      const rows = reservations.filter(item => item.kind === kind)
+      return rows.some(item => item.status === 'partial') && !rows.some(item => item.status === 'admitted_plus_terminal_reserve')
+    })
+    return saveOpen ? '采集已结束，保存未完成' : '执行结束'
+  }
+  return captureStateLabel(group.state)
+}
+
 /** Display durable stage facts without inferring whether later stages ran. */
 export function captureReceiptStateLabel(group: KernSightCaptureGroup, key: string): string {
   const stages = key === 'session' ? group.stages.filter(stage => stage.key !== 'dump')
@@ -91,7 +109,5 @@ export function captureReceiptStateLabel(group: KernSightCaptureGroup, key: stri
 
 /** Saved evidence is usable independently of the source coverage; no state upgrade. */
 export function captureSavedOutcome(group: KernSightCaptureGroup, root: string): string {
-  const coverage = group.state === 'partial' ? '覆盖不足（partial），请核对阶段诊断'
-    : group.state === 'succeeded' ? '覆盖完整性仍按来源记录核对' : '采集未全部完成，请核对阶段记录'
-  return `本次主会话证据已保存并导入：${root}；${coverage}`
+  return `本次主会话证据已保存并导入：${root}；${captureGroupStateLabel(group)}`
 }

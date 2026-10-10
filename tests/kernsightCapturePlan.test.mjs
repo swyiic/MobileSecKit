@@ -291,3 +291,31 @@ test('suggested minimum admits all valid observation sums in the selected deadli
     }
   }
 })
+
+
+test('actual native gateway rejects unsupported explicit timing without fallback or stage execution',async()=>{
+  const {build}=await import('esbuild')
+  const {resolve}=await import('node:path')
+  const {fileURLToPath}=await import('node:url')
+  const root=fileURLToPath(new URL('../',import.meta.url))
+  const output=await build({entryPoints:[resolve(root,'src/services/backend/monitoring.ts')],bundle:true,write:false,format:'esm',platform:'node',alias:{'@':resolve(root,'src')},plugins:[{name:'timed-ipc-mock',setup(b){b.onResolve({filter:/^@tauri-apps\/api\/core$/},()=>({path:'core',namespace:'timed-test'}));b.onLoad({filter:/.*/,namespace:'timed-test'},()=>({contents:'export const invoke=(command,args)=>globalThis.__timedCaptureInvoke(command,args)',loader:'js'}))}}]})
+  const {monitoringBackend}=await import(`data:text/javascript;base64,${Buffer.from(output.outputFiles[0].text).toString('base64')}`)
+  const timing={captureTime:{maxSeconds:120,l2MaxSeconds:60},saveTime:{transferMaxSeconds:40,archiveMaxSeconds:20,importMaxSeconds:10},sessionBudget:{totalBytes:1_000_000,maxSeconds:195}}
+  const isolation={root:'/data/local/tmp/mock-candidate',agentPath:'/data/local/tmp/mock-candidate/ksightd',expectedSha256:'a'.repeat(64)}
+  try{
+    for(const request of [{...base,...timing},{...base,...timing,runtimePaths:isolation},{...base,captureTime:timing.captureTime}]){
+      const calls=[]
+      globalThis.__timedCaptureInvoke=async(command,args)=>{calls.push({command,args});if(command==='begin_kernsight_timed_group')throw new Error('UnknownCommand: begin_kernsight_timed_group');return {id:'unsafe-legacy-parent'}}
+      await assert.rejects(monitoringBackend.beginKernSightGroup(request,[15,90,15],true),/UnknownCommand/)
+      assert.deepEqual(calls.map(c=>c.command),['begin_kernsight_timed_group'])
+      assert.equal(calls[0].args.request,request)
+    }
+    const supported=[]
+    globalThis.__timedCaptureInvoke=async(command,args)=>{supported.push({command,args});return {id:'timed-parent'}}
+    assert.deepEqual(await monitoringBackend.beginKernSightGroup({...base,...timing},[15,90,15],true),{id:'timed-parent'})
+    assert.equal(supported[0].command,'begin_kernsight_timed_group')
+    assert.deepEqual(supported[0].args.request.captureTime,timing.captureTime)
+    assert.deepEqual(supported[0].args.request.saveTime,timing.saveTime)
+    assert.equal(supported[0].args.request.sessionBudget.maxSeconds,195)
+  }finally{delete globalThis.__timedCaptureInvoke}
+})

@@ -67,7 +67,7 @@ try{
    await row(ids[0]).scrollIntoViewIfNeeded();await row(ids[0]).locator('.ks-group-information').screenshot({path:out+`/time-and-evidence-cards-${theme}-${width}.png`});await page.screenshot({path:out+`/grouped-evidence-${theme}-${width}.png`});record(`${theme} ${width}px budget/source groups align, long source paths do not overflow`)
   }
  }
- const ledger=await row(ids[0]).locator('.ks-time-ledger').innerText();assert.match(ledger,/mobilee.session-time-plan\/v4/);assert.match(ledger,/L2 快照\s*上限 245s/);assert.match(ledger,/保存传输\s*上限 255s/);assert.match(ledger,/阶段执行耗时/);record('Original time caps and attempt elapsed time are distinct; 900s is a parent deadline, not L2 duration')
+ const ledger=await row(ids[0]).locator('.ks-time-ledger').innerText();assert.match(ledger,/mobilee.session-time-plan\/v4/);assert.match(ledger,/L2 快照\s*配置上限 245s/);assert.match(ledger,/保存传输\s*配置上限 255s/);assert.match(ledger,/阶段执行耗时/);record('Original time caps and attempt elapsed time are distinct; 900s is a parent deadline, not L2 duration')
  assert.equal(errors.length,0,errors.join('\n'))
  const unsafe=calls.filter(c=>/^(provision_|run_kernsight|start_|dump_|execute_|trash_|restore_|cleanup_|cancel_kernsight_group$)/.test(c.command));assert.deepEqual(unsafe,[])
  writeFileSync(out+'/browser-results.json',JSON.stringify({passed:true,checks,errors,commands:[...new Set(calls.map(c=>c.command))],note:'Actual local headless Chromium renders the modified Vue view. All Tauri IPC mocked; no native ME app, phone, deployment, capture or user evidence was changed.'},null,2))

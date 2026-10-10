@@ -1141,6 +1141,7 @@ pub fn run() {
             monitoring::get_kernsight_session_events,
             monitoring::capture_groups::get_local_kernsight_child_report,
             monitoring::capture_groups::begin_kernsight_group,
+            monitoring::capture_groups::begin_kernsight_timed_group,
             monitoring::capture_groups::begin_kernsight_isolated_group,
             monitoring::capture_groups::list_kernsight_groups,
             monitoring::capture_groups::trash::trash_kernsight_group,
@@ -1172,6 +1173,7 @@ pub fn run() {
             monitoring::pull_kernsight_package_evidence,
             monitoring::pull_kernsight_package_archive,
             monitoring::save_kernsight_group_evidence,
+            monitoring::read_local_kernsight_bound_source_page,
             monitoring::read_local_kernsight_evidence_file,
             monitoring::cleanup_kernsight_package_dump,
         ])

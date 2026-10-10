@@ -104,6 +104,22 @@ impl Group {
                         .unwrap_or(0)
                 });
                 plan.validate_observations(!self.unified, &durations)?;
+                if plan.schema != "mobilee.session-time-plan/v5"
+                    && (!self.base["captureTime"].is_null() || !self.base["saveTime"].is_null())
+                {
+                    return Err("旧父时间合同不能附加新采集时限；未续期".into());
+                }
+                if plan.schema == "mobilee.session-time-plan/v5" {
+                    let request: KernSightCaptureRequest =
+                        serde_json::from_value(self.base.clone()).map_err(|e| e.to_string())?;
+                    b.validate_explicit_configuration(
+                        request
+                            .capture_time
+                            .as_ref()
+                            .ok_or("原请求缺采集时间配置")?,
+                        request.save_time.as_ref().ok_or("原请求缺保存时间配置")?,
+                    )?;
+                }
             }
         }
         validate_serial(&self.serial)?;
@@ -331,9 +347,21 @@ impl Group {
                 && self.stages[..i]
                     .last()
                     .is_some_and(|s| coverage_continuation::verified(self, s));
+            let saved_dump = previous.key == "dump"
+                && next.key == "linker"
+                && i + 1 == index
+                && previous.attempts.last().is_some_and(|attempt| {
+                    attempt.state == "partial"
+                        && attempt.remote_artifact_root.is_some()
+                        && attempt.remote_lifecycle.as_ref().is_some_and(|note| {
+                            note["collection_returned"] == true
+                                && note["collection_status"] == "partial"
+                        })
+                });
             if !(self.quota_partial_closed(previous) && (independent || replaced))
                 && !(coverage && (independent || (next.key == "dump" && i + 1 == index)))
                 && !source_absent
+                && !saved_dump
             {
                 return Err("前置必需阶段未成功或依赖/清理未确认".into());
             }
@@ -572,6 +600,28 @@ pub fn read_import(root: &Path) -> Result<Option<Group>, String> {
     g.refresh();
     Ok(Some(g))
 }
+/// Dedicated IPC makes an older backend reject manual timing before any device
+/// work instead of silently ignoring unknown captureTime/saveTime fields.
+#[tauri::command]
+pub fn begin_kernsight_timed_group(
+    app: tauri::AppHandle,
+    request: KernSightCaptureRequest,
+    durations: Vec<u64>,
+    startup_replay: bool,
+) -> Result<Group, String> {
+    require_timed_configuration(&request)?;
+    if request.runtime_paths.is_some() {
+        begin_kernsight_isolated_group(app, request, durations, startup_replay)
+    } else {
+        begin_kernsight_group(app, request, durations, startup_replay)
+    }
+}
+fn require_timed_configuration(request: &KernSightCaptureRequest) -> Result<(), String> {
+    if request.capture_time.is_none() || request.save_time.is_none() {
+        return Err("手动时间入口必须同时传入采集与保存配置；未执行设备操作".into());
+    }
+    Ok(())
+}
 /// Dedicated IPC prevents an old Me backend silently discarding the new runtime field.
 #[tauri::command]
 pub fn begin_kernsight_isolated_group(
@@ -647,6 +697,24 @@ fn begin_group_at(
     let mut base = serde_json::to_value(&request).map_err(|e| e.to_string())?;
     base.as_object_mut().unwrap().remove("captureRelation");
     base.as_object_mut().unwrap().remove("captureRelations");
+    let limits = request.session_budget.clone().unwrap_or_default();
+    let budget = match (request.capture_time.clone(), request.save_time.clone()) {
+        (Some(capture), Some(save)) => session_budget::Contract::new_explicit_with_time(
+            limits,
+            now_millis(),
+            startup_replay,
+            &durations,
+            capture,
+            save,
+        )?,
+        (None, None) => session_budget::Contract::new_planned_with_time(
+            limits,
+            now_millis(),
+            startup_replay,
+            &durations,
+        )?,
+        _ => return Err("显式采集和保存时限必须同时传入；未隐式补全".into()),
+    };
     let g = Group {
         schema: SCHEMA.into(),
         id: Uuid::new_v4(),
@@ -656,12 +724,7 @@ fn begin_group_at(
         cancel_requested: false,
         unified: !startup_replay,
         state: "planned".into(),
-        budget: Some(session_budget::Contract::new_planned_with_time(
-            request.session_budget.clone().unwrap_or_default(),
-            now_millis(),
-            startup_replay,
-            &durations,
-        )?),
+        budget: Some(budget),
         base,
         stages,
     };
@@ -795,7 +858,7 @@ async fn run_group_stage_at(
         g.budget
             .as_ref()
             .ok_or("旧父会话deadline未知，未启动")?
-            .deadline()?
+            .collection_deadline()?
             .check()?;
         let r = g.start(&stage_key, epoch())?;
         let stage = g
@@ -812,8 +875,15 @@ async fn run_group_stage_at(
         .as_ref()
         .ok_or("旧父会话deadline未知")?
         .deadline()?;
+    let collection_deadline = g
+        .budget
+        .as_ref()
+        .ok_or("缺采集期限")?
+        .collection_deadline()?;
     let mut dump_sources_absent = false;
-    let run = deadline.run(async {
+    let run = collection_deadline.run(async {
+        let preflight_deadline = lease_preflight_deadline(&root, &mut g, r.attempt_id.to_string(), &stage.key)?;
+        run_leased_preflight(preflight_deadline, async {
         let busy=run_device_root_script(&g.serial,r#"for p in $(pidof ksightd 2>/dev/null); do c=$(tr '\0' ' ' < /proc/$p/cmdline); case "$c" in *ksightd*\ capture*) echo capture_busy; exit 73;; esac; done"#).await?;
         if busy.code!=Some(0) {return Err("设备已有采集进程或状态未知；未启动/重试，不强杀其他会话".into());}
 
@@ -822,6 +892,8 @@ async fn run_group_stage_at(
         request.capture_relation = Some(r.clone());
 
         let(n,t)=reserve_attempt(&root,&mut g,r.attempt_id.to_string(),&stage.key)?;request.output_budget_bytes=Some(n-65536);request.output_budget_ms=Some(t);
+        let phase_deadline = g.budget.as_ref().ok_or("缺阶段期限")?.phase_deadline(&stage.key)?;
+        phase_deadline.run(async {
         request.capture_relations=None;
         request.package = Some(g.package.clone());
         request.serial = g.serial.clone();
@@ -853,9 +925,12 @@ async fn run_group_stage_at(
         } else {
             start_kernsight_capture(request).await
         }
+        }).await
+        }).await
     })
     .await;
-    let (result, mut error, session) = match run {
+    finish_attempt_time(&root, &mut g, &stage.key)?;
+    let (result, mut error, mut session) = match run {
         Ok(result) => {
             let error = if result.exit_code == Some(0)
                 && (stage.key == "dump" || result.session_id.is_some())
@@ -889,12 +964,47 @@ async fn run_group_stage_at(
         } else {
             None
         };
+    if session.is_none() {
+        if let Some(note) = remote_lifecycle.as_ref() {
+            match retained_owned_session(note, &r) {
+                Ok(id) => session = id,
+                Err(e) => merge_phase_failure(&mut error, Some(e)),
+            }
+        }
+    }
+    if stage.key != "dump"
+        && result.is_none()
+        && session.is_none()
+        && error.as_deref().is_some_and(session_deadline::is_stop)
+    {
+        merge_phase_failure(&mut error,Some("child_session_id_unconfirmed: 本attempt子会话引用未知；已有证据保留，自动保存只纳入已确认引用".into()));
+    }
     if remote_lifecycle
         .as_ref()
         .is_some_and(|n| !remote_terminal_confirmed(n))
         && error.is_none()
     {
         error=Some("remote_terminal_unconfirmed：停止请求、远端返回与退出尚未全部确认；保留原件，不能标完整成功".into());
+    }
+    if remote_lifecycle.as_ref().is_some_and(|note| {
+        note["collection_returned"] == true && note["collection_status"] == "partial"
+    }) && error
+        .as_deref()
+        .is_some_and(|text| text.contains("未确认成功"))
+    {
+        let cause = result.as_ref().and_then(|item| {
+            item.stderr
+                .lines()
+                .rev()
+                .find(|line| line.starts_with("Error:") || line.starts_with("Caused by:"))
+                .map(str::to_owned)
+        });
+        error = Some(match cause {
+            Some(cause) => {
+                format!("remote_collection_partial：producer已返回，采集未完成；{cause}")
+            }
+            None => "remote_collection_partial：producer已返回，采集partial，原件保留".into(),
+        });
     }
     if remote_lifecycle
         .as_ref()
@@ -940,18 +1050,10 @@ async fn run_group_stage_at(
             Some("无子会话进程实例证据；dump 实例见原报告".into()),
         )
     };
-    let paths = runtime_paths_from_group(Some(&g))?;
-    let artifact = if stage.key == "dump" && !dump_sources_absent {
-        Some(runtime_paths::route(
-            paths.as_ref(),
-            &format!(
-                "/data/local/tmp/ksight/captures/{}/{}/{}/dump",
-                r.parent_id, r.stage_id, r.attempt_id
-            ),
-        )?)
-    } else {
-        None
-    };
+    let artifact = dump_artifact_reference(&g, &r, result.is_some(), dump_sources_absent)?;
+    if stage.key == "dump" && explicit_time_group(&g) && result.is_none() && !dump_sources_absent {
+        merge_phase_failure(&mut error, Some("dump_artifact_unconfirmed: 本attempt Dump产物未确认；设备可能保留原件，自动保存仅纳入已确认子会话".into()));
+    }
     {
         let _guard = IO_LOCK.lock().map_err(|e| e.to_string())?;
         g = load(&root, parent_id)?;
@@ -995,6 +1097,7 @@ async fn run_group_stage_at(
                 b.release_stage_granted_before_capture(&r.attempt_id.to_string())?;
             }
         }
+        let mut saved_copy_note = None;
         if let (Some(b), Some(result)) = (g.budget.as_mut(), result.as_ref()) {
             if let Some(note) = result
                 .stderr
@@ -1009,6 +1112,26 @@ async fn run_group_stage_at(
                 let settlement = b.settle(&r.attempt_id.to_string(), &note);
                 let settled = settlement.is_ok();
                 continuation_phase_safe &= settled;
+                let kept_copy = settled
+                    && note["partial"] == true
+                    && note["reason"].as_str() == Some("bound_code_copy_partial")
+                    && note["admitted_write_bytes"].as_u64().unwrap_or(0) > 0;
+                if kept_copy {
+                    if let Some(reservation) = b
+                        .reservations
+                        .iter_mut()
+                        .find(|item| item.id == r.attempt_id.to_string())
+                    {
+                        reservation.status = "admitted_plus_terminal_reserve".into();
+                    }
+                    let admitted = note["admitted_write_bytes"].as_u64().unwrap_or(0);
+                    saved_copy_note = Some(format!(
+                        "代码快照未拷完：已写入 {admitted} 字节。已保存的文件可以分析。"
+                    ));
+                    // The runner stops the parent when this error is set, even if
+                    // the attempt itself was accepted. Linker must still run.
+                    error = None;
+                }
                 if let Err(e) = settlement {
                     if let Some(a) = g
                         .stages
@@ -1028,16 +1151,21 @@ async fn run_group_stage_at(
                         .flat_map(|s| s.attempts.iter_mut())
                         .find(|a| a.relation == r)
                     {
-                        a.state = "partial".into();
-                        a.error = Some(diagnostics::partial_stage_error(
-                            &stage.key,
-                            note["reason"]
-                                .as_str()
-                                .or_else(|| note["host_time_fence"].as_str())
-                                .unwrap_or("原因未确认"),
-                            deadline.remaining_ms().unwrap_or(0),
-                            error.as_deref(),
-                        ));
+                        if kept_copy {
+                            a.state = "succeeded".into();
+                            a.error = None;
+                        } else {
+                            a.state = "partial".into();
+                            a.error = Some(diagnostics::partial_stage_error(
+                                &stage.key,
+                                note["reason"]
+                                    .as_str()
+                                    .or_else(|| note["host_time_fence"].as_str())
+                                    .unwrap_or("原因未确认"),
+                                deadline.remaining_ms().unwrap_or(0),
+                                error.as_deref(),
+                            ));
+                        }
                     }
                     g.refresh();
                 }
@@ -1051,7 +1179,17 @@ async fn run_group_stage_at(
             .unwrap();
         attempt.omitted_process_instances = instances.len().saturating_sub(16);
         attempt.process_instances = instances.into_iter().take(16).collect();
-        attempt.observation_error = observation_error;
+        attempt.observation_error = [
+            observation_error,
+            result
+                .as_ref()
+                .filter(|item| item.exit_code == Some(0))
+                .and_then(|item| diagnostics::coverage_observation(&item.stderr)),
+            saved_copy_note,
+        ]
+        .into_iter()
+        .flatten()
+        .reduce(|left, right| format!("{left}；{right}"));
         attempt.remote_lifecycle = remote_lifecycle;
         attempt.coverage_continuation =
             coverage_continuation::authorize_phase(coverage_proof, continuation_phase_safe);
@@ -1967,6 +2105,10 @@ pub fn export_root(g: &Group) -> Result<String, String> {
         .ok_or("主会话没有成功的 dump 产物；不会拉取同包其他轮次".into())
 }
 
+pub(super) fn retained_runtime_only(g: &Group) -> bool {
+    export_root(g).is_err() && !g.session_ids().is_empty()
+}
+
 #[tauri::command]
 pub fn get_local_kernsight_child_report(
     root: String,
@@ -2219,7 +2361,7 @@ pub async fn run_kernsight_unified_group(
         g.budget
             .as_ref()
             .ok_or("旧父会话deadline未知，未启动")?
-            .deadline()?
+            .collection_deadline()?
             .check()?;
         let relations = g.start_unified(epoch())?;
         save(&root, &g)?;
@@ -2230,18 +2372,30 @@ pub async fn run_kernsight_unified_group(
         .as_ref()
         .ok_or("旧父会话deadline未知")?
         .deadline()?;
-    let run=deadline.run(async {
+    let collection_deadline = g
+        .budget
+        .as_ref()
+        .ok_or("缺采集期限")?
+        .collection_deadline()?;
+    let run=collection_deadline.run(async {
+        let preflight_deadline = lease_preflight_deadline(&root, &mut g, relations[0].attempt_id.to_string(), "unified")?;
+        run_leased_preflight(preflight_deadline, async {
         let busy=run_device_root_script(&g.serial,r#"for p in $(pidof ksightd 2>/dev/null); do c=$(tr '\0' ' ' < /proc/$p/cmdline); case "$c" in *ksightd*\ capture*) echo capture_busy; exit 73;; esac; done"#).await?;
         if busy.code!=Some(0){return Err("设备已有采集或状态未知；未启动/重试".into());}
         let mut request:KernSightCaptureRequest=serde_json::from_value(g.base.clone()).map_err(|e|e.to_string())?;
 
         let(n,t)=reserve_attempt(&root,&mut g,relations[0].attempt_id.to_string(),"unified")?;request.output_budget_bytes=Some(n-65536);request.output_budget_ms=Some(t);
+        let phase_deadline = g.budget.as_ref().ok_or("缺统一阶段期限")?.phase_deadline("unified")?;
+        phase_deadline.run(async {
         request.serial=g.serial.clone();request.package=Some(g.package.clone());request.capture_relation=Some(relations[0].clone());request.capture_relations=Some(relations.clone());
         request.duration_seconds=g.stages[..3].iter().map(|s|s.duration_seconds).sum();request.launch_after_attach=true;
         request.inspect_tls=false;request.inspect_jni=false;request.inspect_linker=false;request.inspect_adapter=None;
         request.inspect_stages=Some(g.stages[..3].iter().map(|s|format!("{}:{}",s.key,s.duration_seconds)).collect::<Vec<_>>().join(","));
         start_kernsight_capture(request).await
+        }).await
+        }).await
     }).await;
+    finish_attempt_time(&root, &mut g, "unified")?;
     let (result, mut error) = match run {
         Ok(r) => (Some(r), None),
         Err(e) => (None, Some(e)),
@@ -2266,6 +2420,22 @@ pub async fn run_kernsight_unified_group(
         } else {
             None
         };
+    let recovered_session = match remote_lifecycle.as_ref() {
+        Some(note) => match retained_owned_session(note, &relations[0]) {
+            Ok(id) => id,
+            Err(e) => {
+                merge_phase_failure(&mut error, Some(e));
+                None
+            }
+        },
+        None => None,
+    };
+    if result.is_none()
+        && recovered_session.is_none()
+        && error.as_deref().is_some_and(session_deadline::is_stop)
+    {
+        merge_phase_failure(&mut error,Some("child_session_id_unconfirmed: 本统一attempt子会话引用未知；已有证据保留，自动保存只纳入已确认引用".into()));
+    }
     if remote_lifecycle
         .as_ref()
         .is_some_and(|n| !remote_terminal_confirmed(n))
@@ -2298,6 +2468,21 @@ pub async fn run_kernsight_unified_group(
             );
         }
         g.finish_unified(&relations, result.as_ref(), error.as_deref())?;
+        if result.is_none() {
+            if let Some(id) = recovered_session {
+                for relation in &relations {
+                    if let Some(attempt) = g
+                        .stages
+                        .iter_mut()
+                        .flat_map(|s| s.attempts.iter_mut())
+                        .find(|a| a.relation == *relation)
+                    {
+                        attempt.session_id = Some(id);
+                    }
+                }
+            }
+        }
+
         mark_stopped_budget(&mut g, error.as_deref());
         for attempt in g.stages[..3]
             .iter_mut()
@@ -2682,6 +2867,9 @@ pub(super) fn reserve_export_at(
         return Ok(None);
     };
     let key = format!("export:{}", output.display());
+    b.retarget_unfinished_export("transfer", format!("{key}:transfer"));
+    b.retarget_unfinished_export("archive", format!("{key}:archive"));
+    b.retarget_unfinished_export("import", format!("{key}:import"));
     let (transfer, ms) = b.reserve(format!("{key}:transfer"), "transfer", now_millis())?;
     let (archive, _) = b.reserve(format!("{key}:archive"), "archive", now_millis())?;
     let (import, _) = b.reserve(format!("{key}:import"), "import", now_millis())?;
@@ -3270,11 +3458,16 @@ pub(super) fn begin_export_time_at(root: &Path, g: &mut Group, kind: &str) -> Re
     if g.cancel_requested {
         return Err("父会话已取消，未启动导出".into());
     }
-    let ms = g
-        .budget
-        .as_mut()
-        .ok_or("父预算未知，未续期")?
-        .begin_time_phase(kind, now_millis())?;
+    let budget = g.budget.as_mut().ok_or("父预算未知，未续期")?;
+    let ms = match budget.begin_time_phase(kind, now_millis()) {
+        Ok(ms) => ms,
+        Err(error)
+            if error.contains("parent_deadline_unknown") || error.contains("时间阶段已终结") =>
+        {
+            budget.export_remaining_ms(kind)?
+        }
+        Err(error) => return Err(error),
+    };
     save(root, g)?;
     Ok(ms)
 }
@@ -3410,4 +3603,355 @@ mod stage_time_fence_tests {
         assert!(g.start("l1", epoch()).is_err());
         g.validate().unwrap();
     }
+}
+
+/// Start v5 phase accounting before the device-busy guard. Legacy busy checks
+/// retain their original ordering. A later reservation reuses this first lease.
+fn lease_preflight_deadline(
+    root: &Path,
+    g: &mut Group,
+    id: String,
+    kind: &str,
+) -> Result<Option<session_deadline::Deadline>, String> {
+    if !explicit_time_group(g) {
+        return Ok(None);
+    }
+    reserve_attempt(root, g, id, kind)?;
+    g.budget
+        .as_ref()
+        .ok_or("缺阶段期限")?
+        .phase_deadline(kind)
+        .map(Some)
+}
+
+async fn run_leased_preflight<T>(
+    deadline: Option<session_deadline::Deadline>,
+    future: impl std::future::Future<Output = Result<T, String>>,
+) -> Result<T, String> {
+    match deadline {
+        Some(d) => d.run(future).await,
+        None => future.await,
+    }
+}
+
+fn explicit_time_group(g: &Group) -> bool {
+    g.budget
+        .as_ref()
+        .and_then(|b| b.time_plan.as_ref())
+        .is_some_and(|p| p.schema == "mobilee.session-time-plan/v5")
+}
+
+/// The relation retains the exact planned path, even when the producer never
+/// returned. An unconfirmed v5 path cannot select Dump transfer over known sessions.
+fn dump_artifact_reference(
+    g: &Group,
+    relation: &Relation,
+    producer_returned: bool,
+    sources_absent: bool,
+) -> Result<Option<String>, String> {
+    if relation.stage_key != "dump"
+        || sources_absent
+        || (explicit_time_group(g) && !producer_returned)
+    {
+        return Ok(None);
+    }
+    let paths = runtime_paths_from_group(Some(g))?;
+    runtime_paths::route(
+        paths.as_ref(),
+        &format!(
+            "/data/local/tmp/ksight/captures/{}/{}/{}/dump",
+            relation.parent_id, relation.stage_id, relation.attempt_id
+        ),
+    )
+    .map(Some)
+}
+
+/// Persist real operation timing immediately on return, before read-only status
+/// acquisition. Later reloads/settlement never reconstruct it from wall timestamps.
+fn finish_attempt_time(root: &Path, g: &mut Group, kind: &str) -> Result<(), String> {
+    if !g
+        .budget
+        .as_ref()
+        .and_then(|b| b.time_plan.as_ref())
+        .is_some_and(|p| p.schema == "mobilee.session-time-plan/v5")
+    {
+        return Ok(());
+    }
+    let _lock = IO_LOCK.lock().map_err(|e| e.to_string())?;
+    *g = load(root, g.id)?;
+    g.budget
+        .as_mut()
+        .ok_or("缺阶段计时合同")?
+        .finish_phase_timing(kind, now_millis())?;
+    save(root, g)
+}
+/// Only an exact, validated attempt lifecycle may name a real created spool.
+/// Legacy/missing references stay unknown. Never scan historical sessions.
+fn retained_owned_session(note: &Value, relation: &Relation) -> Result<Option<Uuid>, String> {
+    if note["schema"] != "kernsight.capture-lifecycle/v1" {
+        return Ok(None);
+    }
+    validate_remote_lifecycle(note, relation)?;
+    let Some(value) = note.get("session_id").filter(|v| !v.is_null()) else {
+        return Ok(None);
+    };
+    let id = Uuid::parse_str(value.as_str().ok_or("远端会话引用类型未知")?)
+        .map_err(|_| "远端会话引用UUID无效")?;
+    if id.is_nil() {
+        return Err("远端会话引用UUID为空".into());
+    }
+    Ok(Some(id))
+}
+
+#[cfg(test)]
+mod manual_time_v5_parent {
+    use super::*;
+    fn request() -> KernSightCaptureRequest {
+        serde_json::from_value(
+            serde_json::json!({"serial":"synthetic","package":"org.example.fixture",
+            "durationSeconds":15,"sessionBudget":{"totalBytes":4294967296u64,"maxSeconds":530},
+            "captureTime":{"maxSeconds":30,"l2MaxSeconds":15},
+            "saveTime":{"transferMaxSeconds":255,"archiveMaxSeconds":120,"importMaxSeconds":120}}),
+        )
+        .unwrap()
+    }
+    #[test]
+    fn explicit_parent_keeps_requested_observation_even_when_capture_cap_is_shorter() {
+        let root = std::env::temp_dir().join(format!("me-manual-v5-{}", Uuid::new_v4()));
+        let mut g = begin_group_at(root.clone(), request(), vec![15, 90, 15], true).unwrap();
+        assert_eq!(
+            g.stages
+                .iter()
+                .find(|s| s.key == "l1")
+                .unwrap()
+                .duration_seconds,
+            90
+        );
+        let r = g.start("l0", epoch()).unwrap();
+        let id = Uuid::new_v4();
+        g.finish(
+            &r,
+            Some(id),
+            None,
+            Some("parent_deadline_exhausted: fixed capture boundary".into()),
+        )
+        .unwrap();
+        save(&root, &g).unwrap();
+        let retained = selected_for_save(&root, g.id).unwrap();
+        assert!(retained.session_ids().contains(&id));
+        assert_ne!(retained.state, "succeeded");
+        assert!(export_root(&retained).is_err()); // no invented Dump artifact
+        let mut tampered = g.clone();
+        tampered.base["captureTime"]["maxSeconds"] = serde_json::json!(31);
+        assert!(tampered.validate().is_err());
+        // Synthetic fixture cleanup only; no user capture evidence is touched.
+        std::fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn dedicated_time_ipc_requires_both_configs_before_device_work() {
+        assert!(require_timed_configuration(&request()).is_ok());
+        let mut r = request();
+        r.capture_time = None;
+        assert!(require_timed_configuration(&r).is_err());
+        let mut r = request();
+        r.save_time = None;
+        assert!(require_timed_configuration(&r).is_err());
+    }
+    #[test]
+    fn incomplete_or_mismatched_time_request_refuses_before_parent_write() {
+        let root = std::env::temp_dir().join(format!("me-manual-v5-refuse-{}", Uuid::new_v4()));
+        let mut r = request();
+        r.save_time = None;
+        assert!(begin_group_at(root.clone(), r, vec![15, 90, 15], true).is_err());
+        assert!(!root.exists());
+        let mut r = request();
+        r.session_budget.as_mut().unwrap().max_seconds = 900;
+        assert!(begin_group_at(root.clone(), r, vec![15, 90, 15], true).is_err());
+        assert!(!root.exists());
+    }
+    #[test]
+    fn failed_archive_without_byte_receipt_records_time_without_completion() {
+        let root = std::env::temp_dir().join(format!("me-v5-archive-time-{}", Uuid::new_v4()));
+        let mut g = begin_group_at(root.clone(), request(), vec![15, 90, 15], true).unwrap();
+        let output = root.join("synthetic-never-written.mee");
+        reserve_export_at(&root, &mut g, &output).unwrap();
+        begin_export_time_at(&root, &mut g, "archive").unwrap();
+        std::thread::sleep(Duration::from_millis(3));
+        finish_export_time_at(&root, &mut g, "archive").unwrap();
+        let p = g
+            .budget
+            .as_ref()
+            .unwrap()
+            .time_plan
+            .as_ref()
+            .unwrap()
+            .phases
+            .iter()
+            .find(|p| p.kind == "archive")
+            .unwrap();
+        assert!(p.started_unix_ms.is_some() && p.finished_unix_ms.is_some());
+        assert!(p.elapsed_ms.unwrap() >= 3);
+        assert!(!p.completed);
+        let r = g
+            .budget
+            .as_ref()
+            .unwrap()
+            .reservations
+            .iter()
+            .find(|r| r.kind == "archive")
+            .unwrap();
+        assert_eq!(r.charged_bytes, None);
+        assert_eq!(r.status, "reserved");
+        assert!(!output.exists());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn timeout_session_reference_is_exact_attempt_or_unknown() {
+        let r = Relation {
+            parent_id: Uuid::new_v4(),
+            stage_id: Uuid::new_v4(),
+            attempt_id: Uuid::new_v4(),
+            attempt: 1,
+            stage_key: "l1".into(),
+        };
+        let mut note = serde_json::json!({"schema":"kernsight.capture-lifecycle/v1",
+            "relation":{"parent_id":r.parent_id,"stage_id":r.stage_id,"attempt_id":r.attempt_id,"attempt":1,"stage_key":"l1"},
+            "token":Uuid::new_v4(),"target_pause":"forbidden","stop_request_recorded":true,"stop_acknowledged":true,
+            "collection_returned":true,"collection_status":"partial","stop_reason":"parent_deadline_exhausted","agent_exited_confirmed":true,"cleanup":"producer_scope_returned"});
+        assert_eq!(retained_owned_session(&note, &r).unwrap(), None);
+        let id = Uuid::new_v4();
+        note["session_id"] = serde_json::json!(id);
+        assert_eq!(retained_owned_session(&note, &r).unwrap(), Some(id));
+        note["relation"]["attempt_id"] = serde_json::json!(Uuid::new_v4());
+        assert!(retained_owned_session(&note, &r).is_err());
+    }
+    #[tokio::test]
+    async fn short_l2_slow_busy_preflight_keeps_known_prefix_and_original_save_budget() {
+        let root = std::env::temp_dir().join(format!("me-v5-preflight-{}", Uuid::new_v4()));
+        let mut req = request();
+        req.capture_time.as_mut().unwrap().l2_max_seconds = 1;
+        let mut g = begin_group_at(root.clone(), req, vec![15, 90, 15], true).unwrap();
+        let mut ids = Vec::new();
+        for kind in ["l0", "l1"] {
+            let r = g.start(kind, epoch()).unwrap();
+            let id = Uuid::new_v4();
+            g.finish(&r, Some(id), None, None).unwrap();
+            ids.push(id);
+        }
+        let relation = g.start("dump", epoch()).unwrap();
+        save(&root, &g).unwrap();
+        let parent = g.budget.as_ref().unwrap().deadline().unwrap();
+        let token = g.budget.as_ref().unwrap().deadline_token;
+        let phase =
+            lease_preflight_deadline(&root, &mut g, relation.attempt_id.to_string(), "dump")
+                .unwrap();
+        let launch = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let launched = std::sync::Arc::clone(&launch);
+        // A synthetic slow busy guard never reaches producer launch. No device IO.
+        let error = run_leased_preflight(phase, async move {
+            tokio::time::sleep(Duration::from_secs(3)).await;
+            launched.store(true, std::sync::atomic::Ordering::SeqCst);
+            Ok::<(), String>(())
+        })
+        .await
+        .unwrap_err();
+        assert!(error.contains("parent_deadline_exhausted"));
+        assert!(!launch.load(std::sync::atomic::Ordering::SeqCst));
+        finish_attempt_time(&root, &mut g, "dump").unwrap();
+        let artifact = dump_artifact_reference(&g, &relation, false, false).unwrap();
+        assert_eq!(artifact, None);
+        g.finish(&relation, None, artifact, Some(error)).unwrap();
+        save(&root, &g).unwrap();
+        let retained = selected_for_save(&root, g.id).unwrap();
+        assert!(retained_runtime_only(&retained));
+        assert_eq!(retained.session_ids(), ids.into_iter().collect());
+        assert!(export_root(&retained).is_err());
+        let attempt = retained
+            .stages
+            .iter()
+            .find(|s| s.key == "dump")
+            .unwrap()
+            .attempts
+            .last()
+            .unwrap();
+        assert_eq!(attempt.relation, relation); // exact planned attempt retained
+        assert!(attempt.remote_artifact_root.is_none());
+        let timing = retained
+            .budget
+            .as_ref()
+            .unwrap()
+            .time_plan
+            .as_ref()
+            .unwrap()
+            .phases
+            .iter()
+            .find(|p| p.kind == "dump")
+            .unwrap();
+        assert!(timing.started_unix_ms.is_some() && timing.finished_unix_ms.is_some());
+        assert!(timing.elapsed_ms.unwrap() >= 1000 && timing.elapsed_ms.unwrap() < 30000);
+        assert!(parent.check().is_ok());
+        let mut save_budget = retained.budget.unwrap();
+        assert!(save_budget
+            .reserve("known-prefix-save".into(), "transfer", now_millis())
+            .is_ok());
+        assert!(save_budget
+            .begin_time_phase("transfer", now_millis())
+            .is_ok());
+        assert_eq!(save_budget.deadline_token, token);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn returned_dump_path_is_retained_and_legacy_unreturned_path_is_unchanged() {
+        let root = std::env::temp_dir().join(format!("me-v5-root-policy-{}", Uuid::new_v4()));
+        let mut g = begin_group_at(root.clone(), request(), vec![15, 90, 15], true).unwrap();
+        let r = Relation {
+            parent_id: g.id,
+            stage_id: g.stages.iter().find(|s| s.key == "dump").unwrap().id,
+            attempt_id: Uuid::new_v4(),
+            attempt: 1,
+            stage_key: "dump".into(),
+        };
+        let returned = dump_artifact_reference(&g, &r, true, false)
+            .unwrap()
+            .unwrap();
+        assert!(returned.contains(&r.attempt_id.to_string()));
+        assert!(dump_artifact_reference(&g, &r, true, true)
+            .unwrap()
+            .is_none());
+        let legacy = session_budget::Contract::new_planned_with_time(
+            session_budget::Limits {
+                total_bytes: 4294967296,
+                max_seconds: 900,
+            },
+            now_millis(),
+            true,
+            &[15, 90, 15],
+        )
+        .unwrap();
+        g.budget = Some(legacy);
+        assert_eq!(
+            dump_artifact_reference(&g, &r, false, false).unwrap(),
+            Some(returned)
+        );
+        let before = serde_json::to_value(g.budget.as_ref().unwrap()).unwrap();
+        assert!(
+            lease_preflight_deadline(&root, &mut g, r.attempt_id.to_string(), "dump")
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            serde_json::to_value(g.budget.as_ref().unwrap()).unwrap(),
+            before
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+}
+
+/// A failed archive may have no byte receipt, but its observed start/return
+/// still have real elapsed time. Record only timing, never payload completion.
+pub(super) fn finish_export_time_at(root: &Path, g: &mut Group, kind: &str) -> Result<(), String> {
+    if !matches!(kind, "transfer" | "archive" | "import") {
+        return Err("无效保存计时阶段".into());
+    }
+    finish_attempt_time(root, g, kind)
 }
