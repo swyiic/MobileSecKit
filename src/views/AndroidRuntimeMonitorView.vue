@@ -7,17 +7,17 @@
         <p>按进程实例把内核事实、用户态 Inspect 和显式 dump 串成一条可核验的链：进程身份 → DNS / Handshake SNI → Binder token → TLS / Parcel → DEX / SO / CE·DE。这不是整机仪表盘；confirmed、correlated、inferred 不会被界面升级。</p>
         <div class="runtime-hero-actions">
           <button v-if="!androidReady" class="primary-button" @click="$emit('open-devices')"><span class="material-symbols-outlined">devices</span>选择 Android 设备</button>
-          <div v-else-if="!capabilityProbe" class="ks-operation-slot"><button class="primary-button" :disabled="probing" @click="runCapabilityProbe"><span class="material-symbols-outlined" :class="{ spinning: probing }">{{ probing ? 'sync' : 'fact_check' }}</span>{{ probing ? '正在探测…' : '检测设备能力' }}</button><OperationError :message="operationErrors['probe']" @dismiss="dismissOperation('probe')" /></div>
-          <template v-else-if="kernSight">
-            <div class="ks-operation-slot"><button class="ghost-button" :disabled="probing" @click="runCapabilityProbe"><span class="material-symbols-outlined" :class="{ spinning: probing }">{{ probing ? 'sync' : 'fact_check' }}</span>{{ probing ? '正在探测…' : '重新检测环境' }}</button><OperationError :message="operationErrors['probe']" @dismiss="dismissOperation('probe')" /></div>
-            <div class="ks-operation-slot"><button class="ghost-button" :disabled="provisioning" title="从 swyiic/KernSight 的最新 GitHub Release 下载、校验并安装" @click="provisionKernSight"><span class="material-symbols-outlined" :class="{ spinning: provisioning }">{{ provisioning ? 'sync' : 'system_update_alt' }}</span>{{ provisioning ? '正在下载并安装…' : '检查 Agent 更新' }}</button><OperationError :message="operationErrors['provision']" @dismiss="dismissOperation('provision')" /></div>
+          <template v-else>
+            <div class="ks-operation-slot"><button class="ghost-button" :disabled="probing" @click="runCapabilityProbe"><span class="material-symbols-outlined" :class="{ spinning: probing }">{{ probing ? 'sync' : 'fact_check' }}</span>{{ probing ? '正在探测…' : (capabilityProbe ? '重新检测环境' : '检测设备能力') }}</button><OperationError :message="operationErrors['probe']" @dismiss="dismissOperation('probe')" /></div>
+            <div class="ks-operation-slot"><button class="ghost-button" :disabled="provisioning" title="先核对手机上的 ksightd 和本机 CLI 是否已是最新 Release。不是才下载。" @click="provisionKernSight"><span class="material-symbols-outlined" :class="{ spinning: provisioning }">{{ provisioning ? 'sync' : 'system_update_alt' }}</span>{{ provisioning ? '正在核对…' : '检查 Agent 更新' }}</button><OperationError :message="operationErrors['provision']" @dismiss="dismissOperation('provision')" /></div>
             <div class="ks-operation-slot"><button class="ghost-button" :disabled="loadingKernSight" @click="loadKernSight"><span class="material-symbols-outlined" :class="{ spinning: loadingKernSight }">{{ loadingKernSight ? 'sync' : 'refresh' }}</span>{{ loadingKernSight ? '正在握手…' : '刷新会话与证据' }}</button><OperationError :message="operationErrors['refresh']" @dismiss="dismissOperation('refresh')" /></div>
           </template>
         </div>
       </div>
-      <div class="runtime-readiness" :class="readinessTone">
-        <span class="material-symbols-outlined">{{ readinessIcon }}</span>
-        <div><small>当前状态</small><strong>{{ readinessTitle }}</strong><p>{{ readinessDetail }}</p></div>
+      <div class="runtime-readiness" :class="{ current: agentFresh }">
+        <i class="ks-signal"></i>
+        <div><strong>{{ agentFresh ? '最新' : '未核对' }}</strong><small>{{ agentLine }}</small></div>
+        <button class="ghost-button" @click="deviceDrawer = true">设备</button>
       </div>
     </section>
 
@@ -44,7 +44,12 @@
 
     <section v-if="probeError" class="notice error-notice runtime-probe-error" role="alert"><span class="material-symbols-outlined">error</span><span>{{ probeError }}</span><button @click="probeError = ''">关闭</button></section>
 
-    <section v-if="provisionResult" class="panel ks-provision-result">
+    <div v-if="deviceDrawer" class="ks-device-backdrop" @click.self="deviceDrawer = false">
+      <aside class="ks-device-drawer" role="dialog" aria-modal="true" aria-label="设备与更新">
+        <header class="ks-device-drawer-head"><div><div class="eyebrow">DEVICE</div><h2>设备与更新</h2></div><button class="icon-button" @click="deviceDrawer = false"><span class="material-symbols-outlined">close</span></button></header>
+        <div class="ks-device-drawer-body">
+
+    <section v-if="provisionResult && !provisionResult.alreadyCurrent" class="panel ks-provision-result">
       <header><div><div class="eyebrow">KERNSIGHT PROVISIONING</div><h2>{{ provisionResult.releaseTag }} 安装完成</h2><p>{{ provisionResult.installedVersion }} · {{ formatBytes(provisionResult.assetBytes) }} · SHA-256 {{ provisionResult.assetSha256 }}</p></div><a :href="provisionResult.releaseUrl" target="_blank" rel="noreferrer">查看 Release</a></header>
       <div class="ks-provision-steps"><article v-for="step in provisionResult.steps" :key="step.key"><span class="material-symbols-outlined">check_circle</span><div><strong>{{ step.label }}</strong><small>{{ step.detail }}</small></div></article></div>
     </section>
@@ -79,10 +84,13 @@
       <div class="ks-install-guidance">
         <span class="material-symbols-outlined">info</span>
         <p><strong>检测不等于植入。</strong>Agent 和 BPF 对象真正部署并完成协议握手后，MobileE 才会显示采集、会话、取证和分析功能。环境不符合时强行部署可能出现 BPF verifier、权限、BTF relocation 或 bpffs 固定失败。</p>
-        <div class="ks-operation-slot"><button class="primary-button" :disabled="provisioning" @click="provisionKernSight">{{ provisioning ? '正在下载、校验并安装…' : deploymentReady ? '从 GitHub 下载并安装' : '仍然尝试安装' }}</button><OperationError :message="operationErrors.provision" @dismiss="dismissOperation('provision')" /></div>
+        <div class="ks-operation-slot"><button class="primary-button" :disabled="provisioning" @click="provisionKernSight">{{ provisioning ? '正在安装本机 CLI 并更新手机…' : deploymentReady ? '安装本机 CLI 并更新手机' : '仍然尝试安装' }}</button><OperationError :message="operationErrors.provision" @dismiss="dismissOperation('provision')" /></div>
         <div class="ks-operation-slot"><button class="ghost-button" :disabled="loadingKernSight" @click="loadKernSight">我已部署，重新握手</button><OperationError :message="operationErrors.refresh" @dismiss="dismissOperation('refresh')" /></div>
       </div>
     </section>
+        </div>
+      </aside>
+    </div>
 
     <section v-if="kernSight && workspaceMode === 'capture'" class="panel ks-capture-panel">
       <div class="section-title compact">
@@ -611,6 +619,8 @@ const visibleCaptureGroups=computed(()=>mergeCaptureGroups(captureGroups.value.f
 const capabilityProbe = ref<AndroidMonitorCapabilityProbe | null>(null)
 const probing = ref(false)
 const provisioning = ref(false)
+const deviceDrawer = ref(false)
+const agentBadge = ref({ fresh: false, version: '' })
 const provisionResult = ref<KernSightProvisionResult | null>(null)
 const operationErrors = reactive<Record<string, string>>({})
 const operationMessages = reactive<Record<string, string>>({})
@@ -774,16 +784,6 @@ watch(() => [captureForm.captureMaxSeconds, captureForm.l2MaxSeconds, captureFor
 }, { immediate:true })
 
 const androidReady = computed(() => props.device?.platform === 'android' && props.device.status === 'device')
-const readinessTitle = computed(() => {
-  if (kernSight.value) return `KernSight ${kernSight.value.agentBuildIdentity?.version || kernSight.value.agentVersion} · 已连接`
-  if (probing.value) return '正在检测设备能力'
-  if (capabilityProbe.value) return `${recommendedModeLabel.value} · 探测完成`
-  if (!props.device) return '等待设备'
-  if (props.device.platform !== 'android') return '仅支持 Android'
-  if (props.device.status !== 'device') return '设备尚未授权'
-  return '设备已连接 · Agent 未接入'
-})
-const readinessDetail = computed(() => capabilityProbe.value?.summary || (androidReady.value ? '先执行只读能力探测，再决定使用 Standard、Dev Root 或 System 模式。' : '选择一台已通过 USB 调试授权的 Android 设备。'))
 const sessionReport = computed<Record<string, any> | null>(() => selectedReport.value?.report as Record<string, any> || null)
 const selectedLocalBundle = computed(() => selectedEvidenceSource.value === 'local' ? bundleForPackage(selectedPackage.value) : null)
 const selectedPackageBundles = computed(() => localEvidenceBundles.value.filter(bundle => bundle.package === selectedPackage.value))
@@ -1424,8 +1424,12 @@ const aiContextJson = computed(() => JSON.stringify({
   ],
   limitations: reportLimitations.value,
 }, null, 2))
-const readinessIcon = computed(() => capabilityProbe.value ? capabilityProbe.value.recommendedMode === 'system' ? 'verified' : capabilityProbe.value.recommendedMode === 'development' ? 'terminal' : 'info' : androidReady.value ? 'developer_board' : props.device?.platform === 'ios' ? 'mobile_off' : 'usb_off')
-const readinessTone = computed(() => androidReady.value ? 'ready' : 'idle')
+const agentLine = computed(() => {
+  const raw = agentBadge.value.version || kernSight.value?.agentBuildIdentity?.version || kernSight.value?.agentVersion || ''
+  const version = raw.replace(/^ksightd\s+/, '')
+  return version ? `ksightd ${version}` : 'ksightd 未连接'
+})
+const agentFresh = computed(() => agentBadge.value.fresh)
 
 const trustLabel = computed(() => {
   if (capabilityProbe.value) return capabilityProbe.value.trustLevel
@@ -1465,7 +1469,6 @@ async function runCapabilityProbe() {
     capabilityProbe.value = await monitoringBackend.probeCapabilities(props.device.serial)
     if (capabilityProbe.value.agentStatus !== 'Not Installed') await loadKernSight()
   } catch (error) {
-    capabilityProbe.value = null
     failOperation(key, ticket, error)
   } finally {
     probing.value = false
@@ -1480,7 +1483,8 @@ async function provisionKernSight() {
   probeError.value = ''
   try {
     provisionResult.value = await monitoringBackend.provisionLatestAgent(props.device.serial)
-    capabilityProbe.value = await monitoringBackend.probeCapabilities(props.device.serial)
+    agentBadge.value = { fresh: true, version: provisionResult.value.installedVersion || '' }
+    if (!provisionResult.value.alreadyCurrent) capabilityProbe.value = await monitoringBackend.probeCapabilities(props.device.serial)
     await loadKernSight()
   } catch (error) {
     failOperation(key, ticket, error)
@@ -2815,10 +2819,17 @@ details.ks-session-row pre { max-height: 360px; overflow: auto; white-space: pre
 .ks-flow-n{position:relative;z-index:1;display:grid;place-items:center;box-sizing:border-box;width:22px;height:22px;margin:8px 0 0;padding:0;justify-self:center;align-self:start;border-radius:50%;color:#1b1403;background:#f5c542;font-size:12px;font-weight:700;line-height:22px;text-align:center}
 .ks-group-actions .ghost-button{box-sizing:border-box;height:32px;min-height:32px;padding:0 12px;font-size:12px;line-height:1;white-space:nowrap}
 .ks-group-actions .ghost-button:disabled{border-style:solid;opacity:.55}
-.runtime-readiness>div{min-width:0;flex:1}
-.runtime-readiness strong,.runtime-readiness p{overflow-wrap:anywhere;word-break:break-word;white-space:normal}
-.runtime-readiness strong{font-size:15px;line-height:1.35}
-.runtime-readiness p{font-size:13px;line-height:1.55}
+.runtime-readiness{display:flex;align-items:center;gap:8px;min-width:148px;padding:8px 10px}
+.runtime-readiness>div{min-width:0}
+.runtime-readiness strong{display:block;font-size:12px;line-height:1.2}
+.runtime-readiness small{display:block;margin-top:2px;color:var(--muted);font-size:11px;line-height:1.2}
+.ks-signal{width:8px;height:8px;border-radius:50%;background:#8b97a6;flex:none}
+.runtime-readiness.current .ks-signal{background:#3dbe7a;box-shadow:0 0 0 3px rgba(61,190,122,.18)}
+.ks-device-backdrop{position:fixed;inset:0;z-index:40;display:flex;justify-content:flex-end;background:rgba(8,12,18,.35)}
+.ks-device-drawer{display:flex;flex-direction:column;width:min(720px,100vw);height:100%;overflow:hidden;background:var(--surface);border-left:1px solid var(--line);box-shadow:-16px 0 40px rgba(0,0,0,.18)}
+.ks-device-drawer-head{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:16px 18px;border-bottom:1px solid var(--line)}
+.ks-device-drawer-head h2{margin:0;font-size:16px}
+.ks-device-drawer-body{overflow:auto;padding:16px 18px 28px}
 .ks-flow-card{min-width:0;padding:10px 12px;border:1px solid var(--line);border-radius:10px;background:rgba(4,8,13,.36)}
 .ks-flow-card>header{display:flex;flex-wrap:wrap;align-items:center;gap:8px}
 .ks-flow-card>header>b{padding:2px 7px;border-radius:999px;font-size:7px;letter-spacing:.04em}

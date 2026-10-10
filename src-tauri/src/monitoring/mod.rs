@@ -430,6 +430,7 @@ pub struct KernSightProvisionResult {
     release_url: String,
     asset_sha256: String,
     asset_bytes: u64,
+    already_current: bool,
     steps: Vec<KernSightProvisionStep>,
 }
 
@@ -708,7 +709,7 @@ fn build_probe(
 
     let recommended_mode = if agent_value == "system" && bpffs_mounted {
         "system"
-    } else if root_granted && btf_available && bpffs_mounted {
+    } else if root_granted {
         "development"
     } else {
         "standard"
@@ -834,9 +835,10 @@ fn build_probe(
         ),
     ];
 
-    let summary = match recommended_mode.as_str() {
-        "system" => "检测到系统 Agent 候选，可以进入系统握手与完整性校验阶段。",
-        "development" => "设备满足 Dev Root 基础条件，下一步可以经确认部署开发 Agent。",
+    let summary = match (recommended_mode.as_str(), btf_available) {
+        ("system", _) => "检测到系统 Agent 候选，可以进入系统握手与完整性校验阶段。",
+        ("development", false) => "已获得 Root 授权。这台内核没有可读 BTF，采集使用设备上的兼容程序。",
+        ("development", true) => "已获得 Root 授权，可以部署开发 Agent。",
         _ => "当前只能使用 Standard 模式；完整监控需要 Root 授权或预装系统 Agent。",
     }
     .to_string();
@@ -946,6 +948,80 @@ fn checksum_for_asset(manifest: &str, asset_name: &str) -> Option<String> {
     })
 }
 
+fn host_cli_release_asset() -> Result<&'static str, String> {
+    match (std::env::consts::OS, std::env::consts::ARCH) {
+        ("macos", "aarch64") => Ok("kernsight-cli-macos-arm64.tar.gz"),
+        ("macos", "x86_64") => Ok("kernsight-cli-macos-x86_64.tar.gz"),
+        ("linux", "aarch64") => Ok("kernsight-cli-linux-aarch64.tar.gz"),
+        ("linux", "x86_64") => Ok("kernsight-cli-linux-x86_64.tar.gz"),
+        (os, arch) => Err(format!("[选择本机 CLI] 没有 {os}-{arch} 的发布包")),
+    }
+}
+
+fn find_named_file(dir: &Path, name: &str) -> Option<PathBuf> {
+    let entries = std::fs::read_dir(dir).ok()?;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            if let Some(found) = find_named_file(&path, name) {
+                return Some(found);
+            }
+        } else if path.file_name().and_then(|item| item.to_str()) == Some(name) {
+            return Some(path);
+        }
+    }
+    None
+}
+
+fn install_host_cli(archive: &[u8]) -> Result<String, String> {
+    let home = std::env::var("HOME").map_err(|_| "[安装本机 CLI] 没有 HOME".to_string())?;
+    let bin_dir = PathBuf::from(&home).join(".local/bin");
+    std::fs::create_dir_all(&bin_dir)
+        .map_err(|error| format!("[安装本机 CLI] 无法创建 {}：{error}", bin_dir.display()))?;
+    let work = std::env::temp_dir().join(format!("mobilee-cli-{}", Uuid::new_v4()));
+    std::fs::create_dir_all(work.join("out"))
+        .map_err(|error| format!("[安装本机 CLI] {error}"))?;
+    let archive_path = work.join("cli.tar.gz");
+    std::fs::write(&archive_path, archive)
+        .map_err(|error| format!("[安装本机 CLI] {error}"))?;
+    let extracted = work.join("out");
+    let status = std::process::Command::new("tar")
+        .args([
+            "-xzf",
+            archive_path.to_str().ok_or("[安装本机 CLI] 临时路径不是 UTF-8")?,
+            "-C",
+            extracted.to_str().ok_or("[安装本机 CLI] 临时路径不是 UTF-8")?,
+        ])
+        .status()
+        .map_err(|error| format!("[安装本机 CLI] 无法解压：{error}"))?;
+    if !status.success() {
+        let _ = std::fs::remove_dir_all(&work);
+        return Err("[安装本机 CLI] tar 解压失败".into());
+    }
+    let found = find_named_file(&extracted, "ksightctl")
+        .ok_or("[安装本机 CLI] 压缩包里没有 ksightctl")?;
+    let dest = bin_dir.join("ksightctl");
+    std::fs::copy(&found, &dest)
+        .map_err(|error| format!("[安装本机 CLI] 无法写入 {}：{error}", dest.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(0o755))
+            .map_err(|error| format!("[安装本机 CLI] 无法设置可执行权限：{error}"))?;
+    }
+    let _ = std::fs::remove_dir_all(&work);
+    let version = std::process::Command::new(&dest)
+        .arg("--version")
+        .output()
+        .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_string())
+        .unwrap_or_default();
+    if version.is_empty() {
+        Ok(dest.display().to_string())
+    } else {
+        Ok(format!("{} · {version}", dest.display()))
+    }
+}
+
 fn provision_step(key: &str, label: &str, detail: impl Into<String>) -> KernSightProvisionStep {
     KernSightProvisionStep {
         key: key.into(),
@@ -1039,11 +1115,17 @@ pub async fn provision_latest_kernsight_agent(
         .ok_or_else(|| {
             format!("[选择 GitHub Release] 没有找到包含 {KSIGHT_RELEASE_ASSET} 的可用 Release")
         })?;
+    let cli_asset_name = host_cli_release_asset()?;
     let agent_asset = release
         .assets
         .iter()
         .find(|asset| asset.name == KSIGHT_RELEASE_ASSET)
         .ok_or_else(|| format!("[选择发布包] 缺少 {KSIGHT_RELEASE_ASSET}"))?;
+    let cli_asset = release
+        .assets
+        .iter()
+        .find(|asset| asset.name == cli_asset_name)
+        .ok_or_else(|| format!("[选择发布包] 缺少本机 CLI {cli_asset_name}"))?;
     let checksum_asset = release
         .assets
         .iter()
@@ -1066,6 +1148,34 @@ pub async fn provision_latest_kernsight_agent(
         .map_err(|error| format!("[解析 SHA256SUMS] 不是 UTF-8 文本：{error}"))?;
     let expected_sha256 = checksum_for_asset(checksum_manifest, KSIGHT_RELEASE_ASSET)
         .ok_or_else(|| format!("[解析 SHA256SUMS] 没有 {KSIGHT_RELEASE_ASSET} 的校验值"))?;
+    let expected_cli_sha256_now = checksum_for_asset(checksum_manifest, cli_asset_name);
+    let phone_sha = installed_agent_sha256(&serial).await;
+    if phone_sha.as_deref() == Some(expected_sha256.as_str())
+        && host_cli_installed()
+        && cli_receipt_matches(cli_asset_name, expected_cli_sha256_now.as_deref())
+    {
+        let installed_version = run_device_root_script(&serial, &format!("{KSIGHT_AGENT} --version"))
+            .await
+            .ok()
+            .filter(|output| output.code == Some(0))
+            .map(|output| output.stdout.trim().to_string())
+            .filter(|text| text.starts_with("ksightd "))
+            .unwrap_or_else(|| "ksightd".into());
+        steps.push(provision_step(
+            "current",
+            "已是最新",
+            installed_version.clone(),
+        ));
+        return Ok(KernSightProvisionResult {
+            installed_version,
+            release_tag: release.tag_name,
+            release_url: release.html_url,
+            asset_sha256: expected_sha256,
+            asset_bytes: agent_asset.size,
+            already_current: true,
+            steps,
+        });
+    }
     let agent_bytes = download_release_asset(
         &client,
         &agent_asset.browser_download_url,
@@ -1089,6 +1199,24 @@ pub async fn provision_latest_kernsight_agent(
             ));
         }
     }
+    let expected_cli_sha256 = checksum_for_asset(checksum_manifest, cli_asset_name)
+        .ok_or_else(|| format!("[解析 SHA256SUMS] 没有 {cli_asset_name} 的校验值"))?;
+    let cli_bytes = download_release_asset(
+        &client,
+        &cli_asset.browser_download_url,
+        "下载 KernSight CLI",
+        Some(cli_asset.size),
+    )
+    .await?;
+    let actual_cli_sha256 = format!("{:x}", Sha256::digest(&cli_bytes));
+    if actual_cli_sha256 != expected_cli_sha256 {
+        return Err(format!(
+            "[校验本机 CLI] SHA-256 不一致：expected={expected_cli_sha256} actual={actual_cli_sha256}"
+        ));
+    }
+    let cli_path = install_host_cli(&cli_bytes)?;
+    write_cli_receipt(cli_asset_name, &actual_cli_sha256);
+    steps.push(provision_step("cli", "安装本机 CLI", cli_path));
     steps.push(provision_step(
         "download",
         "下载并校验",
@@ -1177,8 +1305,56 @@ pub async fn provision_latest_kernsight_agent(
         release_url: release.html_url,
         asset_sha256: actual_sha256,
         asset_bytes: agent_bytes.len() as u64,
+        already_current: false,
         steps,
     })
+}
+
+fn cli_receipt_path() -> PathBuf {
+    PathBuf::from(std::env::var("HOME").unwrap_or_default())
+        .join("Library/Application Support/com.swyiic.mobilee/kernsight-cli.json")
+}
+
+fn host_cli_installed() -> bool {
+    std::env::var("HOME")
+        .ok()
+        .map(|home| PathBuf::from(home).join(".local/bin/ksightctl").is_file())
+        .unwrap_or(false)
+}
+
+fn cli_receipt_matches(asset: &str, sha: Option<&str>) -> bool {
+    let Some(sha) = sha else {
+        return false;
+    };
+    let Ok(text) = std::fs::read_to_string(cli_receipt_path()) else {
+        return false;
+    };
+    let Ok(value) = serde_json::from_str::<Value>(&text) else {
+        return false;
+    };
+    value["asset"].as_str() == Some(asset) && value["sha256"].as_str() == Some(sha)
+}
+
+fn write_cli_receipt(asset: &str, sha: &str) {
+    let path = cli_receipt_path();
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let _ = std::fs::write(
+        path,
+        serde_json::json!({ "asset": asset, "sha256": sha }).to_string(),
+    );
+}
+
+async fn installed_agent_sha256(serial: &str) -> Option<String> {
+    let output = run_device_root_script(serial, &format!("sha256sum {KSIGHT_AGENT}"))
+        .await
+        .ok()?;
+    if output.code != Some(0) {
+        return None;
+    }
+    let token = output.stdout.split_whitespace().next()?.to_ascii_lowercase();
+    (token.len() == 64).then_some(token)
 }
 
 struct KernSightConnection {
@@ -5493,7 +5669,24 @@ mod tests {
         );
         assert_eq!(probe.recommended_mode, "development");
         assert_eq!(probe.trust_level, "Dev Root");
+        assert!(probe.summary.contains("Root 授权"));
+        assert!(!probe.summary.contains("需要 Root"));
         assert_eq!(probe.bpf_status, "Ready for Dev Probe");
+    }
+
+    #[test]
+    fn root_without_btf_stays_dev_root() {
+        let probe = build_probe(
+            "pixel".into(),
+            values(
+                "kernel_version=6.1.124\narchitecture=aarch64\nandroid_version=14\nsdk_version=34\nverified_boot_state=orange\nflash_locked=0\nselinux_status=Enforcing\nbtf=missing\nbpffs=missing\nsu_binary=available\nagent=development",
+            ),
+            true,
+        );
+        assert_eq!(probe.recommended_mode, "development");
+        assert_eq!(probe.trust_level, "Dev Root");
+        assert!(probe.summary.contains("已获得 Root"));
+        assert!(!probe.summary.contains("只能使用 Standard"));
     }
 
     #[test]

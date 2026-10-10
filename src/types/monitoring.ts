@@ -85,6 +85,7 @@ export interface KernSightProvisionResult {
   releaseUrl: string
   assetSha256: string
   assetBytes: number
+  alreadyCurrent: boolean
   steps: Array<{
     key: string
     label: string
