@@ -134,7 +134,7 @@ jobs:
         # The checked-in config uses yarn; keep this npm-locked lane on npm.
         # '-' is ad-hoc signing, not an Apple Developer ID identity.
         run: >-
-          npm run tauri -- build --ci --target aarch64-apple-darwin --bundles dmg
+          npm run tauri -- build --ci --target aarch64-apple-darwin --bundles app,dmg
           --config '{"build":{"beforeBuildCommand":"npm run build"},"bundle":{"macOS":{"signingIdentity":"-"}}}'
           -- --locked
       - name: Verify bundle and record provenance
