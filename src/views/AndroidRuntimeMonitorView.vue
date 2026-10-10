@@ -51,7 +51,7 @@
 
     <section v-if="provisionResult && !provisionResult.alreadyCurrent" class="panel ks-provision-result">
       <header><div><div class="eyebrow">KERNSIGHT PROVISIONING</div><h2>{{ provisionResult.releaseTag }} 安装完成</h2><p>{{ provisionResult.installedVersion }} · {{ formatBytes(provisionResult.assetBytes) }} · SHA-256 {{ provisionResult.assetSha256 }}</p></div><a :href="provisionResult.releaseUrl" target="_blank" rel="noreferrer">查看 Release</a></header>
-      <div class="ks-provision-steps"><article v-for="step in provisionResult.steps" :key="step.key"><span class="material-symbols-outlined">check_circle</span><div><strong>{{ step.label }}</strong><small>{{ step.detail }}</small></div></article></div>
+      <div class="ks-provision-steps"><article v-for="step in provisionResult.steps" :key="step.key"><svg class="capability-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false"><path :d="capabilityIconPath('available')" /></svg><div><strong>{{ step.label }}</strong><small>{{ step.detail }}</small></div></article></div>
     </section>
 
     <section v-if="capabilityProbe" class="panel capability-probe-panel">
@@ -61,7 +61,7 @@
       </header>
       <div class="capability-check-grid">
         <article v-for="item in capabilityProbe.checks" :key="item.key" :class="`capability-${item.status}`">
-          <span class="material-symbols-outlined">{{ capabilityIcon(item.status) }}</span>
+          <svg class="capability-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false"><path :d="capabilityIconPath(item.status)" /></svg>
           <p><small>{{ item.label }}</small><strong>{{ item.detail }}</strong></p>
           <b>{{ capabilityStatusLabel(item.status) }}</b>
         </article>
@@ -72,18 +72,18 @@
         <span><small>SELinux</small><strong>{{ capabilityProbe.selinuxStatus }}</strong></span>
         <span><small>eBPF</small><strong>{{ capabilityProbe.bpfStatus }}</strong></span>
       </div>
-      <ul v-if="capabilityProbe.warnings.length" class="probe-warnings"><li v-for="warning in capabilityProbe.warnings" :key="warning"><span class="material-symbols-outlined">warning</span>{{ warning }}</li></ul>
-      <p class="probe-footnote">本次探测不会安装 Agent、加载 BPF 或修改系统。Root 检查可能触发手机上的授权提示。</p>
+      <ul v-if="capabilityProbe.warnings.length" class="probe-warnings"><li v-for="warning in capabilityProbe.warnings" :key="warning"><svg class="capability-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false"><path :d="capabilityIconPath('warning')" /></svg>{{ warning }}</li></ul>
+      <p class="probe-footnote">本次探测不会安装 Agent、加载 BPF 或修改系统。Root 检查可能触发手机上的授权提示。{{ capabilityProbe.probeContext === 'root' ? '读取上下文：已验证 Root。' : capabilityProbe.probeContext === 'shell' ? '读取上下文：ADB shell，受限读取不能证明缺失。' : '读取上下文：未报告。' }}eBPF 实际加载尚未验证。</p>
     </section>
 
     <section v-if="capabilityProbe && !kernSight" class="panel ks-install-gate" :class="{ ready: deploymentReady }">
-      <header><span class="material-symbols-outlined">{{ deploymentReady ? 'deployed_code' : 'warning' }}</span><div><div class="eyebrow">KERNSIGHT INSTALLATION GATE</div><h2>{{ deploymentReady ? '环境满足开发 Agent 的硬性要求' : '当前环境不满足可靠植入条件' }}</h2><p>{{ deploymentGateSummary }}</p></div><b>{{ deploymentReady ? 'READY' : `${failedRequirements.length} BLOCKERS` }}</b></header>
+      <header><svg class="capability-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false"><path :d="capabilityIconPath(deploymentReady ? 'available' : deployment.state === 'blocked' ? 'restricted' : 'unknown')" /></svg><div><div class="eyebrow">KERNSIGHT INSTALLATION GATE</div><h2>{{ deployment.title }}</h2><p>{{ deployment.summary }}</p></div><b>{{ deployment.label }}</b></header>
       <div class="ks-requirement-grid">
-        <article v-for="item in deploymentRequirements" :key="item.key" :class="{ passed: item.passed }"><span class="material-symbols-outlined">{{ item.passed ? 'check_circle' : 'cancel' }}</span><div><strong>{{ item.label }}</strong><small>{{ item.detail }}</small></div></article>
+        <article v-for="item in deploymentRequirements" :key="item.key" :class="[`capability-${item.status}`, { passed: item.status === 'available' }]"><svg class="capability-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false"><path :d="capabilityIconPath(item.status)" /></svg><div><strong>{{ item.label }}</strong><small>{{ item.detail }}</small><b>{{ capabilityStatusLabel(item.status) }}</b></div></article>
       </div>
       <div class="ks-install-guidance">
-        <span class="material-symbols-outlined">info</span>
-        <p><strong>检测不等于植入。</strong>Agent 和 BPF 对象真正部署并完成协议握手后，MobileE 才会显示采集、会话、取证和分析功能。环境不符合时强行部署可能出现 BPF verifier、权限、BTF relocation 或 bpffs 固定失败。</p>
+        <svg class="capability-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false"><path :d="capabilityIconPath('unknown')" /></svg>
+        <p><strong>检测不等于植入。</strong>Agent 和 BPF 对象真正部署并完成协议握手后，MobileE 才会显示采集、会话、取证和分析功能。Root 不代表全部能力可用。BTF 是否必需取决于实际 BPF 对象；bpffs 只反映对象固定路径，未挂载不等于不支持。实际加载仍可能被 verifier、权限或内核策略拒绝。</p>
         <div class="ks-operation-slot"><button class="primary-button" :disabled="provisioning" @click="provisionKernSight">{{ provisioning ? '正在安装本机 CLI 并更新手机…' : deploymentReady ? '安装本机 CLI 并更新手机' : '仍然尝试安装' }}</button><OperationError :message="operationErrors.provision" @dismiss="dismissOperation('provision')" /></div>
         <div class="ks-operation-slot"><button class="ghost-button" :disabled="loadingKernSight" @click="loadKernSight">我已部署，重新握手</button><OperationError :message="operationErrors.refresh" @dismiss="dismissOperation('refresh')" /></div>
       </div>
@@ -548,6 +548,7 @@
 
 <script setup lang="ts">
 import FullValue from '@/components/FullValue.vue'
+import { capabilityStatusLabel, capabilityIconPath, deploymentAssessment } from '@/services/kernsightCapabilityReadiness'
 import { runCaptureGroupPlan, mergeCaptureResults, captureStateLabel, captureGroupStateLabel, captureStageLabel, latestGroupSession, captureSavedOutcome, captureReceiptStateLabel } from '@/services/kernsightCaptureRunner'
 import { mergeCaptureGroups,groupSessionIds,captureGroupEdges,captureGroupCanTrash,captureGroupImportIsTrashed } from '../services/kernsightCaptureGroups'
 import { packageEvidenceReports, importedSessionId, bundleForSession, linkedEvidenceMatches, createLatestRequest, createKeyedRequests, evidenceCountLabel, executionStatusLabel } from '../services/kernsightWorkspaceState'
@@ -617,6 +618,8 @@ const importedCaptureGroups=computed(()=>localEvidenceBundles.value.flatMap(bund
 const visibleImportedCaptureGroups = computed(() => importedCaptureGroups.value.filter(item => !captureGroupImportIsTrashed(item.group, item.bundle.root, captureGroupTrash.value)))
 const visibleCaptureGroups=computed(()=>mergeCaptureGroups(captureGroups.value.filter(group => !trashedCaptureGroups.value.some(entry => entry.managed && entry.group.id === group.id)),visibleImportedCaptureGroups.value.map(i=>i.group)))
 const capabilityProbe = ref<AndroidMonitorCapabilityProbe | null>(null)
+const probeRequests = createLatestRequest()
+const provisionRequests = createLatestRequest()
 const probing = ref(false)
 const provisioning = ref(false)
 const deviceDrawer = ref(false)
@@ -1444,52 +1447,51 @@ const recommendedModeLabel = computed(() => {
   if (capabilityProbe.value?.recommendedMode === 'development') return 'Dev Root'
   return 'Standard'
 })
-const deploymentRequirements = computed(() => {
-  const checks = new Map((capabilityProbe.value?.checks || []).map(item => [item.key, item]))
-  const architecture = capabilityProbe.value?.architecture || 'Unknown'
-  return [
-    { key: 'architecture', label: 'ARM64 架构', passed: /aarch64|arm64/i.test(architecture), detail: architecture },
-    { key: 'root', label: 'Root 授权', passed: checks.get('root')?.status === 'available', detail: checks.get('root')?.detail || 'Unknown' },
-    { key: 'btf', label: '内核 BTF', passed: checks.get('btf')?.status === 'available', detail: checks.get('btf')?.detail || 'Unknown' },
-    { key: 'bpffs', label: 'bpffs 已挂载', passed: checks.get('bpffs')?.status === 'available', detail: checks.get('bpffs')?.detail || 'Unknown' },
-  ]
-})
-const failedRequirements = computed(() => deploymentRequirements.value.filter(item => !item.passed))
-const deploymentReady = computed(() => failedRequirements.value.length === 0)
-const deploymentGateSummary = computed(() => deploymentReady.value
-  ? '可以进入开发 Agent 部署阶段；成功启动和握手后才能确认实际可用。'
-  : `缺少：${failedRequirements.value.map(item => item.label).join('、')}。这不是普通警告，而是当前开发部署路径的运行前提。`)
+const deployment = computed(() => deploymentAssessment(capabilityProbe.value))
+const deploymentRequirements = computed(() => deployment.value.requirements)
+const deploymentReady = computed(() => deployment.value.state === 'candidate')
 
 async function runCapabilityProbe() {
-  if (!androidReady.value || !props.device) return
+  if (!androidReady.value || !props.device || probing.value) return
+  const serial = props.device.serial
+  const request = probeRequests.begin()
+  const isCurrent = () => probeRequests.isCurrent(request) && props.device?.serial === serial
   const key = 'probe'; const ticket = beginOperation(key)
   probing.value = true
   probeError.value = ''
   try {
-    capabilityProbe.value = await monitoringBackend.probeCapabilities(props.device.serial)
-    if (capabilityProbe.value.agentStatus !== 'Not Installed') await loadKernSight()
+    const result = await monitoringBackend.probeCapabilities(serial)
+    if (!isCurrent() || result.serial !== serial) return
+    capabilityProbe.value = result
+    if (result.agentStatus !== 'Not Installed') await loadKernSight()
   } catch (error) {
-    failOperation(key, ticket, error)
+    if (isCurrent()) failOperation(key, ticket, error)
   } finally {
-    probing.value = false
+    if (isCurrent()) probing.value = false
   }
 }
 
 async function provisionKernSight() {
-  if (!androidReady.value || !props.device) return
+  if (!androidReady.value || !props.device || provisioning.value) return
+  const serial = props.device.serial
+  const request = provisionRequests.begin()
+  const isCurrent = () => provisionRequests.isCurrent(request) && props.device?.serial === serial
   const key = 'provision'; const ticket = beginOperation(key)
   provisioning.value = true
   provisionResult.value = null
   probeError.value = ''
   try {
-    provisionResult.value = await monitoringBackend.provisionLatestAgent(props.device.serial)
-    agentBadge.value = { fresh: true, version: provisionResult.value.installedVersion || '' }
-    if (!provisionResult.value.alreadyCurrent) capabilityProbe.value = await monitoringBackend.probeCapabilities(props.device.serial)
+    const result = await monitoringBackend.provisionLatestAgent(serial)
+    if (!isCurrent()) return
+    provisionResult.value = result
+    agentBadge.value = { fresh: true, version: result.installedVersion || '' }
+    if (!result.alreadyCurrent) await runCapabilityProbe()
+    if (!isCurrent()) return
     await loadKernSight()
   } catch (error) {
-    failOperation(key, ticket, error)
+    if (isCurrent()) failOperation(key, ticket, error)
   } finally {
-    provisioning.value = false
+    if (isCurrent()) provisioning.value = false
   }
 }
 
@@ -2573,22 +2575,6 @@ const landedKeyFiles = computed(() => {
   return files
 })
 
-function capabilityIcon(status: string) {
-  if (status === 'available') return 'check_circle'
-  if (status === 'restricted') return 'lock'
-  if (status === 'warning') return 'warning'
-  if (status === 'missing') return 'cancel'
-  return 'help'
-}
-
-function capabilityStatusLabel(status: string) {
-  if (status === 'available') return 'READY'
-  if (status === 'restricted') return 'RESTRICTED'
-  if (status === 'warning') return 'CHECK'
-  if (status === 'missing') return 'MISSING'
-  return 'UNKNOWN'
-}
-
 watch(() => [selectedPackage.value, selectedEvidenceSource.value, selectedLocalBundle.value?.root], () => {
   if (!linkedPackageDump.value) sessionPackageLinked.value = false
   selectedArtifact.value = null
@@ -2601,6 +2587,14 @@ watch(() => [selectedPackage.value, selectedEvidenceSource.value, selectedLocalB
 })
 
 watch(() => props.device?.serial, () => {
+  probeRequests.invalidate()
+  provisionRequests.invalidate()
+  probing.value = false
+  provisioning.value = false
+  agentBadge.value = { fresh: false, version: '' }
+  provisionResult.value = null
+  operationErrors.probe = ''
+  operationErrors.provision = ''
   overviewRequests.invalidate()
   loadingKernSight.value = false
   pendingTrashGroup.value = ''
@@ -2614,7 +2608,7 @@ watch(() => props.device?.serial, () => {
   captureResult.value = null
   closeEvidencePreview()
   probeError.value = ''
-})
+}, { flush: 'sync' })
 
 onErrorCaptured((error) => {
   probeError.value = `会话页渲染失败：${error instanceof Error ? error.message : String(error)}`
@@ -2630,6 +2624,8 @@ watch(requestedPackage, packageName => {
 }, { immediate: true })
 
 onBeforeUnmount(() => {
+  probeRequests.invalidate()
+  provisionRequests.invalidate()
   purgeRequests.invalidate()
   purgeTarget.value = null
   sessionRequests.invalidate()
@@ -2739,26 +2735,26 @@ async function copyEvidencePath(value: string) {
 .probe-mode span { margin-top: 4px; color: #6f7f96; font-size: 7px; }
 .capability-check-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 8px; margin-top: 14px; }
 .capability-check-grid article { display: grid; grid-template-columns: 25px minmax(0, 1fr); gap: 8px; min-width: 0; padding: 10px; border: 1px solid var(--line); border-radius: 10px; background: rgba(4, 8, 13, .28); }
-.capability-check-grid article > .material-symbols-outlined { display: grid; width: 25px; height: 25px; place-items: center; border-radius: 8px; color: #6c7b91; background: rgba(255, 255, 255, .04); font-size: 15px; }
+.capability-check-grid article > .capability-icon { display: grid; width: 25px; height: 25px; place-items: center; border-radius: 8px; color: #6c7b91; background: rgba(255, 255, 255, .04); font-size: 15px; }
 .capability-check-grid p, .capability-check-grid small, .capability-check-grid strong { display: block; min-width: 0; margin: 0; }
 .capability-check-grid small { color: #657388; font-size: 7px; }
-.capability-check-grid strong { overflow: hidden; margin-top: 4px; font-size: 8px; text-overflow: ellipsis; white-space: nowrap; }
+.capability-check-grid strong { margin-top: 4px; font-size: 8px; white-space: normal; overflow-wrap: anywhere; }
 .capability-check-grid b { grid-column: 2; color: #617188; font-size: 6px; }
 .capability-check-grid .capability-available { border-color: rgba(52, 211, 153, .18); }
-.capability-check-grid .capability-available > .material-symbols-outlined, .capability-check-grid .capability-available b { color: #65d7aa; }
-.capability-check-grid .capability-warning > .material-symbols-outlined, .capability-check-grid .capability-warning b { color: #f2be58; }
-.capability-check-grid .capability-restricted > .material-symbols-outlined, .capability-check-grid .capability-restricted b { color: #d5a35a; }
-.capability-check-grid .capability-missing > .material-symbols-outlined, .capability-check-grid .capability-missing b { color: #ec7f8d; }
+.capability-check-grid .capability-available > .capability-icon, .capability-check-grid .capability-available b { color: #65d7aa; }
+.capability-check-grid .capability-warning > .capability-icon, .capability-check-grid .capability-warning b { color: #f2be58; }
+.capability-check-grid .capability-restricted > .capability-icon, .capability-check-grid .capability-restricted b { color: #d5a35a; }
+.capability-check-grid .capability-missing > .capability-icon, .capability-check-grid .capability-missing b { color: #ec7f8d; }
 .probe-facts { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 1px; margin-top: 12px; overflow: hidden; border: 1px solid var(--line); border-radius: 10px; background: var(--line); }
 .probe-facts > span { min-width: 0; padding: 9px 10px; background: #0d1118; }
 .probe-facts small, .probe-facts strong { display: block; }
 .probe-facts small { color: #617087; font-size: 7px; }
-.probe-facts strong { overflow: hidden; margin-top: 4px; font-size: 8px; text-overflow: ellipsis; white-space: nowrap; }
+.probe-facts strong { margin-top: 4px; font-size: 8px; white-space: normal; overflow-wrap: anywhere; }
 .probe-warnings { display: grid; gap: 5px; margin: 12px 0 0; padding: 0; list-style: none; }
 .probe-warnings li { display: flex; align-items: flex-start; gap: 7px; color: #caa85f; font-size: 8px; line-height: 1.5; }
-.probe-warnings .material-symbols-outlined { margin-top: 1px; font-size: 13px; }
+.probe-warnings .capability-icon { margin-top: 1px; font-size: 13px; }
 .probe-footnote { margin: 12px 0 0; padding-top: 10px; border-top: 1px solid var(--line); color: #637188; font-size: 8px; }
-.ks-install-gate{padding:18px;border-color:rgba(245,158,11,.24)}.ks-install-gate.ready{border-color:rgba(52,211,153,.24)}.ks-install-gate>header{display:grid;grid-template-columns:38px minmax(0,1fr) auto;gap:11px;align-items:center}.ks-install-gate>header>.material-symbols-outlined{display:grid;width:38px;height:38px;place-items:center;color:#e2ac50;border-radius:11px;background:rgba(245,158,11,.09)}.ks-install-gate.ready>header>.material-symbols-outlined{color:#62d2a5;background:rgba(52,211,153,.09)}.ks-install-gate h2{margin:4px 0 0;font-size:13px}.ks-install-gate header p{margin:5px 0 0;color:var(--muted);font-size:8px;line-height:1.5}.ks-install-gate header>b{color:#d9aa58;font-size:7px}.ks-install-gate.ready header>b{color:#62cea3}.ks-requirement-grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:7px;margin-top:13px}.ks-requirement-grid article{display:flex;align-items:center;gap:8px;padding:9px;border:1px solid rgba(245,158,11,.16);border-radius:9px;background:rgba(245,158,11,.035)}.ks-requirement-grid article.passed{border-color:rgba(52,211,153,.16);background:rgba(52,211,153,.025)}.ks-requirement-grid .material-symbols-outlined{color:#db9260;font-size:15px}.ks-requirement-grid article.passed .material-symbols-outlined{color:#5ecb9f}.ks-requirement-grid strong,.ks-requirement-grid small{display:block}.ks-requirement-grid strong{font-size:8px}.ks-requirement-grid small{margin-top:3px;color:var(--muted);font-size:7px}.ks-install-guidance{display:grid;grid-template-columns:20px minmax(0,1fr) auto auto;gap:9px;align-items:center;margin-top:11px;padding:10px;border:1px solid var(--line);border-radius:9px;background:rgba(255,255,255,.018)}.ks-install-guidance>.material-symbols-outlined{color:#77a4e8;font-size:16px}.ks-install-guidance p{margin:0;color:var(--muted);font-size:8px;line-height:1.55}.ks-install-guidance p strong{color:var(--text)}
+.ks-install-gate{padding:18px;border-color:rgba(245,158,11,.24)}.ks-install-gate.ready{border-color:rgba(52,211,153,.24)}.ks-install-gate>header{display:grid;grid-template-columns:38px minmax(0,1fr) auto;gap:11px;align-items:center}.ks-install-gate>header>.capability-icon{display:grid;width:38px;height:38px;place-items:center;color:#e2ac50;border-radius:11px;background:rgba(245,158,11,.09)}.ks-install-gate.ready>header>.capability-icon{color:#62d2a5;background:rgba(52,211,153,.09)}.ks-install-gate h2{margin:4px 0 0;font-size:13px}.ks-install-gate header p{margin:5px 0 0;color:var(--muted);font-size:8px;line-height:1.5}.ks-install-gate header>b{color:#d9aa58;font-size:7px}.ks-install-gate.ready header>b{color:#62cea3}.ks-requirement-grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:7px;margin-top:13px}.ks-requirement-grid article{display:flex;align-items:center;gap:8px;padding:9px;border:1px solid rgba(245,158,11,.16);border-radius:9px;background:rgba(245,158,11,.035)}.ks-requirement-grid article.passed{border-color:rgba(52,211,153,.16);background:rgba(52,211,153,.025)}.ks-requirement-grid .capability-icon{color:#db9260;font-size:15px}.ks-requirement-grid article.passed .capability-icon{color:#5ecb9f}.ks-requirement-grid strong,.ks-requirement-grid small{display:block}.ks-requirement-grid strong{font-size:8px}.ks-requirement-grid small{margin-top:3px;color:var(--muted);font-size:7px}.ks-install-guidance{display:grid;grid-template-columns:20px minmax(0,1fr) auto auto;gap:9px;align-items:center;margin-top:11px;padding:10px;border:1px solid var(--line);border-radius:9px;background:rgba(255,255,255,.018)}.ks-install-guidance>.capability-icon{color:#77a4e8;font-size:16px}.ks-install-guidance p{margin:0;color:var(--muted);font-size:8px;line-height:1.55}.ks-install-guidance p strong{color:var(--text)}
 .ks-provision-result{padding:15px;border-color:rgba(52,211,153,.25)}.ks-provision-result>header{display:flex;align-items:flex-start;justify-content:space-between;gap:12px}.ks-provision-result h2{margin:4px 0 0;font-size:13px}.ks-provision-result header p{margin:5px 0 0;color:var(--muted);font-size:7px;word-break:break-all}.ks-provision-result header>a{color:var(--primary);font-size:8px}.ks-provision-steps{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:7px;margin-top:12px}.ks-provision-steps article{display:grid;grid-template-columns:22px minmax(0,1fr);gap:7px;align-items:start;padding:9px;border:1px solid rgba(52,211,153,.17);border-radius:8px;background:rgba(52,211,153,.035)}.ks-provision-steps .material-symbols-outlined{color:#62d3a7;font-size:16px}.ks-provision-steps strong,.ks-provision-steps small{display:block}.ks-provision-steps strong{font-size:8px}.ks-provision-steps small{overflow:hidden;margin-top:3px;color:var(--muted);font-size:6px;text-overflow:ellipsis;white-space:nowrap}
 .ks-session-panel, .ks-package-panel, .ks-package-evidence-panel { padding: 16px; }
 .runtime-monitor-layout .section-title { flex-wrap: wrap; align-items: flex-start; gap: 10px; }
@@ -3149,8 +3145,17 @@ details.ks-session-row pre { max-height: 360px; overflow: auto; white-space: pre
 </style>
 
 <style scoped>
+.capability-icon { flex: 0 0 auto; width: 20px; height: 20px; }
+.ks-device-drawer .capability-icon { overflow: visible; }
+.ks-requirement-grid article { min-width: 0; }
+.ks-requirement-grid article > div { min-width: 0; overflow-wrap: anywhere; }
+.ks-requirement-grid b { display: block; margin-top: 4px; font-size: 9px; color: var(--muted); }
+.ks-requirement-grid .capability-unknown .capability-icon { color: var(--muted); }
+.ks-device-drawer .capability-check-grid article, .ks-device-drawer .probe-facts > span { background: var(--surface); }
+.ks-device-drawer .capability-check-grid small, .ks-device-drawer .probe-facts small, .ks-device-drawer .probe-footnote { color: var(--muted); }
 .agent-build-details { margin-top:8px; min-width:0; }
 .agent-build-details summary { cursor:pointer; font-size:10px; color:var(--primary); overflow-wrap:anywhere; }
 .agent-build-details p { color:var(--muted); font-size:10px; line-height:1.6; overflow-wrap:anywhere; }
 .runtime-device-strip > div > strong, .runtime-device-strip > div > small { overflow:visible; white-space:normal; overflow-wrap:anywhere; }
 </style>
+

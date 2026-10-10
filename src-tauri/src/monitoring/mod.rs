@@ -352,19 +352,37 @@ where
     });
 }
 
+// This probe is read-only and runs as one script in the selected shell context.
+// A successful directory listing is required before reporting a path absent.
 const PROBE_SCRIPT: &str = r#"
-printf 'kernel_version='; uname -r 2>/dev/null
-printf 'architecture='; uname -m 2>/dev/null
+printf 'probe_uid='; id -u 2>/dev/null || echo unknown
+printf 'kernel_version='; uname -r 2>/dev/null || echo unknown
+printf 'architecture='; uname -m 2>/dev/null || echo unknown
 printf 'android_version='; getprop ro.build.version.release
 printf 'sdk_version='; getprop ro.build.version.sdk
 printf 'verified_boot_state='; getprop ro.boot.verifiedbootstate
 printf 'flash_locked='; getprop ro.boot.flash.locked
-printf 'selinux_status='; getenforce 2>/dev/null
-if [ -r /sys/kernel/btf/vmlinux ]; then echo 'btf=available'; else echo 'btf=missing'; fi
-if grep -q ' /sys/fs/bpf ' /proc/mounts 2>/dev/null; then echo 'bpffs=mounted'; elif [ -d /sys/fs/bpf ]; then echo 'bpffs=directory-only'; else echo 'bpffs=missing'; fi
+printf 'selinux_status='; getenforce 2>/dev/null || echo unknown
+if [ -e /sys/kernel/btf/vmlinux ] || [ -L /sys/kernel/btf/vmlinux ]; then
+  if ! command -v head >/dev/null 2>&1; then echo 'btf=unknown'
+  elif head -c 1 /sys/kernel/btf/vmlinux >/dev/null 2>&1; then echo 'btf=available'
+  else echo 'btf=unreadable'; fi
+elif entries=$(ls -1 /sys/kernel/btf 2>/dev/null); then
+  if printf '%s\n' "$entries" | grep -qx vmlinux; then echo 'btf=unknown'; else echo 'btf=missing'; fi
+elif entries=$(ls -1 /sys/kernel 2>/dev/null); then
+  if printf '%s\n' "$entries" | grep -qx btf; then echo 'btf=unknown'; else echo 'btf=missing'; fi
+else echo 'btf=unknown'; fi
+if mounts=$(cat /proc/mounts 2>/dev/null); then
+  if printf '%s\n' "$mounts" | grep -q ' /sys/fs/bpf bpf '; then echo 'bpffs=mounted'
+  elif [ -d /sys/fs/bpf ]; then echo 'bpffs=directory-only'
+  else echo 'bpffs=missing'; fi
+else echo 'bpffs=unknown'; fi
 if command -v su >/dev/null 2>&1; then echo 'su_binary=available'; else echo 'su_binary=missing'; fi
 if [ -x /system/bin/ksightd ]; then echo 'agent=system'; elif [ -x /data/local/tmp/ksight/ksightd ]; then echo 'agent=development'; else echo 'agent=missing'; fi
-printf 'unprivileged_bpf_disabled='; cat /proc/sys/kernel/unprivileged_bpf_disabled 2>/dev/null || echo unknown
+if bpf_policy=$(cat /proc/sys/kernel/unprivileged_bpf_disabled 2>/dev/null); then
+  case "$bpf_policy" in 0|1|2) echo "unprivileged_bpf_disabled=$bpf_policy" ;; *) echo 'unprivileged_bpf_disabled=unknown' ;; esac
+else echo 'unprivileged_bpf_disabled=unknown'; fi
+echo 'probe_complete=1'
 "#;
 
 #[derive(Debug, Clone, Serialize)]
@@ -392,6 +410,9 @@ pub struct AndroidMonitorCapabilityProbe {
     btf_status: String,
     bpffs_status: String,
     bpf_status: String,
+    probe_context: String,
+    bpf_load_status: String,
+    unprivileged_bpf_disabled: String,
     agent_status: String,
     recommended_mode: String,
     trust_level: String,
@@ -671,8 +692,9 @@ fn build_probe(
     let verified_boot_state = value(&values, "verified_boot_state", "unknown");
     let flash_locked = value(&values, "flash_locked", "unknown");
     let selinux_status = value(&values, "selinux_status", "Unknown");
-    let btf_available = values.get("btf").is_some_and(|value| value == "available");
-    let bpffs_value = value(&values, "bpffs", "missing");
+    let btf_value = value(&values, "btf", "unknown");
+    let btf_available = btf_value == "available";
+    let bpffs_value = value(&values, "bpffs", "unknown");
     let bpffs_mounted = bpffs_value == "mounted";
     let su_available = values
         .get("su_binary")
@@ -688,16 +710,18 @@ fn build_probe(
         "Unavailable"
     }
     .to_string();
-    let btf_status = if btf_available {
-        "Available"
-    } else {
-        "Missing"
+    let btf_status = match btf_value.as_str() {
+        "available" => "Available",
+        "missing" => "Missing",
+        "unreadable" => "Unreadable",
+        _ => "Unknown",
     }
     .to_string();
     let bpffs_status = match bpffs_value.as_str() {
         "mounted" => "Mounted",
         "directory-only" => "Directory Only",
-        _ => "Missing",
+        "missing" => "Missing",
+        _ => "Unknown",
     }
     .to_string();
     let agent_status = match agent_value.as_str() {
@@ -707,7 +731,7 @@ fn build_probe(
     }
     .to_string();
 
-    let recommended_mode = if agent_value == "system" && bpffs_mounted {
+    let recommended_mode = if root_granted && agent_value == "system" && bpffs_mounted {
         "system"
     } else if root_granted {
         "development"
@@ -726,26 +750,38 @@ fn build_probe(
         "Integrity Unknown"
     }
     .to_string();
-    let bpf_status = if btf_available && bpffs_mounted && root_granted {
-        "Ready for Dev Probe"
-    } else if btf_available && bpffs_mounted {
-        "Kernel Ready / Privilege Required"
+    // Metadata cannot establish BPF verifier, load, attach, or feature support.
+    // BTF is feature/backend-specific, not a universal root-development gate.
+    let bpf_status = if root_granted {
+        "Preflight Only / Load Unverified"
     } else {
-        "Prerequisites Missing"
+        "Privilege Required / Load Unverified"
     }
     .to_string();
 
     let bootloader = bootloader_status(&verified_boot_state, &flash_locked);
     let mut warnings = Vec::new();
-    if !root_granted && agent_value != "system" {
-        warnings.push("当前没有 Root 授权或 KernSight 系统 Agent，不能加载全设备采集程序。".into());
+    if !root_granted {
+        warnings.push(
+            "当前未确认 Root 授权；系统 Agent 路径不等于服务可用，保持 Standard 模式。".into(),
+        );
     }
     if !btf_available {
-        warnings
-            .push("未发现可读的 /sys/kernel/btf/vmlinux，CO-RE 采集需要设备专用兼容方案。".into());
+        warnings.push(match btf_value.as_str() {
+            "missing" => "已确认当前上下文中没有内核 BTF；需要目标 BTF 的 CO-RE/类型相关功能受限，兼容后端是否存在尚未验证。",
+            "unreadable" => "内核 BTF 路径存在但读取失败；不能判定为内核不支持 BTF，兼容后端是否存在尚未验证。",
+            _ => "内核 BTF 状态未知；未能确认存在、缺失或可读性，不能宣称相关功能就绪。",
+        }.into());
     }
     if !bpffs_mounted {
-        warnings.push("bpffs 尚未挂载，BPF program/map 无法按规划固定和共享。".into());
+        warnings.push(
+            if bpffs_value == "unknown" {
+                "无法读取挂载信息，bpffs 状态未知；本次未挂载或更改设备配置。"
+            } else {
+                "未确认 bpffs 挂载；固定/共享 program 或 map 的功能需要额外条件，本次未挂载。"
+            }
+            .into(),
+        );
     }
     if bootloader.contains("Unlocked") {
         warnings.push("Bootloader 处于 Unlocked；该设备适合研发，但不能标记为系统可信。".into());
@@ -753,6 +789,11 @@ fn build_probe(
     if agent_value == "system" {
         warnings.push("检测到系统 Agent 路径；仍需后续握手校验版本、签名和 BPF links。".into());
     }
+
+    warnings.push(
+        "这里只完成只读预检，未实际加载或附加 BPF 程序；具体功能以 Agent 后端和运行结果为准。"
+            .into(),
+    );
 
     let checks = vec![
         check(
@@ -770,36 +811,29 @@ fn build_probe(
         check(
             "btf",
             "Kernel BTF",
-            if btf_available {
-                "available"
-            } else {
-                "missing"
+            match btf_value.as_str() {
+                "available" => "available",
+                "missing" => "missing",
+                "unreadable" => "restricted",
+                _ => "unknown",
             },
-            &btf_status,
+            format!("{btf_status} · 仅影响需要目标 BTF 的功能；兼容后端未验证"),
         ),
         check(
             "bpffs",
             "BPF filesystem",
-            if bpffs_mounted {
-                "available"
-            } else {
-                "missing"
+            match bpffs_value.as_str() {
+                "mounted" => "available",
+                "directory-only" | "missing" => "warning",
+                _ => "unknown",
             },
             &bpffs_status,
         ),
         check(
             "bpf",
-            "eBPF readiness",
-            if btf_available && bpffs_mounted {
-                if root_granted {
-                    "available"
-                } else {
-                    "restricted"
-                }
-            } else {
-                "missing"
-            },
-            format!("{bpf_status} · unprivileged_bpf_disabled={unprivileged_bpf}"),
+            "eBPF preflight",
+            if root_granted { "warning" } else { "restricted" },
+            format!("{bpf_status} · unprivileged_bpf_disabled={unprivileged_bpf}（仅描述非特权 BPF 策略，不代表 Root BPF 加载结果）"),
         ),
         check(
             "selinux",
@@ -837,8 +871,8 @@ fn build_probe(
 
     let summary = match (recommended_mode.as_str(), btf_available) {
         ("system", _) => "检测到系统 Agent 候选，可以进入系统握手与完整性校验阶段。",
-        ("development", false) => "已获得 Root 授权。这台内核没有可读 BTF，采集使用设备上的兼容程序。",
-        ("development", true) => "已获得 Root 授权，可以部署开发 Agent。",
+        ("development", false) => "已获得 Root 授权，可进入开发模式；BTF 未确认可读，相关功能及兼容后端待验证，尚未验证 BPF 加载。",
+        ("development", true) => "已获得 Root 授权，可进入开发模式；只读预检不代表 BPF 加载或具体功能已通过验证。",
         _ => "当前只能使用 Standard 模式；完整监控需要 Root 授权或预装系统 Agent。",
     }
     .to_string();
@@ -857,6 +891,9 @@ fn build_probe(
         btf_status,
         bpffs_status,
         bpf_status,
+        probe_context: if root_granted { "root" } else { "shell" }.into(),
+        bpf_load_status: "unverified".into(),
+        unprivileged_bpf_disabled: unprivileged_bpf,
         agent_status,
         recommended_mode,
         trust_level,
@@ -864,6 +901,12 @@ fn build_probe(
         checks,
         warnings,
     }
+}
+
+fn root_probe_confirmed(code: Option<i32>, values: &HashMap<String, String>) -> bool {
+    code == Some(0)
+        && values.get("probe_uid").is_some_and(|v| v == "0")
+        && values.get("probe_complete").is_some_and(|v| v == "1")
 }
 
 #[tauri::command]
@@ -874,25 +917,33 @@ pub async fn probe_android_monitor_capabilities(
         return Err("请先选择 Android 设备".into());
     }
 
-    let (probe, root) = tokio::join!(
-        run_device_adb(&serial, &["shell", PROBE_SCRIPT]),
-        run_device_root_script(&serial, "id")
-    );
-    let probe = probe?;
-    if probe.code != Some(0) && probe.stdout.trim().is_empty() {
+    // All sensitive observations and the UID marker come from the same su
+    // invocation. Never combine an ordinary-shell BTF result with a root `id`.
+    let root = run_device_root_script(&serial, PROBE_SCRIPT).await;
+    if let Ok(output) = root {
+        let values = parse_probe_output(&output.stdout);
+        if root_probe_confirmed(output.code, &values) {
+            return Ok(build_probe(serial, values, true));
+        }
+    }
+    // Denied/failed/incomplete root probes fall back to explicitly shell-scoped
+    // observations. A shell path cannot establish a privileged agent service.
+    let probe = run_device_adb(&serial, &["shell", PROBE_SCRIPT]).await?;
+    if probe.code != Some(0)
+        || !parse_probe_output(&probe.stdout)
+            .get("probe_complete")
+            .is_some_and(|v| v == "1")
+    {
         return Err(if probe.stderr.trim().is_empty() {
-            "设备能力探测没有返回结果".into()
+            "设备能力探测未完整返回结果".into()
         } else {
             probe.stderr
         });
     }
-    let root_granted = root
-        .ok()
-        .is_some_and(|output| output.code == Some(0) && output.stdout.contains("uid=0"));
     Ok(build_probe(
         serial,
         parse_probe_output(&probe.stdout),
-        root_granted,
+        false,
     ))
 }
 
@@ -979,18 +1030,20 @@ fn install_host_cli(archive: &[u8]) -> Result<String, String> {
     std::fs::create_dir_all(&bin_dir)
         .map_err(|error| format!("[安装本机 CLI] 无法创建 {}：{error}", bin_dir.display()))?;
     let work = std::env::temp_dir().join(format!("mobilee-cli-{}", Uuid::new_v4()));
-    std::fs::create_dir_all(work.join("out"))
-        .map_err(|error| format!("[安装本机 CLI] {error}"))?;
+    std::fs::create_dir_all(work.join("out")).map_err(|error| format!("[安装本机 CLI] {error}"))?;
     let archive_path = work.join("cli.tar.gz");
-    std::fs::write(&archive_path, archive)
-        .map_err(|error| format!("[安装本机 CLI] {error}"))?;
+    std::fs::write(&archive_path, archive).map_err(|error| format!("[安装本机 CLI] {error}"))?;
     let extracted = work.join("out");
     let status = std::process::Command::new("tar")
         .args([
             "-xzf",
-            archive_path.to_str().ok_or("[安装本机 CLI] 临时路径不是 UTF-8")?,
+            archive_path
+                .to_str()
+                .ok_or("[安装本机 CLI] 临时路径不是 UTF-8")?,
             "-C",
-            extracted.to_str().ok_or("[安装本机 CLI] 临时路径不是 UTF-8")?,
+            extracted
+                .to_str()
+                .ok_or("[安装本机 CLI] 临时路径不是 UTF-8")?,
         ])
         .status()
         .map_err(|error| format!("[安装本机 CLI] 无法解压：{error}"))?;
@@ -998,8 +1051,8 @@ fn install_host_cli(archive: &[u8]) -> Result<String, String> {
         let _ = std::fs::remove_dir_all(&work);
         return Err("[安装本机 CLI] tar 解压失败".into());
     }
-    let found = find_named_file(&extracted, "ksightctl")
-        .ok_or("[安装本机 CLI] 压缩包里没有 ksightctl")?;
+    let found =
+        find_named_file(&extracted, "ksightctl").ok_or("[安装本机 CLI] 压缩包里没有 ksightctl")?;
     let dest = bin_dir.join("ksightctl");
     std::fs::copy(&found, &dest)
         .map_err(|error| format!("[安装本机 CLI] 无法写入 {}：{error}", dest.display()))?;
@@ -1154,13 +1207,14 @@ pub async fn provision_latest_kernsight_agent(
         && host_cli_installed()
         && cli_receipt_matches(cli_asset_name, expected_cli_sha256_now.as_deref())
     {
-        let installed_version = run_device_root_script(&serial, &format!("{KSIGHT_AGENT} --version"))
-            .await
-            .ok()
-            .filter(|output| output.code == Some(0))
-            .map(|output| output.stdout.trim().to_string())
-            .filter(|text| text.starts_with("ksightd "))
-            .unwrap_or_else(|| "ksightd".into());
+        let installed_version =
+            run_device_root_script(&serial, &format!("{KSIGHT_AGENT} --version"))
+                .await
+                .ok()
+                .filter(|output| output.code == Some(0))
+                .map(|output| output.stdout.trim().to_string())
+                .filter(|text| text.starts_with("ksightd "))
+                .unwrap_or_else(|| "ksightd".into());
         steps.push(provision_step(
             "current",
             "已是最新",
@@ -1353,7 +1407,11 @@ async fn installed_agent_sha256(serial: &str) -> Option<String> {
     if output.code != Some(0) {
         return None;
     }
-    let token = output.stdout.split_whitespace().next()?.to_ascii_lowercase();
+    let token = output
+        .stdout
+        .split_whitespace()
+        .next()?
+        .to_ascii_lowercase();
     (token.len() == 64).then_some(token)
 }
 
@@ -5671,7 +5729,7 @@ mod tests {
         assert_eq!(probe.trust_level, "Dev Root");
         assert!(probe.summary.contains("Root 授权"));
         assert!(!probe.summary.contains("需要 Root"));
-        assert_eq!(probe.bpf_status, "Ready for Dev Probe");
+        assert_eq!(probe.bpf_status, "Preflight Only / Load Unverified");
     }
 
     #[test]
@@ -5712,7 +5770,7 @@ mod tests {
             ),
             false,
         );
-        assert_eq!(probe.recommended_mode, "system");
+        assert_eq!(probe.recommended_mode, "standard");
         assert_eq!(probe.trust_level, "System Candidate");
         assert!(probe
             .warnings
@@ -6649,5 +6707,174 @@ mod cooperative_import_deadline_tests {
         assert_eq!(std::fs::read(path).unwrap(), original);
         assert_eq!(guard.receipt().admitted_write_bytes, 0);
         std::fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod capability_preflight_regression_tests {
+    use super::*;
+
+    fn probe(btf: &str, root: bool) -> AndroidMonitorCapabilityProbe {
+        build_probe(
+            "fixture".into(),
+            parse_probe_output(&format!(
+                "architecture=aarch64\nbtf={btf}\nbpffs=mounted\nsu_binary=available\nagent=development\nunprivileged_bpf_disabled=2"
+            )),
+            root,
+        )
+    }
+
+    #[test]
+    fn btf_absent_unreadable_and_unknown_remain_distinct_without_gating_development() {
+        for (raw, label, status) in [
+            ("available", "Available", "available"),
+            ("missing", "Missing", "missing"),
+            ("unreadable", "Unreadable", "restricted"),
+            ("unknown", "Unknown", "unknown"),
+            ("", "Unknown", "unknown"),
+        ] {
+            let probe = probe(raw, true);
+            assert_eq!(probe.btf_status, label);
+            assert_eq!(
+                probe.checks.iter().find(|c| c.key == "btf").unwrap().status,
+                status
+            );
+            assert_eq!(probe.recommended_mode, "development");
+            assert_eq!(probe.bpf_load_status, "unverified");
+            assert_eq!(probe.probe_context, "root");
+            assert_ne!(
+                probe.checks.iter().find(|c| c.key == "bpf").unwrap().status,
+                "available"
+            );
+            assert!(!probe.summary.contains("采集使用设备上的兼容程序"));
+            assert_eq!(probe.unprivileged_bpf_disabled, "2");
+        }
+    }
+
+    #[test]
+    fn root_denial_keeps_standard_even_with_system_agent_path() {
+        let probe = build_probe(
+            "fixture".into(),
+            parse_probe_output("btf=available\nbpffs=mounted\nsu_binary=available\nagent=system"),
+            false,
+        );
+        assert_eq!(probe.recommended_mode, "standard");
+        assert_eq!(probe.probe_context, "shell");
+        assert_eq!(
+            probe
+                .checks
+                .iter()
+                .find(|c| c.key == "root")
+                .unwrap()
+                .status,
+            "restricted"
+        );
+        assert_eq!(probe.bpf_load_status, "unverified");
+    }
+
+    #[test]
+    fn incomplete_root_or_nonzero_uid_never_grants_root() {
+        for (code, text) in [
+            (None, "probe_uid=0\nprobe_complete=1"),
+            (Some(1), "probe_uid=0\nprobe_complete=1"),
+            (Some(0), "probe_uid=0"),
+            (Some(0), "probe_uid=1000\nprobe_complete=1"),
+            (Some(0), "uid=0(root)\nprobe_complete=1"),
+        ] {
+            assert!(!root_probe_confirmed(code, &parse_probe_output(text)));
+        }
+        assert!(root_probe_confirmed(
+            Some(0),
+            &parse_probe_output("probe_uid=0\nprobe_complete=1")
+        ));
+    }
+
+    #[test]
+    fn omitted_observations_stay_unknown_and_load_never_becomes_verified() {
+        let probe = build_probe("fixture".into(), HashMap::new(), true);
+        assert_eq!(probe.btf_status, "Unknown");
+        assert_eq!(probe.bpffs_status, "Unknown");
+        assert_eq!(probe.unprivileged_bpf_disabled, "unknown");
+        assert_eq!(probe.bpf_load_status, "unverified");
+        assert_eq!(
+            probe
+                .checks
+                .iter()
+                .find(|c| c.key == "bpffs")
+                .unwrap()
+                .status,
+            "unknown"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn production_shell_probe_distinguishes_readable_absent_denied_and_unknown() {
+        let root = std::env::temp_dir().join(format!("me-probe-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(root.join("sys/kernel/btf")).unwrap();
+        std::fs::create_dir_all(root.join("sys/fs/bpf")).unwrap();
+        std::fs::create_dir_all(root.join("proc/sys/kernel")).unwrap();
+        let btf = root.join("sys/kernel/btf/vmlinux");
+        std::fs::write(&btf, b"btf fixture").unwrap();
+        std::fs::write(root.join("proc/mounts"), b"bpf /sys/fs/bpf bpf rw 0 0\n").unwrap();
+        let policy = root.join("proc/sys/kernel/unprivileged_bpf_disabled");
+        std::fs::write(&policy, b"2\n").unwrap();
+        // Rewrite only host fixture paths; production Android paths stay fixed.
+        let mut script = PROBE_SCRIPT.replace("/proc/sys/", "__PROBE_POLICY__/");
+        for prefix in ["/sys/", "/proc/", "/system/", "/data/"] {
+            script = script.replace(prefix, &format!("{}{prefix}", root.display()));
+        }
+        script = script.replace(
+            "__PROBE_POLICY__/",
+            &format!("{}/proc/sys/", root.display()),
+        );
+        // Mount records carry Android paths, so preserve the production matcher.
+        script = script.replace(
+            &format!(" {}{}", root.display(), "/sys/fs/bpf bpf "),
+            " /sys/fs/bpf bpf ",
+        );
+        let run = |override_commands: &str| {
+            let output = std::process::Command::new("sh")
+                .arg("-c")
+                .arg(format!("getprop() {{ echo fixture; }}\ngetenforce() {{ echo Enforcing; }}\n{override_commands}\n{script}"))
+                .output().unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            parse_probe_output(&String::from_utf8_lossy(&output.stdout))
+        };
+        let readable = run("");
+        assert_eq!(readable["btf"], "available");
+        assert_eq!(readable["bpffs"], "mounted");
+        assert_eq!(readable["unprivileged_bpf_disabled"], "2");
+        assert_eq!(readable["probe_complete"], "1");
+        assert_eq!(run("head() { return 1; }")["btf"], "unreadable");
+        std::fs::remove_file(&btf).unwrap();
+        assert_eq!(run("")["btf"], "missing");
+        assert_eq!(run("ls() { return 1; }")["btf"], "unknown");
+        std::fs::remove_dir(root.join("sys/kernel/btf")).unwrap();
+        assert_eq!(run("")["btf"], "missing");
+        std::fs::remove_file(&policy).unwrap();
+        assert_eq!(run("")["unprivileged_bpf_disabled"], "unknown");
+        std::fs::write(&policy, b"unexpected\n").unwrap();
+        assert_eq!(run("")["unprivileged_bpf_disabled"], "unknown");
+        std::fs::remove_file(root.join("proc/mounts")).unwrap();
+        assert_eq!(run("")["bpffs"], "unknown");
+        assert_eq!(std::fs::read(&policy).unwrap(), b"unexpected\n");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn probe_script_only_observes_without_device_configuration_changes() {
+        assert!(PROBE_SCRIPT.contains("probe_uid="));
+        assert!(PROBE_SCRIPT.contains("probe_complete=1"));
+        assert!(PROBE_SCRIPT.contains("btf=unreadable"));
+        assert!(PROBE_SCRIPT.contains("btf=unknown"));
+        assert!(!PROBE_SCRIPT.contains("sysctl -w"));
+        assert!(!PROBE_SCRIPT.contains("mount -t"));
+        assert!(!PROBE_SCRIPT.contains("chmod"));
+        assert!(!PROBE_SCRIPT.contains("> /proc/"));
     }
 }

@@ -1,56 +1,312 @@
 name: release
 
 on:
-  workflow_dispatch:
   push:
+    branches:
+      - release/device-probe-20261010
     tags:
       - "v*"
+  workflow_dispatch:
 
 permissions:
   contents: read
 
+# Serialize each release ref. Never cancel a run while it is publishing.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
 jobs:
-  macos:
-    runs-on: macos-latest
+  metadata:
+    # Manual runs are branch-only. Generated candidate tags cannot recurse.
+    if: >-
+      (github.ref == 'refs/heads/release/device-probe-20261010' &&
+       (github.event_name == 'push' || github.event_name == 'workflow_dispatch')) ||
+      (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') &&
+       !contains(github.ref_name, '-build.'))
+    runs-on: ubuntu-24.04
+    outputs:
+      sha: ${{ steps.version.outputs.sha }}
+      version: ${{ steps.version.outputs.version }}
+      tag: ${{ steps.version.outputs.tag }}
+      mode: ${{ steps.version.outputs.mode }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Validate source SHA and all version metadata
+        id: version
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          python3 - <<'PY'
+          import json
+          import os
+          import re
+          import tomllib
+          from pathlib import Path
+
+          package = json.loads(Path('package.json').read_text())
+          npm_lock = json.loads(Path('package-lock.json').read_text())
+          cargo = tomllib.loads(Path('src-tauri/Cargo.toml').read_text())
+          cargo_lock = tomllib.loads(Path('src-tauri/Cargo.lock').read_text())
+          tauri = json.loads(Path('src-tauri/tauri.conf.json').read_text())
+          local_crate = [p for p in cargo_lock['package']
+                         if p['name'] == cargo['package']['name'] and 'source' not in p]
+          if len(local_crate) != 1:
+              raise SystemExit('Expected exactly one local application crate in Cargo.lock')
+          versions = {
+              'package.json': package['version'],
+              'package-lock.json': npm_lock['version'],
+              'package-lock.json packages[""]': npm_lock['packages']['']['version'],
+              'Cargo.toml': cargo['package']['version'],
+              'Cargo.lock': local_crate[0]['version'],
+              'tauri.conf.json': tauri['version'],
+          }
+          version = package['version']
+          if not isinstance(version, str) or not re.fullmatch(r'(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)', version):
+              raise SystemExit('Application version must be a stable major.minor.patch version')
+          if any(v != version for v in versions.values()):
+              raise SystemExit(f'Expected all versions to equal {version}: {versions}')
+          sha = os.environ['GITHUB_SHA']
+          if not re.fullmatch(r'[0-9a-f]{40}', sha):
+              raise SystemExit('GITHUB_SHA must be a full commit SHA')
+          ref = os.environ['GITHUB_REF']
+          event = os.environ['GITHUB_EVENT_NAME']
+          if ref == 'refs/heads/release/device-probe-20261010' and event in ('push', 'workflow_dispatch'):
+              mode = 'candidate'
+              tag = f'v{version}-build.{sha[:8]}'
+          elif event == 'push' and ref == f'refs/tags/v{version}':
+              mode = 'stable'
+              tag = f'v{version}'
+          else:
+              raise SystemExit('Ref/event is not an authorized release lane')
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
+              output.write(f'sha={sha}\nversion={version}\ntag={tag}\nmode={mode}\n')
+          print(f'Validated {tag} from exact commit {sha}')
+          PY
+
+  macos:
+    needs: metadata
+    runs-on: macos-15
+    timeout-minutes: 90
+    env:
+      SOURCE_SHA: ${{ needs.metadata.outputs.sha }}
+      APP_VERSION: ${{ needs.metadata.outputs.version }}
+      RELEASE_TAG: ${{ needs.metadata.outputs.tag }}
+      RELEASE_MODE: ${{ needs.metadata.outputs.mode }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.metadata.outputs.sha }}
+          persist-credentials: false
       - uses: actions/setup-node@v4
         with:
           node-version: 20
           cache: npm
-      - name: Install Rust
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+          targets: aarch64-apple-darwin
+      - name: Verify native Apple Silicon runner and source
         run: |
-          curl --proto '=https' --tlsv1.2 -fsSL https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
-          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
+          test "$(uname -m)" = arm64
+          rustc -vV | grep -Fx 'host: aarch64-apple-darwin'
       - run: npm ci
-      - run: npm run tauri build
+      - name: Gate - frontend typecheck
+        run: npm run typecheck
+      - name: Gate - KernSight evidence tests
+        run: npm run test:kernsight-evidence
+      - name: Gate - frontend production build
+        run: npm run build
+      - name: Gate - Rust formatting
+        run: cargo fmt --manifest-path src-tauri/Cargo.toml --all -- --check
+      - name: Gate - locked Rust library tests
+        run: cargo test --manifest-path src-tauri/Cargo.toml --lib --locked
+      - name: Build native arm64 DMG
+        # The checked-in config uses yarn; keep this npm-locked lane on npm.
+        # '-' is ad-hoc signing, not an Apple Developer ID identity.
+        run: >-
+          npm run tauri -- build --ci --target aarch64-apple-darwin --bundles app,dmg
+          --config '{"build":{"beforeBuildCommand":"npm run build"},"bundle":{"macOS":{"signingIdentity":"-"}}}'
+          -- --locked
+      - name: Verify bundle and record provenance
+        run: |
+          set -euo pipefail
+          app='src-tauri/target/aarch64-apple-darwin/release/bundle/macos/ME.app'
+          plist="$app/Contents/Info.plist"
+          test -d "$app"
+          test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$plist")" = "$APP_VERSION"
+          executable="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$plist")"
+          test "$(lipo -archs "$app/Contents/MacOS/$executable")" = arm64
+          codesign --verify --deep --strict "$app"
+          signature="$(codesign --display --verbose=4 "$app" 2>&1)"
+          printf '%s\n' "$signature"
+          grep -Fx 'Signature=adhoc' <<< "$signature"
+          grep -Fx 'TeamIdentifier=not set' <<< "$signature"
+          mkdir release
+          shopt -s nullglob
+          dmgs=(src-tauri/target/aarch64-apple-darwin/release/bundle/dmg/*.dmg)
+          test "${#dmgs[@]}" -eq 1
+          cp "${dmgs[0]}" "release/ME_${RELEASE_TAG#v}_macos_arm64.dmg"
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          info = {
+              'repository': os.environ['GITHUB_REPOSITORY'],
+              'commit': os.environ['SOURCE_SHA'],
+              'tag': os.environ['RELEASE_TAG'],
+              'release_mode': os.environ['RELEASE_MODE'],
+              'app_version': os.environ['APP_VERSION'],
+              'target': 'aarch64-apple-darwin',
+              'native_runner_architecture': 'arm64',
+              'signing': 'ad-hoc only; no Apple Developer ID; not notarized',
+              'device_validation': 'not performed by this workflow',
+              'passed_gates': ['typecheck', 'test:kernsight-evidence', 'build',
+                               'cargo fmt --all -- --check', 'cargo test --lib --locked'],
+              'run_url': f"{os.environ['GITHUB_SERVER_URL']}/{os.environ['GITHUB_REPOSITORY']}/actions/runs/{os.environ['GITHUB_RUN_ID']}",
+              'run_attempt': os.environ['GITHUB_RUN_ATTEMPT'],
+          }
+          Path('release/BUILD_INFO.json').write_text(json.dumps(info, indent=2) + '\n')
+          PY
+          (cd release && shasum -a 256 -- *.dmg BUILD_INFO.json > SHA256SUMS)
+          # Neither install/build may silently change either lockfile.
+          git diff --exit-code -- package-lock.json src-tauri/Cargo.lock
       - uses: actions/upload-artifact@v4
         with:
-          name: me-macos
-          path: src-tauri/target/release/bundle/dmg/*.dmg
+          name: me-macos-arm64-${{ needs.metadata.outputs.sha }}
+          path: release/*
           if-no-files-found: error
+          retention-days: 30
 
   publish:
-    needs: macos
-    runs-on: ubuntu-latest
+    needs: [metadata, macos]
+    if: >-
+      (github.ref == 'refs/heads/release/device-probe-20261010' &&
+       (github.event_name == 'push' || github.event_name == 'workflow_dispatch')) ||
+      (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') &&
+       !contains(github.ref_name, '-build.'))
+    runs-on: ubuntu-24.04
     permissions:
       contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      SOURCE_SHA: ${{ needs.metadata.outputs.sha }}
+      APP_VERSION: ${{ needs.metadata.outputs.version }}
+      RELEASE_TAG: ${{ needs.metadata.outputs.tag }}
+      RELEASE_MODE: ${{ needs.metadata.outputs.mode }}
     steps:
-      - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
         with:
+          name: me-macos-arm64-${{ needs.metadata.outputs.sha }}
           path: release
-          merge-multiple: true
-      - name: Publish GitHub Release
-        if: startsWith(github.ref, 'refs/tags/v')
-        env:
-          GH_TOKEN: ${{ github.token }}
+      - name: Validate downloaded checksums and provenance
         run: |
-          find release -type f -print
-          if gh release view "${GITHUB_REF_NAME}" >/dev/null 2>&1; then
-            gh release upload "${GITHUB_REF_NAME}" release/* --clobber
+          set -euo pipefail
+          (cd release && sha256sum --check SHA256SUMS)
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          info = json.loads(Path('release/BUILD_INFO.json').read_text())
+          expected = {'commit': os.environ['SOURCE_SHA'], 'tag': os.environ['RELEASE_TAG'],
+                      'app_version': os.environ['APP_VERSION'], 'repository': os.environ['GITHUB_REPOSITORY'],
+                      'target': 'aarch64-apple-darwin', 'release_mode': os.environ['RELEASE_MODE']}
+          if any(info.get(k) != v for k, v in expected.items()):
+              raise SystemExit('Downloaded build provenance does not match this run')
+          assets = {p.name for p in Path('release').iterdir()}
+          wanted = {f"ME_{os.environ['RELEASE_TAG'][1:]}_macos_arm64.dmg", 'BUILD_INFO.json', 'SHA256SUMS'}
+          if assets != wanted:
+              raise SystemExit(f'Unexpected release assets: {assets}')
+          PY
+      - name: Validate tag policy and refuse existing release
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json
+          import os
+          import urllib.error
+          import urllib.request
+
+          base = f"{os.environ['GITHUB_API_URL']}/repos/{os.environ['GITHUB_REPOSITORY']}"
+          tag = os.environ['RELEASE_TAG']
+          def fetch(endpoint):
+              request = urllib.request.Request(f'{base}/{endpoint}', headers={
+                  'Authorization': f"Bearer {os.environ['GH_TOKEN']}",
+                  'Accept': 'application/vnd.github+json',
+                  'X-GitHub-Api-Version': '2022-11-28',
+              })
+              try:
+                  with urllib.request.urlopen(request) as response:
+                      return json.load(response)
+              except urllib.error.HTTPError as error:
+                  if error.code == 404:
+                      return None
+                  raise
+
+          ref = fetch(f'git/ref/tags/{tag}')
+          if os.environ['RELEASE_MODE'] == 'candidate':
+              if ref is not None:
+                  raise SystemExit('Refusing to modify an existing candidate tag')
+          else:
+              if ref is None:
+                  raise SystemExit('The stable tag must already exist')
+              obj = ref['object']
+              # Resolve annotated tags as well as lightweight tags, without changing them.
+              for _ in range(16):
+                  if obj['type'] != 'tag':
+                      break
+                  annotated = fetch(f"git/tags/{obj['sha']}")
+                  if annotated is None:
+                      raise SystemExit('Cannot resolve annotated tag')
+                  obj = annotated['object']
+              if obj['type'] != 'commit' or obj['sha'] != os.environ['SOURCE_SHA']:
+                  raise SystemExit('Stable tag does not point to the exact tested commit')
+          if fetch(f'releases/tags/{tag}') is not None:
+              raise SystemExit('Refusing to modify an existing release')
+          PY
+      - name: Publish new release without overwriting tags or releases
+        run: |
+          set -euo pipefail
+          release_flags=(--latest=false)
+          if [ "$RELEASE_MODE" = candidate ]; then
+            # Atomic create fails on a race. Never update an existing ref.
+            gh api --method POST "repos/$GITHUB_REPOSITORY/git/refs" \
+              -f "ref=refs/tags/$RELEASE_TAG" -f "sha=$SOURCE_SHA"
+            test "$(gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$RELEASE_TAG" --jq '.object.sha')" = "$SOURCE_SHA"
+            release_flags+=(--prerelease)
+            release_label='candidate prerelease'
           else
-            gh release create "${GITHUB_REF_NAME}" release/* \
-              --title "${GITHUB_REF_NAME}" \
-              --notes "ME ${GITHUB_REF_NAME} for macOS. Built by the release workflow on this tag."
+            # Tag-push mode uses the verified existing stable tag without changing it.
+            release_label='stable-tag release'
           fi
+          cat > release-notes.md <<EOF
+          ME $APP_VERSION $release_label for macOS Apple Silicon (arm64).
+
+          Source commit: $SOURCE_SHA
+          Release tag: $RELEASE_TAG
+          Build: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID
+
+          Built natively on an arm64 macOS runner after frontend typecheck, KernSight evidence tests, frontend production build, Rust formatting, and locked Rust library tests passed.
+
+          Distribution status: ad-hoc signed only (unsigned for trusted distribution), not Apple Developer ID signed, and not notarized. macOS Gatekeeper may block installation or opening.
+
+          Validation limits: this workflow does not prove launch or end-to-end behavior on a user's Mac and does not test a connected Android or iOS device. This $release_label is not a device-validated production build.
+
+          Assets include the DMG, BUILD_INFO.json provenance, and SHA256SUMS. Verify the downloaded assets with: shasum -a 256 -c SHA256SUMS
+          EOF
+          gh release create "$RELEASE_TAG" release/* \
+            --verify-tag --target "$SOURCE_SHA" "${release_flags[@]}" \
+            --title "ME $RELEASE_TAG (macOS arm64 $release_label)" \
+            --notes-file release-notes.md

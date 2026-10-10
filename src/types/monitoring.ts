@@ -1,4 +1,4 @@
-export type MonitorCapabilityStatus = 'available' | 'restricted' | 'missing' | 'warning' | 'unknown' | string
+export type MonitorCapabilityStatus = 'available' | 'restricted' | 'missing' | 'warning' | 'unknown' | 'unavailable' | 'limited' | string
 export type MonitorDeploymentRecommendation = 'standard' | 'development' | 'system' | string
 
 export interface MonitorCapabilityCheck {
@@ -10,6 +10,9 @@ export interface MonitorCapabilityCheck {
 
 export interface AndroidMonitorCapabilityProbe {
   serial: string
+  probeContext?: 'root' | 'shell'
+  bpfLoadStatus?: 'unverified'
+  unprivilegedBpfDisabled?: string
   probedAt: number
   kernelVersion: string
   architecture: string
@@ -546,3 +549,4 @@ export interface KernSightGroupPurgeReport {
   warnings: string[]
   error: string | null
 }
+
