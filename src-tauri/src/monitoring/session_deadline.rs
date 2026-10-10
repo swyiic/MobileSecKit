@@ -8,10 +8,16 @@ use std::{
         atomic::{AtomicBool, AtomicUsize, Ordering},
         Arc, Mutex, OnceLock,
     },
-    time::{Duration, Instant},
+    time::Duration,
 };
 use tokio::{process::Command, sync::Notify};
 use uuid::Uuid;
+
+// Keep production on the system clock; unit tests can opt into paused time.
+#[cfg(not(test))]
+use std::time::Instant;
+#[cfg(test)]
+use tokio::time::Instant;
 
 #[derive(Clone)]
 pub struct Deadline(Arc<Inner>);

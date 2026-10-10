@@ -154,7 +154,7 @@ test('saved partial evidence remains usable and is never described as complete c
   assert.match(message, /已保存并导入/)
   assert.match(message, /覆盖不足（partial）/)
   assert.equal(JSON.stringify(group), before)
-  assert.match(captureSavedOutcome({ ...group, state: 'failed' }, '/retained'), /采集未全部完成/)
+  assert.match(captureSavedOutcome({ ...group, state: 'failed' }, '/retained'), /采集失败/)
 })
 
 test('real 676bd086 partial stage receipts do not claim failure or stopped follow-up', () => {
