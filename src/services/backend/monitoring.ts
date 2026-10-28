@@ -35,6 +35,7 @@ export const monitoringBackend = {
   kernSightGroupSessionReport:(parentId:string,serial:string,packageName:string,sessionId:string)=>invoke<KernSightSessionReportDocument>('get_kernsight_group_session_report',{parentId,serial,package:packageName,sessionId}),
   localKernSightChildReport:(root:string,parentId:string,sessionId:string)=>invoke<KernSightSessionReportDocument>('get_local_kernsight_child_report',{root,parentId,sessionId}),
   beginKernSightGroup:(request:KernSightCaptureRequest,durations:number[],startupReplay:boolean)=>invoke<KernSightCaptureGroup>(captureGroupIPC(request),{request,durations,startupReplay}),
+  deleteKernSightGroup: (parentId: string, importedRoots: string[]) => invoke<KernSightCaptureGroupTrash>('delete_kernsight_group', { parentId, importedRoots }),
   trashKernSightGroup: (parentId: string, importedRoots: string[]) => invoke<KernSightCaptureGroupTrash>('trash_kernsight_group', { parentId, importedRoots }),
   listKernSightGroupTrash: () => invoke<KernSightCaptureGroupTrash[]>('list_kernsight_group_trash'),
   restoreKernSightGroup: (parentId: string) => invoke<KernSightCaptureGroupTrash>('restore_kernsight_group', { parentId }),
@@ -70,6 +71,8 @@ export const monitoringBackend = {
     invoke<KernSightLocalEvidenceBundle>('import_kernsight_evidence_archive', { path }),
   exportKernSightEvidenceArchive: (root: string, outputPath: string) =>
     invoke<string>('export_kernsight_evidence_archive', { root, outputPath }),
+  exportKernSightAnalysisDirectory: (root: string, outputPath: string) =>
+    invoke<string>('export_kernsight_analysis_directory', { root, outputPath }),
   pullKernSightPackageEvidence: (serial: string, packageName: string, destination: string) =>
     invoke<KernSightLocalEvidenceBundle>('pull_kernsight_package_evidence', { serial, package: packageName, destination }),
   pullKernSightPackageArchive: (serial: string, packageName: string, outputPath: string, parentId?:string) =>

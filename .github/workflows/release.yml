@@ -11,7 +11,7 @@ permissions:
 
 jobs:
   macos:
-    runs-on: macos-latest
+    runs-on: macos-14
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -24,6 +24,8 @@ jobs:
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
       - run: npm ci
       - run: npm run tauri build
+      - name: Check app signature
+        run: codesign --verify --deep --strict src-tauri/target/release/bundle/macos/ME.app
       - uses: actions/upload-artifact@v4
         with:
           name: me-macos
@@ -47,10 +49,11 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           find release -type f -print
+          (cd release && sha256sum *.dmg > SHA256SUMS)
           if gh release view "${GITHUB_REF_NAME}" >/dev/null 2>&1; then
             gh release upload "${GITHUB_REF_NAME}" release/* --clobber
           else
             gh release create "${GITHUB_REF_NAME}" release/* \
               --title "${GITHUB_REF_NAME}" \
-              --notes "ME ${GITHUB_REF_NAME} for macOS. Built by the release workflow on this tag."
+              --notes-file "release-notes/${GITHUB_REF_NAME}.txt"
           fi

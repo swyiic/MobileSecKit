@@ -103,6 +103,8 @@ export interface KernSightSessionReportDocument {
 export interface KernSightCaptureRequest {
   runtimePaths?:{root:string;agentPath:string;expectedSha256:string}|null
   sessionBudget?:{totalBytes:number;maxSeconds:number}|null
+  /** New v6 parents: l2MaxSeconds is effective copy time after phone readiness.
+   * Retained v5 contracts keep their original whole-L2-stage meaning. */
   captureTime?:{maxSeconds:number;l2MaxSeconds:number}|null
   saveTime?:{transferMaxSeconds:number;archiveMaxSeconds:number;importMaxSeconds:number}|null
   codeOnly?:boolean
@@ -216,7 +218,37 @@ export interface KernSightEvidenceFileContent {
   content: string
 }
 
+export type KernSightCandidateCoverage = {
+  status: 'unknown'
+  reason: string
+  scope: 'initial_main_process_candidate_snapshot'
+  metadataOnly: true
+} | {
+  status: 'available'
+  scope: 'initial_main_process_candidate_snapshot'
+  metadataOnly: true
+  candidateManifest: string
+  eligibleRanges: number
+  eligibleBytes: number
+  attemptedRanges: number
+  sourceShardCount: number
+  currentSourceRecords: number
+  globalAttemptedRanges: number
+  terminalStopScope?: string | null
+  terminalUnattemptedState?: string | null
+  admittedRanges: number
+  admittedBytes: number
+  excludedRanges: number
+  rejectedRanges: number
+  unattemptedRanges: number
+  unattemptedBytes: number
+  remainingBytes: number
+  appInstall: { eligibleRanges: number; admittedRanges: number; remainingRanges: number; remainingBytes: number } | null
+}
+
 export interface KernSightBoundSourcePage {
+  producerStatus?: { partial?: boolean | null; stopScope?: string | null; unattemptedState?: string | null; attemptedRanges?: number | null; grantedWindowMs?: number | null; setupElapsedMs?: number | null }
+  candidateCoverage?: KernSightCandidateCoverage
   schema: 'mobilee.bound-source-page/v1'
   sourceReport: string
   sourceSha256: string
@@ -500,6 +532,7 @@ export interface KernSightGroupStageResult {
 
 export interface KernSightCaptureGroupTrash {
   schema: 'mobilee.capture-group-trash/v1'; group: KernSightCaptureGroup;
+  deletion?: { localDone: boolean; deviceDone: boolean; error?: string | null };
   trashedUnixMs: number; managed: boolean; trashed?: boolean; retainedSessionIds?: string[]; importedRoots: string[];
 }
 

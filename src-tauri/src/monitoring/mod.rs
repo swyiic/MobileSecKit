@@ -1,3 +1,4 @@
+mod analysis_export;
 mod archive_objects;
 mod batch_transfer;
 mod bound_source_page;
@@ -15,6 +16,19 @@ pub(crate) mod session_deadline;
 mod stage_policy;
 mod storage_evidence;
 use crate::{run_device_adb, run_device_root_script};
+
+/// Inventory hashes every retained object. Large applications legitimately
+/// exceed the ordinary 20-second control-command timeout; the surrounding
+/// transfer/session deadline still caps this operation and cancellation.
+async fn run_evidence_inventory(serial: &str, script: &str) -> Result<crate::RawOutput, String> {
+    crate::run_device_adb_with_timeout(
+        serial,
+        &["shell", &crate::root_shell_command(script)],
+        std::time::Duration::from_secs(120),
+        "证据清单与 SHA-256 核验",
+    )
+    .await
+}
 use ksight_core::{
     DexArtifactSet, DumpArtifact, MergedDumpRef, SessionGraph, SessionReport, SessionReportBuilder,
 };
@@ -465,6 +479,12 @@ pub struct KernSightCaptureRequest {
     session_budget: Option<session_budget::Limits>,
     #[serde(default)]
     capture_time: Option<session_budget::CaptureTime>,
+    /// Trusted stage-only v6 effective copy window. Never accepted from IPC or
+    /// a retained base request; the parent time contract supplies it.
+    #[serde(default, skip_deserializing, skip_serializing_if = "Option::is_none")]
+    runtime_copy_ms: Option<u64>,
+    #[serde(skip)]
+    ready_timing_v6: bool,
     #[serde(default)]
     save_time: Option<session_budget::SaveTime>,
     #[serde(default)]
@@ -837,7 +857,9 @@ fn build_probe(
 
     let summary = match (recommended_mode.as_str(), btf_available) {
         ("system", _) => "检测到系统 Agent 候选，可以进入系统握手与完整性校验阶段。",
-        ("development", false) => "已获得 Root 授权。这台内核没有可读 BTF，采集使用设备上的兼容程序。",
+        ("development", false) => {
+            "已获得 Root 授权。这台内核没有可读 BTF，采集使用设备上的兼容程序。"
+        }
         ("development", true) => "已获得 Root 授权，可以部署开发 Agent。",
         _ => "当前只能使用 Standard 模式；完整监控需要 Root 授权或预装系统 Agent。",
     }
@@ -979,18 +1001,20 @@ fn install_host_cli(archive: &[u8]) -> Result<String, String> {
     std::fs::create_dir_all(&bin_dir)
         .map_err(|error| format!("[安装本机 CLI] 无法创建 {}：{error}", bin_dir.display()))?;
     let work = std::env::temp_dir().join(format!("mobilee-cli-{}", Uuid::new_v4()));
-    std::fs::create_dir_all(work.join("out"))
-        .map_err(|error| format!("[安装本机 CLI] {error}"))?;
+    std::fs::create_dir_all(work.join("out")).map_err(|error| format!("[安装本机 CLI] {error}"))?;
     let archive_path = work.join("cli.tar.gz");
-    std::fs::write(&archive_path, archive)
-        .map_err(|error| format!("[安装本机 CLI] {error}"))?;
+    std::fs::write(&archive_path, archive).map_err(|error| format!("[安装本机 CLI] {error}"))?;
     let extracted = work.join("out");
     let status = std::process::Command::new("tar")
         .args([
             "-xzf",
-            archive_path.to_str().ok_or("[安装本机 CLI] 临时路径不是 UTF-8")?,
+            archive_path
+                .to_str()
+                .ok_or("[安装本机 CLI] 临时路径不是 UTF-8")?,
             "-C",
-            extracted.to_str().ok_or("[安装本机 CLI] 临时路径不是 UTF-8")?,
+            extracted
+                .to_str()
+                .ok_or("[安装本机 CLI] 临时路径不是 UTF-8")?,
         ])
         .status()
         .map_err(|error| format!("[安装本机 CLI] 无法解压：{error}"))?;
@@ -998,8 +1022,8 @@ fn install_host_cli(archive: &[u8]) -> Result<String, String> {
         let _ = std::fs::remove_dir_all(&work);
         return Err("[安装本机 CLI] tar 解压失败".into());
     }
-    let found = find_named_file(&extracted, "ksightctl")
-        .ok_or("[安装本机 CLI] 压缩包里没有 ksightctl")?;
+    let found =
+        find_named_file(&extracted, "ksightctl").ok_or("[安装本机 CLI] 压缩包里没有 ksightctl")?;
     let dest = bin_dir.join("ksightctl");
     std::fs::copy(&found, &dest)
         .map_err(|error| format!("[安装本机 CLI] 无法写入 {}：{error}", dest.display()))?;
@@ -1154,13 +1178,14 @@ pub async fn provision_latest_kernsight_agent(
         && host_cli_installed()
         && cli_receipt_matches(cli_asset_name, expected_cli_sha256_now.as_deref())
     {
-        let installed_version = run_device_root_script(&serial, &format!("{KSIGHT_AGENT} --version"))
-            .await
-            .ok()
-            .filter(|output| output.code == Some(0))
-            .map(|output| output.stdout.trim().to_string())
-            .filter(|text| text.starts_with("ksightd "))
-            .unwrap_or_else(|| "ksightd".into());
+        let installed_version =
+            run_device_root_script(&serial, &format!("{KSIGHT_AGENT} --version"))
+                .await
+                .ok()
+                .filter(|output| output.code == Some(0))
+                .map(|output| output.stdout.trim().to_string())
+                .filter(|text| text.starts_with("ksightd "))
+                .unwrap_or_else(|| "ksightd".into());
         steps.push(provision_step(
             "current",
             "已是最新",
@@ -1238,7 +1263,10 @@ pub async fn provision_latest_kernsight_agent(
     )
     .await;
     let _ = std::fs::remove_file(&temporary_path);
-    let push = push_result
+    // Always remove this operation's unique staging file, including interrupted
+    // uploads and failed installs. Never sweep evidence or unrelated runtimes.
+    let install_result: Result<(), String> = async {
+        let push = push_result
         .map_err(|_| "[推送到手机] ADB push 超过 120 秒".to_string())?
         .map_err(|error| format!("[推送到手机] 无法启动 adb：{error}"))?;
     if !push.status.success() {
@@ -1268,6 +1296,33 @@ pub async fn provision_latest_kernsight_agent(
         ));
     }
     steps.push(provision_step("install", "Root 原子安装", KSIGHT_AGENT));
+
+        Ok(())
+    }.await;
+    let cleanup_script = format!("rm -f -- {}", crate::shell_quote(&remote_stage));
+    let cleanup = timeout(
+        Duration::from_secs(10),
+        run_device_root_script(&serial, &cleanup_script),
+    )
+    .await;
+    let cleanup_error = match cleanup {
+        Ok(Ok(output)) if output.code == Some(0) => None,
+        Ok(Ok(output)) => Some(format!(
+            "临时文件待清理 {}：{}",
+            remote_stage, output.stderr
+        )),
+        Ok(Err(error)) => Some(format!("临时文件待清理 {}：{error}", remote_stage)),
+        Err(_) => Some(format!("临时文件清理超时：{remote_stage}")),
+    };
+    if let Err(error) = install_result {
+        return Err(match cleanup_error {
+            Some(cleanup) => format!("{error}；{cleanup}"),
+            None => error,
+        });
+    }
+    if let Some(error) = cleanup_error {
+        steps.push(provision_step("cleanup", "临时文件清理", error));
+    }
 
     let version = run_device_root_script(&serial, &format!("{KSIGHT_AGENT} --version"))
         .await
@@ -1353,7 +1408,11 @@ async fn installed_agent_sha256(serial: &str) -> Option<String> {
     if output.code != Some(0) {
         return None;
     }
-    let token = output.stdout.split_whitespace().next()?.to_ascii_lowercase();
+    let token = output
+        .stdout
+        .split_whitespace()
+        .next()?
+        .to_ascii_lowercase();
     (token.len() == 64).then_some(token)
 }
 
@@ -1658,7 +1717,14 @@ async fn get_kernsight_session_report_scoped(
         match connection.receive().await? {
             Message::EventBatch(batch) if batch.session_id == session_id => {
                 for event in &batch.events {
-                    builder.record(event);
+                    if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        builder.record(event)
+                    }))
+                    .is_err()
+                    {
+                        let _ = connection.close().await;
+                        return Err("session_report_parser_failed：报告解析异常，手机原始会话保留；本阶段不能按成功继续".into());
+                    }
                     linker.record(event);
                     perf_loss.record(event);
                 }
@@ -1677,7 +1743,11 @@ async fn get_kernsight_session_report_scoped(
         }
     }
     connection.close().await?;
-    let mut report = builder.finish();
+    let mut report = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| builder.finish()))
+        .map_err(|_| {
+            "session_report_parser_failed：报告生成异常，手机原始会话保留；本阶段不能按成功继续"
+                .to_owned()
+        })?;
     compact_session_report_for_ui(&mut report);
     let mut report = serde_json::to_value(report).map_err(|error| error.to_string())?;
     linker.augment(&mut report);
@@ -1737,6 +1807,84 @@ fn capture_launch_command(
     Ok(command)
 }
 
+fn capture_command_timeout(request: &KernSightCaptureRequest) -> Result<Duration, String> {
+    if request.ready_timing_v6 {
+        return Ok(Duration::from_millis(session_deadline::remaining_ms(
+            request.output_budget_ms.ok_or("v6观察缺固定硬期限")?,
+        )?));
+    }
+    let overhead = if request.capture_relation.is_none() {
+        let stages = request
+            .inspect_stages
+            .as_deref()
+            .map_or(1, |stages| stages.split(',').count().max(1));
+        55_u64.saturating_mul(stages as u64)
+    } else {
+        30
+    };
+    Ok(Duration::from_secs(
+        request.duration_seconds.saturating_add(overhead),
+    ))
+}
+fn capture_timeout_error(request: &KernSightCaptureRequest, error: String) -> String {
+    if request.capture_relation.is_none() && error.contains("command_timeout") {
+        return format!("单次采集准备/观察/收尾保护期限已到，{} 秒有效观察尚未确认完整；主机等待已结束，手机端停止状态未确认。请核对已保留的会话记录，不能将本次当作采齐：{error}",request.duration_seconds);
+    }
+    error
+}
+
+#[cfg(test)]
+mod capture_host_timeout_tests {
+    use super::*;
+    fn request() -> KernSightCaptureRequest {
+        serde_json::from_value(serde_json::json!({"serial":"synthetic","durationSeconds":30}))
+            .unwrap()
+    }
+    #[test]
+    fn independent_ready_presets_keep_effective_duration_and_separate_overhead() {
+        let mut request = request();
+        assert_eq!(
+            capture_command_timeout(&request).unwrap(),
+            Duration::from_secs(85)
+        );
+        assert_eq!(request.duration_seconds, 30);
+        request.duration_seconds = 75;
+        request.inspect_stages = Some("l0:25,l1:30,linker:20".into());
+        assert_eq!(
+            capture_command_timeout(&request).unwrap(),
+            Duration::from_secs(240)
+        );
+        let error = capture_timeout_error(&request, "command_timeout".into());
+        assert!(error.contains("有效观察尚未确认完整"));
+        assert!(error.contains("手机端停止状态未确认"));
+    }
+    #[test]
+    fn historical_parent_fallback_is_unchanged_and_v6_uses_its_hard_lease() {
+        let mut request = request();
+        request.capture_relation = Some(capture_groups::Relation {
+            parent_id: Uuid::new_v4(),
+            stage_id: Uuid::new_v4(),
+            attempt_id: Uuid::new_v4(),
+            attempt: 1,
+            stage_key: "l1".into(),
+        });
+        assert_eq!(
+            capture_command_timeout(&request).unwrap(),
+            Duration::from_secs(60)
+        );
+        request.ready_timing_v6 = true;
+        request.output_budget_ms = Some(85000);
+        assert_eq!(
+            capture_command_timeout(&request).unwrap(),
+            Duration::from_secs(85)
+        );
+        assert_eq!(
+            capture_timeout_error(&request, "parent_deadline_exhausted".into()),
+            "parent_deadline_exhausted"
+        );
+    }
+}
+
 #[tauri::command]
 pub async fn start_kernsight_capture(
     request: KernSightCaptureRequest,
@@ -1772,6 +1920,11 @@ pub async fn start_kernsight_capture(
             || request.inspect_adapter.is_some()
             || request.mirror_burp.is_some(),
     )?;
+    // Independent presets do not enter a parent time plan. Require the new
+    // device-ready clock rather than silently retaining the old clipped timer.
+    if request.capture_relation.is_none() {
+        require_ready_clock_capability(&request.serial, request.runtime_paths.as_ref()).await?;
+    }
     if request.code_only {
         require_code_scope_capability(&request.serial, request.runtime_paths.as_ref()).await?;
         let help = run_device_root_script(
@@ -1793,6 +1946,9 @@ pub async fn start_kernsight_capture(
     if let Some(r) = request.capture_relation.as_ref() {
         require_parent_lifecycle_capability(&request.serial, request.runtime_paths.as_ref())
             .await?;
+        if request.ready_timing_v6 {
+            require_ready_clock_capability(&request.serial, request.runtime_paths.as_ref()).await?;
+        }
         if request.hide_debug
             || request.collect_keys
             || request.collect_memory_windows
@@ -1962,10 +2118,20 @@ pub async fn start_kernsight_capture(
         args.push("--collect-memory-windows".into());
     }
     match (request.output_budget_bytes, request.output_budget_ms) {
-        (Some(n), Some(t)) => args.push(format!(
-            "--output-budget-bytes {n} --output-budget-ms {}",
-            session_deadline::remaining_ms(t)?
-        )),
+        (Some(n), Some(t)) => {
+            let remaining = session_deadline::remaining_ms(t)?;
+            let producer_ms = if request.ready_timing_v6 {
+                if request.capture_relation.is_none() {
+                    return Err("v6观察时限缺可信父阶段；未启动".into());
+                }
+                dump_policy::producer_time_for_scope(remaining, 0, true)?
+            } else {
+                remaining
+            };
+            args.push(format!(
+                "--output-budget-bytes {n} --output-budget-ms {producer_ms}"
+            ));
+        }
         (None, None) => {}
         _ => return Err("写盘预算缺字节/期限".into()),
     }
@@ -2064,6 +2230,7 @@ pub async fn start_kernsight_capture(
     let capture_command = runtime_paths::route(request.runtime_paths.as_ref(), &capture_command)?;
     let command_preview = capture_command.replace(KSIGHT_AGENT, "ksightd");
     let started_unix_ms = now_millis();
+    let capture_timeout = capture_command_timeout(&request)?;
 
     let (stdout, stderr, exit_code) = if request.hide_debug {
         let wrapped = format!(
@@ -2073,11 +2240,9 @@ pub async fn start_kernsight_capture(
         let remote = format!("su -c {}", crate::shell_quote(&wrapped));
         let mut command = Command::new("adb");
         command.args(["-s", &request.serial, "shell", &remote]);
-        let output = session_deadline::output(
-            &mut command,
-            Duration::from_secs(request.duration_seconds.saturating_add(30)),
-        )
-        .await?;
+        let output = session_deadline::output(&mut command, capture_timeout)
+            .await
+            .map_err(|error| capture_timeout_error(&request, error))?;
         wait_for_adb_return(&request.serial, request.duration_seconds.saturating_add(25)).await?;
         let log = run_device_root_script(&request.serial, &format!("cat {KSIGHT_CAPTURE_LOG}"))
             .await
@@ -2090,10 +2255,11 @@ pub async fn start_kernsight_capture(
         )
     } else {
         let remote = format!("su -c {}", crate::shell_quote(&capture_command));
-        let capture_timeout = Duration::from_secs(request.duration_seconds.saturating_add(30));
         let mut command = Command::new("adb");
         command.args(["-s", &request.serial, "shell", &remote]);
-        let output = session_deadline::output(&mut command, capture_timeout).await?;
+        let output = session_deadline::output(&mut command, capture_timeout)
+            .await
+            .map_err(|error| capture_timeout_error(&request, error))?;
         (
             String::from_utf8_lossy(&output.stdout).trim().to_string(),
             String::from_utf8_lossy(&output.stderr).trim().to_string(),
@@ -2576,6 +2742,55 @@ pub async fn dump_kernsight_package(
     )
     .await
 }
+fn dump_command_timeout(scope: Option<&KernSightCaptureRequest>) -> Result<Duration, String> {
+    if let Some(request) = scope.filter(|request| request.runtime_copy_ms.is_some()) {
+        return Ok(Duration::from_millis(session_deadline::remaining_ms(
+            request.output_budget_ms.ok_or("v6复制缺固定阶段硬期限")?,
+        )?));
+    }
+    Ok(Duration::from_secs(600))
+}
+
+#[cfg(test)]
+mod dump_host_timeout_tests {
+    use super::*;
+    fn request() -> KernSightCaptureRequest {
+        let mut request: KernSightCaptureRequest = serde_json::from_value(
+            serde_json::json!({"serial":"synthetic","durationSeconds":1,"outputBudgetMs":670000}),
+        )
+        .unwrap();
+        request.runtime_copy_ms = Some(600000);
+        request
+    }
+    #[test]
+    fn v6_copy_over_ten_minutes_uses_phase_hard_limit_and_v5_keeps_legacy_fallback() {
+        let mut request = request();
+        assert_eq!(
+            dump_command_timeout(Some(&request)).unwrap(),
+            Duration::from_secs(670)
+        );
+        request.runtime_copy_ms = None;
+        assert_eq!(
+            dump_command_timeout(Some(&request)).unwrap(),
+            Duration::from_secs(600)
+        );
+        assert_eq!(
+            dump_command_timeout(None).unwrap(),
+            Duration::from_secs(600)
+        );
+    }
+    #[tokio::test]
+    async fn v6_timeout_uses_original_current_phase_without_renewing_it() {
+        let request = request();
+        let phase = session_deadline::Deadline::new(Duration::from_millis(100));
+        let timeout = phase
+            .run(async { dump_command_timeout(Some(&request)) })
+            .await
+            .unwrap();
+        assert!(timeout <= Duration::from_millis(100));
+    }
+}
+
 async fn dump_kernsight_package_scoped(
     serial: String,
     package: String,
@@ -2592,6 +2807,9 @@ async fn dump_kernsight_package_scoped(
     validate_package(&package)?;
     if relation.is_some() {
         require_parent_lifecycle_capability(&serial, paths).await?;
+    }
+    if scope.is_some_and(|s| s.runtime_copy_ms.is_some()) {
+        require_ready_clock_capability(&serial, paths).await?;
     }
     if scope.is_some_and(|s| s.code_only) {
         require_code_scope_capability(&serial, paths).await?;
@@ -2629,6 +2847,11 @@ async fn dump_kernsight_package_scoped(
         {
             return Err("设备 dump 不支持父子会话；未启动".into());
         }
+        if scope.is_some_and(|s| s.runtime_copy_ms.is_some())
+            && !help.stdout.contains("--runtime-copy-ms")
+        {
+            return Err("设备 Agent 不支持 ready 后完整复制时限（--runtime-copy-ms）；请先更新 Agent。未降级或缩短用户时长".into());
+        }
     }
     let prefix = if relation.is_some() {
         format!("test ! -e {remote} && mkdir -p {remote}")
@@ -2642,6 +2865,10 @@ async fn dump_kernsight_package_scoped(
         dump.push_str(&format!(" --parent-session {} --stage-id {} --stage-attempt {} --attempt-id {} --stage-key dump",r.parent_id,r.stage_id,r.attempt,r.attempt_id));
     }
     if let Some(s) = scope {
+        dump.push_str(&dump_policy::runtime_copy_argument(
+            s.runtime_copy_ms,
+            relation.is_some(),
+        )?);
         if relation.is_some() {
             let sources = s
                 .expected_code_sources
@@ -2690,7 +2917,7 @@ async fn dump_kernsight_package_scoped(
     let remote_shell = crate::root_shell_command(&dump);
     let mut command = Command::new("adb");
     command.args(["-s", &serial, "shell", &remote_shell]);
-    let output = session_deadline::output(&mut command, Duration::from_secs(600)).await?;
+    let output = session_deadline::output(&mut command, dump_command_timeout(scope)?).await?;
     let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
     let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
     if !output.status.success() && relation.is_none() {
@@ -3685,7 +3912,7 @@ fn collect_archive_files_scoped(
 }
 
 fn write_kernsight_evidence_archive(root: &Path, output: &Path) -> Result<(), String> {
-    archive_objects::write(root, output)
+    archive_objects::write_portable(root, output)
 }
 #[cfg(test)]
 fn write_kernsight_evidence_archive_v1(root: &Path, output: &Path) -> Result<(), String> {
@@ -3794,6 +4021,18 @@ pub fn export_kernsight_evidence_archive(
 }
 
 #[tauri::command]
+pub async fn export_kernsight_analysis_directory(
+    root: String,
+    output_path: String,
+) -> Result<String, String> {
+    tokio::task::spawn_blocking(move || {
+        analysis_export::export(Path::new(&root), Path::new(&output_path))
+    })
+    .await
+    .map_err(|e| format!("导出任务异常：{e}"))?
+}
+
+#[tauri::command]
 pub async fn import_kernsight_evidence_archive(
     path: String,
 ) -> Result<KernSightLocalEvidenceBundle, String> {
@@ -3822,6 +4061,9 @@ pub async fn import_kernsight_evidence_archive(
         .map_err(|error| format!("无法创建证据包缓存目录：{error}"))?;
     let mut total_bytes = 0u64;
     let mut manifest_valid = false;
+    let mut references: Option<Vec<Value>> = None;
+    let mut extracted = BTreeSet::new();
+    let mut archive_names = BTreeSet::new();
     for index in 0..archive.len() {
         let mut entry = archive
             .by_index(index)
@@ -3830,6 +4072,9 @@ pub async fn import_kernsight_evidence_archive(
             .enclosed_name()
             .ok_or("证据包包含不安全路径")?
             .to_path_buf();
+        if !archive_names.insert(enclosed.clone()) {
+            return Err("归档含重复路径，未覆盖已解压证据".into());
+        }
         total_bytes = total_bytes.saturating_add(entry.size());
         if total_bytes > MAX_EVIDENCE_ARCHIVE_BYTES {
             return Err("证据包解压大小超过 8 GiB 上限".into());
@@ -3838,13 +4083,16 @@ pub async fn import_kernsight_evidence_archive(
             let mut text = String::new();
             entry
                 .by_ref()
-                .take(1024 * 1024)
+                .take(archive_objects::REFERENCE_METADATA_LIMIT as u64 + 1)
                 .read_to_string(&mut text)
                 .map_err(|error| format!("无法读取证据包清单：{error}"))?;
             let manifest: Value =
                 serde_json::from_str(&text).map_err(|error| format!("证据包清单无效：{error}"))?;
             manifest_valid = manifest.get("schemaVersion").and_then(Value::as_str)
                 == Some(MOBILEE_EVIDENCE_SCHEMA);
+            if let Some(rows) = manifest.get("references") {
+                references = Some(rows.as_array().ok_or("归档路径引用不是数组")?.clone());
+            }
             continue;
         }
         let Ok(relative) = enclosed.strip_prefix("evidence") else {
@@ -3859,6 +4107,8 @@ pub async fn import_kernsight_evidence_archive(
                 .map_err(|error| format!("无法创建证据目录：{error}"))?;
             continue;
         }
+        validate_evidence_relative_path(&relative.to_string_lossy())?;
+        extracted.insert(relative.to_string_lossy().into_owned());
         if let Some(parent) = output.parent() {
             std::fs::create_dir_all(parent)
                 .map_err(|error| format!("无法创建证据目录：{error}"))?;
@@ -3878,6 +4128,26 @@ pub async fn import_kernsight_evidence_archive(
     if !manifest_valid {
         let _ = std::fs::remove_dir_all(&extraction_root);
         return Err("不是受支持的 MobileE KernSight 证据包".into());
+    }
+    if let Some(rows) = references {
+        let mut verified = BTreeSet::new();
+        for row in rows {
+            let path = row["path"].as_str().ok_or("归档引用缺少原始路径")?;
+            validate_evidence_relative_path(path)?;
+            if !verified.insert(path.to_owned()) || !extracted.contains(path) {
+                return Err("归档引用缺失或重复".into());
+            }
+            let n = row["bytes"].as_u64().ok_or("归档引用缺少长度")?;
+            let expected = row["sha256"].as_str().ok_or("归档引用缺少 SHA-256")?;
+            if archive_objects::digest_scoped(&evidence_root.join(path), n, &evidence_root)?
+                != expected
+            {
+                return Err(format!("归档原始文件 hash 不一致：{path}；原归档保留"));
+            }
+        }
+        if verified != extracted {
+            return Err("归档含未编目的原始文件".into());
+        }
     }
     import_kernsight_evidence_directory(evidence_root.to_string_lossy().into_owned()).await
 }
@@ -4144,7 +4414,7 @@ async fn pull_kernsight_package_evidence_with_plan(
     }
 
     if paths.is_some() || remote.starts_with("/data/local/tmp/ksight/captures/") {
-        let inventory = run_device_root_script(
+        let inventory = run_evidence_inventory(
             &serial,
             &format!(
                 "{} evidence-inventory --root {}",
@@ -4352,19 +4622,15 @@ async fn pull_kernsight_package_archive_at(
     if !output.is_absolute() {
         return Err("MobileE 证据包输出文件必须是绝对路径".into());
     }
-    // The save dialog already asks before replacing. A finished parent pull
-    // replaces that chosen archive instead of making the user invent a new name.
-    for path in [
-        output.clone(),
-        PathBuf::from(format!("{}.budget.json", output.display())),
-    ] {
-        if !path.exists() {
-            continue;
+    // The archive writer publishes by rename after all bytes verify. Never
+    // remove the user's previous archive while a new phone transfer can fail.
+    if let Ok(meta) = std::fs::symlink_metadata(&output) {
+        if !meta.is_file() || meta.file_type().is_symlink() {
+            return Err(format!(
+                "输出路径不是可替换的普通文件：{}",
+                output.display()
+            ));
         }
-        if !path.is_file() {
-            return Err(format!("输出路径不是可替换的文件：{}", path.display()));
-        }
-        std::fs::remove_file(&path).map_err(|error| format!("无法替换已有归档：{error}"))?;
     }
     if let Some(parent) = output.parent() {
         std::fs::create_dir_all(parent)
@@ -4860,6 +5126,9 @@ async fn pull_kernsight_package_archive_at(
             )?;
         }
     }
+    // This invocation has finished; the verified archive or preserved source
+    // reports its outcome. Do not leave an orphaned "in progress" marker.
+    let _ = std::fs::remove_file(&partial);
     result
 }
 
@@ -6102,6 +6371,28 @@ fn validate_parent_lifecycle_capability(code: Option<i32>, text: &str) -> Result
     // Code qualification is a separate feature. Its current refusal cannot block ordinary parent stages.
     Ok(())
 }
+fn validate_runtime_copy_clock_capability(code: Option<i32>, text: &str) -> Result<(), String> {
+    let note: Value = serde_json::from_str(text)
+        .map_err(|_| "Agent有效复制时钟能力未知；请更新Agent，未启动或缩短用户时长")?;
+    if code != Some(0)
+        || note["schema"] != "kernsight.code-capabilities/v1"
+        || note["runtime_copy_clock"] != "kernsight.runtime-copy-clock/v1"
+    {
+        return Err("Agent不支持ready后有效复制时钟；请更新Agent，未启动或缩短用户时长".into());
+    }
+    Ok(())
+}
+async fn require_ready_clock_capability(
+    serial: &str,
+    paths: Option<&runtime_paths::RuntimePaths>,
+) -> Result<(), String> {
+    let capability = run_device_root_script(
+        serial,
+        &runtime_paths::route(paths, &format!("{KSIGHT_AGENT} code-capabilities"))?,
+    )
+    .await?;
+    validate_runtime_copy_clock_capability(capability.code, &capability.stdout)
+}
 async fn require_runtime_paths(
     serial: &str,
     paths: Option<&runtime_paths::RuntimePaths>,
@@ -6157,6 +6448,17 @@ async fn require_code_scope_capability(
 #[cfg(test)]
 mod code_scope_gate_tests {
     use super::*;
+    #[test]
+    fn exact_copy_clock_refuses_missing_or_unknown_agent_marker() {
+        let current = serde_json::json!({"schema":"kernsight.code-capabilities/v1","runtime_copy_clock":"kernsight.runtime-copy-clock/v1"});
+        validate_runtime_copy_clock_capability(Some(0), &current.to_string()).unwrap();
+        for marker in [Value::Null, serde_json::json!("future-unknown/v2")] {
+            let mut old = current.clone();
+            old["runtime_copy_clock"] = marker;
+            assert!(validate_runtime_copy_clock_capability(Some(0), &old.to_string()).is_err());
+        }
+        assert!(validate_runtime_copy_clock_capability(Some(1), &current.to_string()).is_err());
+    }
     #[test]
     fn corrected_ordinary_parent_accepts_lifecycle_independent_of_code_gate_and_rejects_old_agent()
     {
@@ -6444,11 +6746,7 @@ async fn run_save_phase<T>(
 ) -> Result<T, String> {
     let deadline = group
         .and_then(|g| g.budget.as_ref())
-        .filter(|b| {
-            b.time_plan
-                .as_ref()
-                .is_some_and(|p| p.schema == "mobilee.session-time-plan/v5")
-        })
+        .filter(|b| b.time_plan.as_ref().is_some_and(|p| p.explicit()))
         .map(|b| b.phase_deadline(kind))
         .transpose()?;
     match deadline {
@@ -6469,7 +6767,7 @@ fn archive_output_limits_note(
         "archive_bytes":archive_cap,"import_bytes":import_cap,"max_ms":max_ms});
     let key = if budget
         .and_then(|b| b.time_plan.as_ref())
-        .is_some_and(|p| p.schema == "mobilee.session-time-plan/v5")
+        .is_some_and(|p| p.explicit())
     {
         "deadline_display_unix_ms"
     } else {
@@ -6560,7 +6858,7 @@ mod manual_time_v5_archive_clock {
                 .unwrap();
             assert_eq!(reference["sha256"], hash);
             let mut archived = Vec::new();
-            zip.by_name(&format!("objects/{hash}.bin"))
+            zip.by_name(&format!("evidence/{relative}"))
                 .unwrap()
                 .read_to_end(&mut archived)
                 .unwrap();

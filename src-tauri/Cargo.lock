@@ -1962,7 +1962,6 @@ dependencies = [
 [[package]]
 name = "ksight-core"
 version = "0.2.10"
-source = "git+https://github.com/swyiic/KernSight.git?tag=v0.2.10#6b0a244fb99ed738894dd48d4058356d4a3e7302"
 dependencies = [
  "flate2",
  "ksight-model",
@@ -2198,7 +2197,7 @@ dependencies = [
 
 [[package]]
 name = "mobilee"
-version = "2.2.2"
+version = "2.2.3"
 dependencies = [
  "base64 0.22.1",
  "ksight-core",

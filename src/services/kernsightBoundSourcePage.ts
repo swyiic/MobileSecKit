@@ -1,9 +1,36 @@
-import type { KernSightBoundSourcePage, KernSightRuntimeRangeInventoryEntry } from '@/types/monitoring'
+import type { KernSightBoundSourcePage, KernSightCandidateCoverage, KernSightRuntimeRangeInventoryEntry } from '@/types/monitoring'
 
 const object = (value: unknown): value is Record<string, any> => value !== null && typeof value === 'object' && !Array.isArray(value)
 const count = (value: unknown): value is number => Number.isSafeInteger(value) && Number(value) >= 0
 const hash = (value: unknown): value is string => typeof value === 'string' && /^[a-f0-9]{64}$/i.test(value)
 const array = (value: unknown): Record<string, any>[] => Array.isArray(value) ? value.filter(object) : []
+
+/** Producer metadata totals are separate from payload verification and execution. */
+export function candidateCoverageSummary(value: unknown): KernSightCandidateCoverage {
+  const unknown = (reason: string): KernSightCandidateCoverage => ({ status: 'unknown', reason, scope: 'initial_main_process_candidate_snapshot', metadataOnly: true })
+  if (!object(value)) return unknown('当前来源未提供可核实的初始候选统计')
+  if (value.status === 'unknown') return unknown(typeof value.reason === 'string' && value.reason ? value.reason : '候选清单缺失或关联未核实')
+  const fields = ['eligibleRanges', 'eligibleBytes', 'attemptedRanges', 'sourceShardCount', 'currentSourceRecords', 'globalAttemptedRanges', 'admittedRanges', 'admittedBytes', 'excludedRanges', 'rejectedRanges', 'unattemptedRanges', 'unattemptedBytes', 'remainingBytes']
+  if (value.status !== 'available' || value.scope !== 'initial_main_process_candidate_snapshot' || value.metadataOnly !== true
+      || typeof value.candidateManifest !== 'string' || !/^bound-candidates-[1-9]\d*-[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/i.test(value.candidateManifest)
+      || !fields.every(field => count(value[field]))
+      || value.sourceShardCount < 1 || value.globalAttemptedRanges !== value.attemptedRanges
+      || value.currentSourceRecords > value.attemptedRanges
+      || (value.sourceShardCount === 1 && value.currentSourceRecords !== value.attemptedRanges)
+      || value.eligibleRanges !== value.attemptedRanges + value.unattemptedRanges
+      || value.attemptedRanges !== value.admittedRanges + value.excludedRanges + value.rejectedRanges
+      || value.admittedBytes > value.eligibleBytes || value.remainingBytes !== value.eligibleBytes - value.admittedBytes
+      || value.unattemptedBytes > value.remainingBytes) return unknown('候选覆盖摘要字段或分项无法核实')
+  if (value.appInstall !== null) {
+    const install = value.appInstall
+    if (!object(install) || !['eligibleRanges', 'admittedRanges', 'remainingRanges', 'remainingBytes'].every(field => count(install[field]))
+        || install.eligibleRanges > value.eligibleRanges || install.admittedRanges > value.admittedRanges
+        || install.remainingRanges !== install.eligibleRanges - install.admittedRanges || install.remainingBytes > value.remainingBytes) {
+      return unknown('安装目录候选分项无法核实')
+    }
+  }
+  return value as KernSightCandidateCoverage
+}
 
 export function boundSourceReports(ledger?: Record<string, any>): string[] {
   return [...new Set([
@@ -30,7 +57,11 @@ export function validateBoundSourcePage(value: unknown, sourceReport: string, of
   if (value.nextOffset !== (end < value.totalRecords ? end : null) || (end < value.totalRecords && end === offset)) {
     throw new Error('原始范围页的后续位置无法核实')
   }
-  return value as KernSightBoundSourcePage
+  let coverage = candidateCoverageSummary(value.candidateCoverage)
+  if (coverage.status === 'available' && coverage.currentSourceRecords !== value.totalRecords) {
+    coverage = candidateCoverageSummary({ status: 'unknown', reason: '候选尝试总数与当前来源报告记录数不一致' })
+  }
+  return { ...value, candidateCoverage: coverage } as KernSightBoundSourcePage
 }
 
 function equal(left: unknown, right: unknown): boolean {

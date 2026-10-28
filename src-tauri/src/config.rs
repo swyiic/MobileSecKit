@@ -126,6 +126,11 @@ impl AppConfig {
         if self.ai_provider_base_url.trim().is_empty() {
             self.ai_provider_base_url = DEFAULT_PROVIDER_BASE_URL.into();
         }
+        if let Some(cli) =
+            crate::analyzer_tools::discover_jadx_cli(&self.jadx_path, &self.tool_directory)
+        {
+            self.jadx_path = cli.to_string_lossy().into_owned();
+        }
         Ok(self)
     }
 }
@@ -144,17 +149,74 @@ pub fn load_app_config(app: AppHandle) -> Result<AppConfig, String> {
                 return Ok(config);
             }
         }
-        let config = AppConfig::default();
+        let config = AppConfig::default().normalized()?;
         write_config(&path, &config)?;
         return Ok(config);
     }
 
     let content = fs::read_to_string(&path)
         .map_err(|error| format!("读取配置文件 {} 失败：{error}", path.display()))?;
-    let config = parse_ini(&content)?.normalized()?;
-    // Do not rewrite an existing file during startup: this keeps user comments and
-    // future/unknown sections intact. Normalized values are persisted on the next edit.
+    let parsed = parse_ini(&content)?;
+    let previous_jadx = parsed.jadx_path.clone();
+    let config = parsed.normalized()?;
+    if config.jadx_path != previous_jadx {
+        write_config_text(&path, &replace_jadx_setting(&content, &config.jadx_path))?;
+    }
     Ok(config)
+}
+
+fn replace_jadx_setting(content: &str, path: &str) -> String {
+    let mut lines = Vec::new();
+    let mut in_analyzer = false;
+    let mut written = false;
+    for line in content.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('[') && trimmed.ends_with(']') {
+            if in_analyzer && !written {
+                lines.push(format!("jadx_path={}", encode_value(path)));
+                written = true;
+            }
+            in_analyzer = trimmed == "[analyzer]";
+        }
+        if in_analyzer
+            && trimmed
+                .split_once('=')
+                .is_some_and(|(key, _)| key.trim() == "jadx_path")
+        {
+            lines.push(format!("jadx_path={}", encode_value(path)));
+            written = true;
+        } else {
+            lines.push(line.to_owned());
+        }
+    }
+    if !written {
+        if !in_analyzer {
+            lines.push("[analyzer]".into());
+        }
+        lines.push(format!("jadx_path={}", encode_value(path)));
+    }
+    lines.join("\n") + "\n"
+}
+
+#[cfg(test)]
+#[test]
+fn discovered_jadx_replaces_only_analyzer_key_and_preserves_other_sections() {
+    for input in [
+        "# keep\n[analyzer]\njadx_path=old.jar\nunknown=yes\n[other]\nvalue=keep\n",
+        "# keep\n[other]\nvalue=keep\n",
+    ] {
+        let migrated = replace_jadx_setting(input, "/opt/homebrew/bin/jadx");
+        assert!(migrated.contains("# keep\n"));
+        assert!(migrated.contains("[other]\nvalue=keep"));
+        assert_eq!(
+            parse_ini(&migrated).unwrap().jadx_path,
+            "/opt/homebrew/bin/jadx"
+        );
+        assert_eq!(
+            replace_jadx_setting(&migrated, "/opt/homebrew/bin/jadx"),
+            migrated
+        );
+    }
 }
 
 fn legacy_config_path(current: &Path) -> Option<PathBuf> {
@@ -188,6 +250,10 @@ fn config_path(app: &AppHandle) -> Result<PathBuf, String> {
 }
 
 fn write_config(path: &Path, config: &AppConfig) -> Result<(), String> {
+    write_config_text(path, &format_ini(config))
+}
+
+fn write_config_text(path: &Path, content: &str) -> Result<(), String> {
     if path.exists() {
         let metadata = fs::symlink_metadata(path)
             .map_err(|error| format!("检查配置文件 {} 失败：{error}", path.display()))?;
@@ -211,7 +277,7 @@ fn write_config(path: &Path, config: &AppConfig) -> Result<(), String> {
             .open(&temporary)
             .map_err(|error| format!("创建临时配置文件失败：{error}"))?;
         set_private_permissions(&file)?;
-        file.write_all(format_ini(config).as_bytes())
+        file.write_all(content.as_bytes())
             .map_err(|error| format!("写入配置文件失败：{error}"))?;
         file.sync_all()
             .map_err(|error| format!("同步配置文件失败：{error}"))?;

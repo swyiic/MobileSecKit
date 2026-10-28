@@ -157,7 +157,11 @@ pub(super) fn verify_local_object(
     if !metadata.is_file() || metadata.len() != expected {
         return Ok(false);
     }
+    let before = ObjectSnapshot::of(&metadata);
     let mut input = std::fs::File::open(source).map_err(|e| e.to_string())?;
+    if ObjectSnapshot::of(&input.metadata().map_err(|e| e.to_string())?) != before {
+        return Ok(false);
+    }
     let mut digest = Sha256::new();
     let mut count = 0_u64;
     let mut buffer = [0_u8; 65536];
@@ -176,7 +180,100 @@ pub(super) fn verify_local_object(
         digest.update(&buffer[..n]);
     }
     session_budget::charge(fence, 0).map_err(|e| e.to_string())?;
-    Ok(count == expected && format!("{:x}", digest.finalize()) == hash)
+    let after = std::fs::symlink_metadata(source).map_err(|e| e.to_string())?;
+    Ok(after.is_file()
+        && ObjectSnapshot::of(&after) == before
+        && ObjectSnapshot::of(&input.metadata().map_err(|e| e.to_string())?) == before
+        && count == expected
+        && format!("{:x}", digest.finalize()) == hash)
+}
+
+/// A hash can be reused only for the same, unchanged local inode. Content IDs
+/// alone do not authorize another file, and a replacement/same-size edit must
+/// undergo the full digest again. Unsupported platforms retain per-path hashing.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct ObjectSnapshot {
+    bytes: u64,
+    modified: Option<std::time::SystemTime>,
+    #[cfg(unix)]
+    identity: (u64, u64, i64, i64, u32),
+}
+impl ObjectSnapshot {
+    fn of(metadata: &std::fs::Metadata) -> Self {
+        #[cfg(unix)]
+        use std::os::unix::fs::MetadataExt;
+        Self {
+            bytes: metadata.len(),
+            modified: metadata.modified().ok(),
+            #[cfg(unix)]
+            identity: (
+                metadata.dev(),
+                metadata.ino(),
+                metadata.ctime(),
+                metadata.ctime_nsec(),
+                metadata.mode(),
+            ),
+        }
+    }
+}
+
+#[derive(Default)]
+struct FinalVerification {
+    #[cfg(unix)]
+    inodes: BTreeSet<(ObjectSnapshot, u64, String)>,
+    full_hashes: u64,
+    unchanged_inode_aliases: u64,
+}
+impl FinalVerification {
+    fn verify(&mut self, root: &Path, path: &Path, file: &Item) -> Result<bool, String> {
+        check_destination(root, path)?;
+        let metadata = std::fs::symlink_metadata(path).map_err(|e| e.to_string())?;
+        if !metadata.is_file() || metadata.len() != file.bytes {
+            return Ok(false);
+        }
+        let before = ObjectSnapshot::of(&metadata);
+        #[cfg(unix)]
+        let key = (before.clone(), file.bytes, file.hash.clone());
+        #[cfg(unix)]
+        if before.modified.is_some() && self.inodes.contains(&key) {
+            session_budget::charge(path, 0).map_err(|e| e.to_string())?;
+            let current = std::fs::symlink_metadata(path).map_err(|e| e.to_string())?;
+            if !current.is_file() || ObjectSnapshot::of(&current) != before {
+                return Ok(false);
+            }
+            self.unchanged_inode_aliases += 1;
+            return Ok(true);
+        }
+        self.full_hashes += 1;
+        if !verify_local_object(path, path, file.bytes, &file.hash)? {
+            return Ok(false);
+        }
+        let current = std::fs::symlink_metadata(path).map_err(|e| e.to_string())?;
+        if !current.is_file() || ObjectSnapshot::of(&current) != before {
+            return Ok(false);
+        }
+        #[cfg(unix)]
+        if before.modified.is_some() {
+            self.inodes.insert(key);
+        }
+        Ok(true)
+    }
+}
+
+/// Materialize aliases first, then validate every path. Linking before the final
+/// hash avoids re-reading source bytes merely to create a hard link. No receipt
+/// is published until each unique inode's SHA256 and every alias have passed.
+fn materialize_alias(root: &Path, source: &Path, path: &Path, bytes: u64) -> Result<(), String> {
+    check_destination(root, path)?;
+    let metadata = std::fs::symlink_metadata(source).map_err(|e| e.to_string())?;
+    if !metadata.is_file() || metadata.len() != bytes {
+        return Err("alias source is not the expected regular object".into());
+    }
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
+    std::fs::hard_link(source, path).map_err(|e| format!("alias publication failed: {e}"))?;
+    session_budget::charge(path, 0).map_err(|e| e.to_string())
 }
 
 async fn boundary<R: AsyncRead + Unpin>(reader: &mut R, expected: &str) -> Result<(), String> {
@@ -337,22 +434,23 @@ pub(super) async fn transfer(
             verified.insert((file.hash, file.bytes), root.join(file.path));
         }
     }
-    for file in items {
+    for file in &items {
         let path = root.join(&file.path);
         if path.exists() {
-            if !verify_local_object(&path, &path, file.bytes, &file.hash)? {
-                return Err("existing received path no longer matches its declared object".into());
-            }
             continue;
         }
         let prior = verified
             .get(&(file.hash.clone(), file.bytes))
             .ok_or("missing verified transfer object")?;
-        if !super::reuse_verified_transfer(prior, &path, file.bytes, &file.hash)? {
-            return Err("verified alias could not be retained".into());
+        materialize_alias(root, prior, &path, file.bytes)?;
+    }
+    let mut final_verification = FinalVerification::default();
+    for file in &items {
+        if !final_verification.verify(root, &root.join(&file.path), file)? {
+            return Err("existing received path no longer matches its declared object".into());
         }
     }
-    session_budget::write_json(root.join("batch-transfer-receipt.json"),&serde_json::json!({"schema":"mobilee.batch-transfer-receipt/v1","complete":true,"plannedPaths":rows.len(),"streamedUniqueObjects":streamed_objects,"streamedPayloadBytes":streamed_bytes,"adbStreamCommands":adb_batches,"elapsedMs":started.elapsed().as_millis(),"verification":"manifest paths; per-object exact length + SHA256 + framed boundary; finite output deadline; owned host child reaped"})).map_err(|e|e.to_string())?;
+    session_budget::write_json(root.join("batch-transfer-receipt.json"),&serde_json::json!({"schema":"mobilee.batch-transfer-receipt/v1","complete":true,"plannedPaths":rows.len(),"streamedUniqueObjects":streamed_objects,"streamedPayloadBytes":streamed_bytes,"adbStreamCommands":adb_batches,"elapsedMs":started.elapsed().as_millis(),"finalUniqueInodeHashes":final_verification.full_hashes,"unchangedInodeAliases":final_verification.unchanged_inode_aliases,"verification":"manifest paths; per-object exact length + SHA256 + framed boundary; final unique-inode SHA256 plus unchanged dev/inode/length/mtime/ctime for aliases; finite output deadline; owned host child reaped"})).map_err(|e|e.to_string())?;
     Ok(())
 }
 
@@ -539,6 +637,71 @@ mod tests {
         .await
         .is_err());
         assert_eq!(std::fs::read(&source).unwrap(), b"abcdef");
+        std::fs::remove_dir_all(root).unwrap();
+    }
+    #[cfg(unix)]
+    #[test]
+    fn final_hash_reuses_only_unchanged_inodes_and_rejects_same_size_alias_edits() {
+        let root = root();
+        let source = root.join("source");
+        std::fs::write(&source, b"abcdef").unwrap();
+        let alias = root.join("alias");
+        materialize_alias(&root, &source, &alias, 6).unwrap();
+        // Equal bytes in an independent inode must still get their own digest.
+        std::fs::write(root.join("copy"), b"abcdef").unwrap();
+        let mut validation = FinalVerification::default();
+        for name in ["source", "alias", "copy"] {
+            assert!(validation
+                .verify(&root, &root.join(name), &fixture(name, b"abcdef"))
+                .unwrap());
+        }
+        assert_eq!(validation.full_hashes, 2);
+        assert_eq!(validation.unchanged_inode_aliases, 1);
+        // Keep the same inode and length. An in-place write invalidates the stamp.
+        std::fs::write(&alias, b"edited").unwrap();
+        assert!(!validation
+            .verify(&root, &alias, &fixture("alias", b"abcdef"))
+            .unwrap());
+        assert_eq!(validation.full_hashes, 3);
+        assert_eq!(validation.unchanged_inode_aliases, 1);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+    #[cfg(unix)]
+    #[test]
+    fn final_hash_rejects_path_replacement_symlinks_and_expired_alias_fence() {
+        let root = root();
+        let source = root.join("source");
+        std::fs::write(&source, b"abcdef").unwrap();
+        let alias = root.join("alias");
+        materialize_alias(&root, &source, &alias, 6).unwrap();
+        let mut validation = FinalVerification::default();
+        assert!(validation
+            .verify(&root, &source, &fixture("source", b"abcdef"))
+            .unwrap());
+        std::fs::remove_file(&alias).unwrap();
+        std::fs::write(&alias, b"edited").unwrap();
+        assert!(!validation
+            .verify(&root, &alias, &fixture("alias", b"abcdef"))
+            .unwrap());
+        std::fs::remove_file(&alias).unwrap();
+        std::os::unix::fs::symlink(&source, &alias).unwrap();
+        assert!(validation
+            .verify(&root, &alias, &fixture("alias", b"abcdef"))
+            .is_err());
+        std::fs::remove_file(&alias).unwrap();
+        materialize_alias(&root, &source, &alias, 6).unwrap();
+        // Cache the post-link ctime, then ensure even a cache hit observes expiry.
+        assert!(validation
+            .verify(&root, &source, &fixture("source", b"abcdef"))
+            .unwrap());
+        let guard = session_budget::Guard::install(vec![root.clone()], 64, 1).unwrap();
+        std::thread::sleep(Duration::from_millis(10));
+        assert!(validation
+            .verify(&root, &alias, &fixture("alias", b"abcdef"))
+            .is_err());
+        assert!(guard.receipt().partial);
+        drop(guard);
+        assert_eq!(std::fs::read(source).unwrap(), b"abcdef");
         std::fs::remove_dir_all(root).unwrap();
     }
     #[tokio::test]

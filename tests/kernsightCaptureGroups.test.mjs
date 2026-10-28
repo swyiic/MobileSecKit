@@ -49,14 +49,15 @@ test('trashed parent references continue to suppress children from the legacy de
  assert.deepEqual(['child-old','child-new','child-b','legacy'].filter(id=>!known.has(id)),['legacy'])
  assert.equal(archived.stages[0].attempts.length,2)
 })
-test('UI loads local parents independently of device handshake and exposes a recoverable confirmation', () => {
+test('UI loads parents independently and offers one-click family deletion', () => {
  const vue = readFileSync(new URL('../src/views/AndroidRuntimeMonitorView.vue',import.meta.url),'utf8')
  const remote = vue.slice(vue.indexOf('async function loadKernSight()'),vue.indexOf('async function importLocalEvidence()'))
  assert.match(remote,/void loadLocalCaptureGroups\(\)/)
  assert.doesNotMatch(remote,/captureGroups\.value\s*=/)
- assert.match(vue,/确认移入回收站/)
+ assert.match(vue,/@click="deleteCaptureGroup\(group\)"/)
+ assert.doesNotMatch(vue,/确认移入回收站/)
  assert.match(vue,/恢复主会话/)
- assert.match(vue,/不会释放设备或本地空间/)
+ assert.match(vue,/后台清理本地与手机文件/)
 })
 
 test('legacy rows require loaded ownership and expose viewing without destructive cleanup', () => {
@@ -66,7 +67,7 @@ test('legacy rows require loaded ownership and expose viewing without destructiv
  assert.match(vue,/缺少父会话归属，需先核对所有权；不会执行删除/)
  assert.doesNotMatch(vue,/confirmDeleteDeviceSession|armDeleteDeviceSession|cleanupKernSightSession/)
  assert.match(vue,/@click="loadSessionReport\(session.session_id\)"/)
- const load = vue.slice(vue.indexOf('async function loadLocalCaptureGroups('),vue.indexOf('function canTrashCaptureGroup('))
+ const load = vue.slice(vue.indexOf('async function loadLocalCaptureGroups('),vue.indexOf('async function deleteCaptureGroup('))
  assert.match(load,/localOwnershipConfirmed.value = false/)
  assert.match(load,/localOwnershipConfirmed.value = true/)
 })

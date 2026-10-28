@@ -1,6 +1,6 @@
 [package]
 name = "mobilee"
-version = "2.2.2"
+version = "2.2.3"
 description = "Local Android and iOS mobile security assessment workbench"
 authors = ["swyiic"]
 edition = "2021"
@@ -36,3 +36,7 @@ ksight-model = { git = "https://github.com/swyiic/KernSight.git", tag = "v0.2.10
 ksight-protocol = { git = "https://github.com/swyiic/KernSight.git", tag = "v0.2.10" }
 uuid = { version = "1", features = ["v4", "serde"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+
+# Pinned v0.2.10 with the UTF-8 report fix; no sibling checkout required.
+[patch."https://github.com/swyiic/KernSight.git"]
+ksight-core = { path = "vendor/ksight-core" }

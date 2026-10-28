@@ -466,7 +466,7 @@ fn chosen_group(
     local::ensure_purge_candidate(&g)?;
     Ok(g)
 }
-fn check_shared_ownership(
+pub(super) fn check_shared_ownership(
     root: &Path,
     g: &Group,
     sources: &[String],
@@ -518,6 +518,11 @@ fn check_shared_ownership(
             return Err("子 session 仍被其他回收站父会话引用".into());
         }
         for foreign in entry.imported_roots {
+            if entry.deletion.as_ref().is_some_and(|d| d.local_done)
+                && !Path::new(&foreign).exists()
+            {
+                continue;
+            }
             let foreign = local::safe_path(Path::new(&foreign))?;
             let foreign = foreign.as_path();
             if selected_sources

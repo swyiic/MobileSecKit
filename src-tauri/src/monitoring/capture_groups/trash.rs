@@ -16,6 +16,8 @@ pub struct TrashEntry {
     #[serde(default)]
     pub retained_session_ids: Vec<Uuid>,
     pub imported_roots: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deletion: Option<super::delete::Progress>,
 }
 
 fn default_trashed() -> bool {
@@ -73,7 +75,7 @@ fn ensure_inactive(group: &Group) -> Result<(), String> {
     Ok(())
 }
 
-fn write_entry(root: &Path, entry: &TrashEntry) -> Result<(), String> {
+pub(super) fn write_entry(root: &Path, entry: &TrashEntry) -> Result<(), String> {
     let bytes = serde_json::to_vec_pretty(entry).map_err(|e| e.to_string())?;
     if bytes.len() > 2 * 1024 * 1024 {
         return Err("回收站记录过大".into());
@@ -113,7 +115,7 @@ fn write_entry(root: &Path, entry: &TrashEntry) -> Result<(), String> {
     result
 }
 
-fn trash_at(
+pub(super) fn trash_at(
     root: &Path,
     parent_id: Uuid,
     imported_roots: Vec<String>,
@@ -162,6 +164,7 @@ fn trash_at(
         trashed: true,
         retained_session_ids: vec![],
         imported_roots: vec![],
+        deletion: None,
     };
     if trash_path(root, parent_id)
         .try_exists()
@@ -172,6 +175,9 @@ fn trash_at(
             || previous.group.package != entry.group.package
         {
             return Err("回收站主会话身份冲突".into());
+        }
+        if previous.deletion.is_some() {
+            return Ok(previous);
         }
         retained_sessions.extend(previous.group.session_ids());
         retained_sessions.extend(previous.retained_session_ids);
@@ -219,6 +225,9 @@ pub(super) fn list_at(root: &Path) -> Result<Vec<TrashEntry>, String> {
 fn restore_at(root: &Path, parent_id: Uuid) -> Result<TrashEntry, String> {
     purge::ensure_not_purging(root, parent_id)?;
     let mut entry = read_entry(root, parent_id)?;
+    if entry.deletion.is_some() {
+        return Err("会话已请求永久删除，不能恢复".into());
+    }
     if entry.managed && !path(root, parent_id).is_file() {
         return Err("原主会话清单已在应用外移走，请先找回原清单；回收站记录已保留".into());
     }
@@ -241,8 +250,17 @@ pub fn trash_kernsight_group(
 
 #[tauri::command]
 pub fn list_kernsight_group_trash(app: tauri::AppHandle) -> Result<Vec<TrashEntry>, String> {
-    let _guard = IO_LOCK.lock().map_err(|e| e.to_string())?;
-    list_at(&root(&app)?)
+    let directory = root(&app)?;
+    let entries = {
+        let _guard = IO_LOCK.lock().map_err(|e| e.to_string())?;
+        list_at(&directory)?
+    };
+    for entry in &entries {
+        if entry.deletion.as_ref().is_some_and(|d| !d.complete()) {
+            super::delete::schedule(directory.clone(), entry.group.id);
+        }
+    }
+    Ok(entries)
 }
 
 #[tauri::command]

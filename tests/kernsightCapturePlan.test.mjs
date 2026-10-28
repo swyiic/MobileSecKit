@@ -9,7 +9,7 @@ const source = readFileSync(new URL('../src/services/kernsightCapturePlan.ts', i
 const compiled = ts.transpileModule(source, {
   compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.ES2022 },
 }).outputText
-const { captureTimeAllocation, buildAutoCaptureStages, runAutoCapturePlan, runUnifiedCapturePlan, buildUnifiedStageSpec, captureIPCCommand, captureCodeOnlyChoice, startupEvidenceLabel, qualifiedSourceLabel, captureGroupIPC } =
+const { automaticTimingPreset, captureByteAllocation, captureTimeAllocation, effectiveCopyTimeAllocation, buildAutoCaptureStages, runAutoCapturePlan, runUnifiedCapturePlan, buildUnifiedStageSpec, captureIPCCommand, captureCodeOnlyChoice, startupEvidenceLabel, qualifiedSourceLabel, captureGroupIPC } =
   await import(`data:text/javascript;base64,${Buffer.from(compiled).toString('base64')}`)
 
 const base = {
@@ -20,6 +20,55 @@ const base = {
   hideDebug: false, sampleOneIn: 1, inspectMaxBytes: 65536, inspectMaxHits: 0,
 }
 const durations = { l0: 15, l1: 90, linker: 15 }
+
+test('automatic presets preserve full copy and observation windows within independent save limits', () => {
+  for (const [profile, seconds] of [['quick', 60], ['standard', 120], ['extended', 300]]) {
+    const p = automaticTimingPreset(profile)
+    const d = { l0: p.autoL0Seconds, l1: p.autoL1Seconds, linker: p.autoLinkerSeconds }
+    assert.equal(d.l0 + d.l1 + d.linker, seconds)
+    for (const separate of [true, false]) {
+      assert.equal(effectiveCopyTimeAllocation(d, p.captureMaxSeconds, p.l2MaxSeconds, separate).valid, true)
+    }
+    assert.equal(p.l2MaxSeconds, 180, 'speed presets do not silently truncate copy coverage')
+    assert.equal(p.maxSessionSeconds, p.captureMaxSeconds + p.transferMaxSeconds + p.archiveMaxSeconds + p.importMaxSeconds + 5)
+    assert.ok(p.maxSessionSeconds <= 3600)
+  }
+})
+
+test('v6 reserves complete ready-time observation and copy budgets inside a separate hard protection limit',()=>{
+  const original={l0:25,l1:30,linker:20}
+  const plan=effectiveCopyTimeAllocation(original,600,180,true)
+  assert.equal(plan.schema,'mobilee.session-time-plan/v6')
+  assert.deepEqual(plan.producer.map(phase=>phase.seconds),[80,85,75])
+  assert.equal(plan.producerSeconds,240)
+  assert.equal(plan.copySeconds,180)
+  assert.equal(plan.dumpHardSeconds,250)
+  assert.deepEqual([plan.preparationSeconds,plan.agentCloseoutSeconds,plan.hostCloseoutSeconds],[20,40,10])
+  assert.deepEqual([plan.observationPreparationSeconds,plan.observationCloseoutSeconds,plan.observationHostSeconds],[30,15,10])
+  assert.equal(plan.minimumCaptureSeconds,490)
+  assert.equal(plan.valid,true)
+  assert.equal(effectiveCopyTimeAllocation(original,490,180,true).valid,true)
+  const tooShort=effectiveCopyTimeAllocation(original,489,180,true)
+  assert.equal(tooShort.valid,false)
+  assert.equal(tooShort.copySeconds,180,'the configured effective copy budget is never clipped')
+  assert.deepEqual(tooShort.producer.map(phase=>phase.seconds),[80,85,75])
+  assert.equal(effectiveCopyTimeAllocation(original,360,180,true).valid,false,'custom legacy-sized limits require explicit correction')
+  assert.deepEqual(original,{l0:25,l1:30,linker:20})
+})
+
+test('v6 unified observations reserve three ready-time allowances and invalid budgets never become shortened windows',()=>{
+  const plan=effectiveCopyTimeAllocation({l0:25,l1:30,linker:20},490,180,false)
+  assert.deepEqual(plan.producer,[{key:'统一 session',seconds:240}])
+  assert.equal(plan.minimumCaptureSeconds,490)
+  assert.equal(plan.valid,true)
+  for(const [capture,copy] of [[29,180],[NaN,180],[600,0],[600,1.5],[600,Infinity]]) {
+    assert.throws(()=>effectiveCopyTimeAllocation({l0:25,l1:30,linker:20},capture,copy,true))
+  }
+  const impossible=effectiveCopyTimeAllocation({l0:25,l1:30,linker:20},3600,3600,true)
+  assert.equal(impossible.valid,false)
+  assert.equal(impossible.copySeconds,3600)
+  assert.equal(impossible.dumpHardSeconds,3670)
+})
 function fixture(failAt = '', failure = 'exit') {
   const calls = [], receipts = [], starts = []
   const backend = {
@@ -318,4 +367,17 @@ test('actual native gateway rejects unsupported explicit timing without fallback
     assert.deepEqual(supported[0].args.request.saveTime,timing.saveTime)
     assert.equal(supported[0].args.request.sessionBudget.maxSeconds,195)
   }finally{delete globalThis.__timedCaptureInvoke}
+})
+
+
+test('byte plan exposes payload capacity separately from cumulative writes', () => {
+  const small = captureByteAllocation(8192, true)
+  assert.equal(small.eachExport, 2048 * 1048576)
+  assert.equal(small.linker, 8 * 1048576)
+  assert.equal(small.dumpUpperBound, 1955 * 1048576)
+  assert.ok(small.dumpUpperBound + small.eachExport * 3 + small.linker + 2 * 1048576 <= small.total)
+  const large = captureByteAllocation(16384, true)
+  assert.ok(large.dumpUpperBound > small.dumpUpperBound)
+  assert.equal(captureByteAllocation(NaN, true), null)
+  assert.equal(captureByteAllocation(20000, false), null)
 })

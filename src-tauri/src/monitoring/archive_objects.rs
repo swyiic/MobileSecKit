@@ -15,7 +15,11 @@ struct Reference {
 fn digest(path: &Path, expected: u64) -> Result<String, String> {
     digest_scoped(path, expected, path)
 }
-fn digest_scoped(path: &Path, expected: u64, checkpoint: &Path) -> Result<String, String> {
+pub(super) fn digest_scoped(
+    path: &Path,
+    expected: u64,
+    checkpoint: &Path,
+) -> Result<String, String> {
     session_budget::charge(checkpoint, 0).map_err(|e| e.to_string())?;
     let mut source = session_budget::CheckedReader::new(
         File::open(path).map_err(|e| format!("读取失败 {}: {e}", path.display()))?,
@@ -63,15 +67,55 @@ fn equal_scoped(a: &Path, b: &Path, checkpoint: &Path) -> Result<bool, String> {
     }
 }
 pub(super) fn write(root: &Path, output: &Path) -> Result<(), String> {
-    write_scoped(root, output, false)
+    write_scoped(root, output, false, false)
+}
+pub(super) fn write_portable(root: &Path, output: &Path) -> Result<(), String> {
+    write_scoped(root, output, false, true)
 }
 pub(super) fn write_local_retained(root: &Path, output: &Path) -> Result<(), String> {
-    write_scoped(root, output, true)
+    write_scoped(root, output, true, true)
 }
-fn write_scoped(root: &Path, output: &Path, offline_retained: bool) -> Result<(), String> {
+fn resolved_output_path(output: &Path) -> Result<PathBuf, String> {
+    let absolute = if output.is_absolute() {
+        output.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .map_err(|e| e.to_string())?
+            .join(output)
+    };
+    let mut ancestor = absolute.parent().ok_or("归档输出缺少父目录")?;
+    let mut missing = Vec::new();
+    loop {
+        match std::fs::symlink_metadata(ancestor) {
+            Ok(_) => break,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                missing.push(ancestor.file_name().ok_or("归档输出目录无效")?.to_owned());
+                ancestor = ancestor.parent().ok_or("归档输出目录无效")?;
+            }
+            Err(error) => return Err(error.to_string()),
+        }
+    }
+    let mut resolved = ancestor.canonicalize().map_err(|e| e.to_string())?;
+    for component in missing.into_iter().rev() {
+        resolved.push(component);
+    }
+    resolved.push(absolute.file_name().ok_or("归档输出文件名无效")?);
+    Ok(resolved)
+}
+fn write_scoped(
+    root: &Path,
+    output: &Path,
+    offline_retained: bool,
+    portable: bool,
+) -> Result<(), String> {
     session_budget::charge(output, 0).map_err(|e| e.to_string())?;
-    if output.exists() {
+    if output.exists() && !portable {
         return Err("输出归档已存在；保留原件，请使用新路径或只读导入复用".into());
+    }
+    if let Ok(meta) = std::fs::symlink_metadata(output) {
+        if !meta.is_file() || meta.file_type().is_symlink() {
+            return Err("输出必须是普通文件；未替换旧归档".into());
+        }
     }
     if std::fs::symlink_metadata(root)
         .map_err(|e| e.to_string())?
@@ -79,6 +123,10 @@ fn write_scoped(root: &Path, output: &Path, offline_retained: bool) -> Result<()
         .is_symlink()
     {
         return Err("引用归档根是符号链接，拒绝读取".into());
+    }
+    let canonical_root = root.canonicalize().map_err(|e| e.to_string())?;
+    if resolved_output_path(output)?.starts_with(&canonical_root) {
+        return Err("归档输出不能位于证据目录内；请选择独立位置，原始证据未修改".into());
     }
     let limits_path = root.join("archive-output-limits.json");
     let mut limits: Option<Value> = if limits_path.is_file() {
@@ -96,7 +144,11 @@ fn write_scoped(root: &Path, output: &Path, offline_retained: bool) -> Result<()
                 .ok_or("归档限额必须为对象")?
                 .remove("deadline_unix_ms");
             note["scope"] = json!("explicit_offline_retained_evidence_export_not_capture_resume");
-            note["max_ms"] = json!(note["max_ms"].as_u64().ok_or("缺归档期限")?.min(30000));
+            note["source_capture_archive_bytes"] = note["archive_bytes"].clone();
+            note["max_ms"] = json!(note["max_ms"]
+                .as_u64()
+                .ok_or("缺归档期限")?
+                .clamp(120_000, 900_000));
         }
     }
     let _guard = limits
@@ -169,7 +221,7 @@ fn write_scoped(root: &Path, output: &Path, offline_retained: bool) -> Result<()
                 == "partial";
     session_budget::charge(output, 0).map_err(|e| e.to_string())?;
     let coverage = json!({"status":if partial {"partial"} else {"unknown"},"scope":"all retained paths only; missing producer/transport bytes are not in this archive","complete_collection":false,"hash_verification_scope":"every archived object and path reference; not process or application coverage"});
-    let manifest = serde_json::json!({"schemaVersion":SCHEMA,"package":package,"dumpId":report["dump_id"],"fileCount":refs.len(),"uncompressedBytes":refs.iter().map(|r|r.bytes).sum::<u64>(),"objectCount":objects.len(),"objectBytes":objects.values().map(|(_,n)|n).sum::<u64>(),"storageRepresentation":"full-sha256-objects-and-path-references/v1","references":refs,"outputLimits":limits,"coverage":coverage});
+    let manifest = serde_json::json!({"schemaVersion":if portable {MOBILEE_EVIDENCE_SCHEMA} else {SCHEMA},"package":package,"dumpId":report["dump_id"],"fileCount":refs.len(),"uncompressedBytes":refs.iter().map(|r|r.bytes).sum::<u64>(),"objectCount":objects.len(),"objectBytes":objects.values().map(|(_,n)|n).sum::<u64>(),"storageRepresentation":if portable {"expanded-logical-files/v1"} else {"full-sha256-objects-and-path-references/v1"},"references":refs,"outputLimits":limits,"coverage":coverage});
     let metadata_bytes =
         session_budget::measure_json(output, &manifest).map_err(|e| e.to_string())?;
     if metadata_bytes > REFERENCE_METADATA_LIMIT {
@@ -192,45 +244,106 @@ fn write_scoped(root: &Path, output: &Path, offline_retained: bool) -> Result<()
     if temporary.exists() {
         return Err("归档临时输出已存在，保留旧证据，请用新输出路径".into());
     }
-    // Select Stored for partial evidence only when the full unique content and
-    // conservative ZIP write overhead fit a known remaining quota. Coverage and
-    // per-write enforcement remain independent of this representation choice.
+    // Portable ZIPs write every logical alias, while v2 writes unique objects.
+    // Include the actual entry names and conservative charged-write overhead;
+    // coverage and per-write enforcement do not depend on compression choice.
     let remaining = _guard.as_ref().map(|guard| {
         let receipt = guard.receipt();
         receipt
             .limit_bytes
             .saturating_sub(receipt.admitted_write_bytes)
     });
-    let object_bytes = objects
-        .values()
-        .try_fold(0u64, |sum, (_, n)| sum.checked_add(*n));
-    let names = std::iter::once("manifest.json".len() as u64).chain(
+    let stored_bound = if portable {
+        refs.iter()
+            .try_fold(0u64, |sum, reference| sum.checked_add(reference.bytes))
+            .and_then(|n| {
+                stored_write_bound(
+                    n,
+                    bytes.len() as u64,
+                    std::iter::once("manifest.json".len() as u64).chain(
+                        refs.iter()
+                            .map(|r| ("evidence/".len() + r.path.len()) as u64),
+                    ),
+                )
+            })
+    } else {
         objects
-            .keys()
-            .map(|hash| ("objects/".len() + hash.len() + ".bin".len()) as u64),
-    );
-    let stored_bound = object_bytes.and_then(|n| stored_write_bound(n, bytes.len() as u64, names));
+            .values()
+            .try_fold(0u64, |sum, (_, n)| sum.checked_add(*n))
+            .and_then(|n| {
+                stored_write_bound(
+                    n,
+                    bytes.len() as u64,
+                    std::iter::once("manifest.json".len() as u64).chain(
+                        objects
+                            .keys()
+                            .map(|hash| ("objects/".len() + hash.len() + ".bin".len()) as u64),
+                    ),
+                )
+            })
+    };
     let stored_fits = remaining
         .zip(stored_bound)
         .is_some_and(|(quota, bound)| bound <= quota);
+    let mut published = false;
     let result = (|| {
         let mut writer = ZipWriter::new(
             session_budget::BudgetFile::create(&temporary).map_err(|e| e.to_string())?,
         );
-        let options = SimpleFileOptions::default()
-            .compression_method(if !partial || stored_fits {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&temporary, std::fs::Permissions::from_mode(0o600))
+                .map_err(|e| e.to_string())?;
+        }
+        let compression = if portable {
+            if stored_fits || (remaining.is_none() && stored_bound.is_some()) {
                 zip::CompressionMethod::Stored
             } else {
                 zip::CompressionMethod::Deflated
-            })
+            }
+        } else if !partial || stored_fits {
+            zip::CompressionMethod::Stored
+        } else {
+            zip::CompressionMethod::Deflated
+        };
+        let options = SimpleFileOptions::default()
+            .compression_method(compression)
+            .compression_level(
+                if portable && compression == zip::CompressionMethod::Deflated {
+                    Some(1)
+                } else {
+                    None
+                },
+            )
             .unix_permissions(0o600);
         writer
             .start_file("manifest.json", options)
             .map_err(|e| e.to_string())?;
         writer.write_all(&bytes).map_err(|e| e.to_string())?;
-        for (hash, (path, expected)) in objects {
+        let entries: Vec<_> = if portable {
+            refs.iter()
+                .map(|r| {
+                    (
+                        r.sha256.clone(),
+                        root.join(&r.path),
+                        r.bytes,
+                        format!("evidence/{}", r.path),
+                    )
+                })
+                .collect()
+        } else {
+            objects
+                .into_iter()
+                .map(|(hash, (path, n))| {
+                    let entry = format!("objects/{hash}.bin");
+                    (hash, path, n, entry)
+                })
+                .collect()
+        };
+        for (hash, path, expected, entry_name) in entries {
             writer
-                .start_file(format!("objects/{hash}.bin"), options)
+                .start_file(entry_name, options)
                 .map_err(|e| e.to_string())?;
             let mut source = session_budget::CheckedReader::new(
                 File::open(path).map_err(|e| format!("归档源读取失败：{e}"))?,
@@ -263,6 +376,7 @@ fn write_scoped(root: &Path, output: &Path, offline_retained: bool) -> Result<()
         file.sync_all().map_err(|e| e.to_string())?;
         session_budget::charge(output, 0).map_err(|e| e.to_string())?;
         std::fs::rename(&temporary, output).map_err(|e| format!("归档发布到本地路径失败：{e}"))?;
+        published = true;
         // A single rename can cross the boundary. Keep its complete output but
         // reject an in-budget phase success; never remove the final archive.
         session_budget::charge(output, 0).map_err(|e| e.to_string())?;
@@ -271,7 +385,10 @@ fn write_scoped(root: &Path, output: &Path, offline_retained: bool) -> Result<()
     if let Some(g) = _guard.as_ref() {
         let note = serde_json::to_vec(&g.receipt()).map_err(|e| e.to_string())?;
         std::fs::write(
-            PathBuf::from(format!("{}.budget.json", output.display())),
+            PathBuf::from(format!(
+                "{}.budget.json",
+                if published { output } else { &temporary }.display()
+            )),
             note,
         )
         .map_err(|e| e.to_string())?;
@@ -305,10 +422,203 @@ pub(super) fn is_v2(path: &Path) -> Result<bool, String> {
     session_budget::charge(path, 0).map_err(|e| e.to_string())?;
     Ok(value["schemaVersion"] == SCHEMA)
 }
+
+#[cfg(test)]
+mod portable_tests {
+    use super::*;
+    #[test]
+    fn output_inside_source_never_replaces_or_adds_evidence() {
+        let base = std::env::temp_dir().join(format!("me-portable-overlap-{}", Uuid::new_v4()));
+        let root = base.join("source");
+        std::fs::create_dir_all(root.join("apk-dex")).unwrap();
+        std::fs::write(
+            root.join("dump-report.json"),
+            br#"{"package":"org.example.portable","dump_id":"fixture"}"#,
+        )
+        .unwrap();
+        let source = root.join("apk-dex/classes.dex");
+        let original = b"dex\n035\0original-evidence";
+        std::fs::write(&source, original).unwrap();
+        assert!(write_portable(&root, &source)
+            .unwrap_err()
+            .contains("证据目录内"));
+        assert_eq!(std::fs::read(&source).unwrap(), original);
+        let nested = root.join("new-output/nested/export.mee");
+        assert!(write_portable(&root, &nested).is_err());
+        assert!(!root.join("new-output").exists());
+        assert!(!source.with_extension("dex.part").exists());
+        #[cfg(unix)]
+        {
+            let alias = base.join("source-alias");
+            std::os::unix::fs::symlink(&root, &alias).unwrap();
+            assert!(write_portable(&root, &alias.join("export.mee")).is_err());
+            assert!(!root.join("export.mee").exists());
+        }
+        assert_eq!(collect_archive_files(&root).unwrap().len(), 2);
+        std::fs::remove_dir_all(base).unwrap();
+    }
+    #[tokio::test]
+    async fn ordinary_unzip_paths_and_me_import_keep_original_bytes() {
+        let base = std::env::temp_dir().join(format!("me-portable-{}", Uuid::new_v4()));
+        let root = base.join("source");
+        std::fs::create_dir_all(root.join("apk-dex")).unwrap();
+        std::fs::create_dir_all(root.join("lib")).unwrap();
+        std::fs::write(
+            root.join("dump-report.json"),
+            br#"{"package":"org.example.portable","dump_id":"fixture"}"#,
+        )
+        .unwrap();
+        std::fs::write(root.join("apk-dex/classes.dex"), b"dex\n035\0fixture").unwrap();
+        std::fs::write(root.join("lib/libfixture.so"), b"\x7fELFfixture").unwrap();
+        let output = base.join("fixture.mee");
+        write_portable(&root, &output).unwrap();
+        assert!(!is_v2(&output).unwrap());
+        let mut zip = ZipArchive::new(File::open(&output).unwrap()).unwrap();
+        for (name, original) in [
+            ("evidence/apk-dex/classes.dex", &b"dex\n035\0fixture"[..]),
+            ("evidence/lib/libfixture.so", &b"\x7fELFfixture"[..]),
+        ] {
+            let mut entry = zip.by_name(name).unwrap();
+            assert_eq!(entry.compression(), zip::CompressionMethod::Stored);
+            let mut content = Vec::new();
+            entry.read_to_end(&mut content).unwrap();
+            assert_eq!(content, original);
+        }
+        assert!(!zip.file_names().any(|p| p.starts_with("objects/")));
+        drop(zip);
+        let bundle = import_kernsight_evidence_archive(output.to_string_lossy().into_owned())
+            .await
+            .unwrap();
+        assert_eq!(
+            std::fs::read(Path::new(&bundle.root).join("apk-dex/classes.dex")).unwrap(),
+            b"dex\n035\0fixture"
+        );
+        let previous = std::fs::read(&output).unwrap();
+        std::fs::rename(
+            root.join("dump-report.json"),
+            root.join("missing-report.json"),
+        )
+        .unwrap();
+        assert!(write_portable(&root, &output).is_err());
+        assert_eq!(std::fs::read(&output).unwrap(), previous);
+        std::fs::rename(
+            root.join("missing-report.json"),
+            root.join("dump-report.json"),
+        )
+        .unwrap();
+        write_portable(&root, &output).unwrap();
+        std::fs::remove_dir_all(base).unwrap();
+        std::fs::remove_dir_all(Path::new(&bundle.root).parent().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn expanded_aliases_use_deflate_when_only_unique_content_fits_quota() {
+        let base = std::env::temp_dir().join(format!("me-portable-alias-quota-{}", Uuid::new_v4()));
+        let root = base.join("source");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("dump-report.json"),
+            br#"{"package":"org.example.portable","dump_id":"fixture","collection_status":"partial"}"#).unwrap();
+        let cap = 512 * 1024;
+        std::fs::write(
+            root.join("archive-output-limits.json"),
+            serde_json::to_vec(&json!({"archive_bytes":cap,"max_ms":10000})).unwrap(),
+        )
+        .unwrap();
+        let payload = vec![0_u8; 256 * 1024];
+        for name in ["one.bin", "two.bin", "three.bin"] {
+            std::fs::write(root.join(name), &payload).unwrap();
+        }
+        let output = base.join("fixture.mee");
+        write_portable(&root, &output).unwrap();
+        let mut zip = ZipArchive::new(File::open(&output).unwrap()).unwrap();
+        for index in 0..zip.len() {
+            assert_eq!(
+                zip.by_index(index).unwrap().compression(),
+                zip::CompressionMethod::Deflated
+            );
+        }
+        for name in ["one.bin", "two.bin", "three.bin"] {
+            let mut content = Vec::new();
+            zip.by_name(&format!("evidence/{name}"))
+                .unwrap()
+                .read_to_end(&mut content)
+                .unwrap();
+            assert_eq!(content, payload);
+        }
+        let mut text = String::new();
+        zip.by_name("manifest.json")
+            .unwrap()
+            .read_to_string(&mut text)
+            .unwrap();
+        let manifest: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(manifest["coverage"]["status"], "partial");
+        let references = manifest["references"].as_array().unwrap();
+        let names = || {
+            std::iter::once("manifest.json".len() as u64).chain(
+                references
+                    .iter()
+                    .map(|r| ("evidence/".len() + r["path"].as_str().unwrap().len()) as u64),
+            )
+        };
+        let quota = cap - 65536;
+        assert!(
+            stored_write_bound(
+                manifest["objectBytes"].as_u64().unwrap(),
+                text.len() as u64,
+                names()
+            )
+            .unwrap()
+                <= quota
+        );
+        assert!(
+            stored_write_bound(
+                manifest["uncompressedBytes"].as_u64().unwrap(),
+                text.len() as u64,
+                names()
+            )
+            .unwrap()
+                > quota
+        );
+        let receipt: Value = serde_json::from_slice(
+            &std::fs::read(format!("{}.budget.json", output.display())).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(receipt["partial"], false);
+        assert!(receipt["admitted_write_bytes"].as_u64().unwrap() <= quota);
+        drop(zip);
+        std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore = "explicit retained archive import/export only; never launches or captures an App"]
+    async fn retained_archive_exports_for_external_tools() {
+        let input = std::env::var("ME_RETAINED_ARCHIVE").unwrap();
+        let output = PathBuf::from(std::env::var("ME_PORTABLE_OUTPUT").unwrap());
+        let directory = PathBuf::from(std::env::var("ME_ANALYSIS_OUTPUT").unwrap());
+        assert!(!output.exists() && !directory.exists());
+        let bundle = import_kernsight_evidence_archive(input).await.unwrap();
+        write_local_retained(Path::new(&bundle.root), &output).unwrap();
+        let zip = ZipArchive::new(File::open(&output).unwrap()).unwrap();
+        let dex = zip.file_names().filter(|p| p.ends_with(".dex")).count();
+        let so = zip.file_names().filter(|p| p.ends_with(".so")).count();
+        assert!(!zip.file_names().any(|p| p.starts_with("objects/")));
+        drop(zip);
+        let imported = import_kernsight_evidence_archive(output.to_string_lossy().into_owned())
+            .await
+            .unwrap();
+        assert_eq!(imported.package, bundle.package);
+        let saved =
+            super::super::analysis_export::export(Path::new(&imported.root), &directory).unwrap();
+        println!("retained_export package={} ordinary_dex_paths={dex} ordinary_so_paths={so} archive={} directory={saved}", bundle.package, output.display());
+    }
+}
 pub(super) fn restore(path: &Path) -> Result<PathBuf, String> {
     restore_with_source(path, None)
 }
 pub(super) fn restore_from_export_source(path: &Path, source: &Path) -> Result<PathBuf, String> {
+    if !is_v2(path)? {
+        return Ok(source.to_path_buf());
+    }
     restore_with_source(path, Some(source))
 }
 fn restore_with_source(path: &Path, reuse_source: Option<&Path>) -> Result<PathBuf, String> {
@@ -764,7 +1074,7 @@ mod tests {
         )
         .unwrap();
         let archive = root.with_extension("mee");
-        write_kernsight_evidence_archive(&root, &archive).unwrap();
+        write(&root, &archive).unwrap();
         assert!(is_v2(&archive).unwrap());
         assert!(std::fs::metadata(&archive).unwrap().len() < 800 * 1024);
         let bundle = import_kernsight_evidence_archive(archive.to_string_lossy().into_owned())
@@ -795,7 +1105,7 @@ mod tests {
             );
         }
         let again = root.with_extension("again.mee");
-        write_kernsight_evidence_archive(target, &again).unwrap();
+        write(target, &again).unwrap();
         let second = import_kernsight_evidence_archive(again.to_string_lossy().into_owned())
             .await
             .unwrap();
@@ -904,7 +1214,7 @@ pub(super) fn share_fresh_pull(root: &Path, archive_path: &Path) -> Result<(), S
         return Err("引用清单读取超预算".into());
     }
     let value: Value = serde_json::from_str(&text).map_err(|e| e.to_string())?;
-    if value["schemaVersion"] != SCHEMA {
+    if value["schemaVersion"] != SCHEMA && value["schemaVersion"] != MOBILEE_EVIDENCE_SCHEMA {
         return Err("仅 v2 完整引用可共享".into());
     }
     let refs: Vec<Reference> =

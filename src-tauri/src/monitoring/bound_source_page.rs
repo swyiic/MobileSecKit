@@ -3,6 +3,7 @@
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::{fs, io::Read, path::Path};
+mod candidate_coverage;
 
 const PAGE_LIMIT: usize = 100;
 const PAGE_BYTES: usize = 256 * 1024;
@@ -197,6 +198,7 @@ pub(super) fn read_page(
         page.push(row);
     }
     let end = offset + page.len();
+    let candidate_coverage = candidate_coverage::summarize(&root, source_report, &note);
     let path_after = checked_path(&root, source_report)?;
     if !same_snapshot(&opened, &file.metadata().map_err(|e| e.to_string())?)
         || !same_snapshot(
@@ -210,6 +212,8 @@ pub(super) fn read_page(
     let result = json!({"schema":"mobilee.bound-source-page/v1","sourceReport":source_report,
         "sourceSha256":sha,"offset":offset,"limit":limit,"totalRecords":records.len(),
         "nextOffset":(end<records.len()).then_some(end),"records":page,
+        "producerStatus":{"partial":note["partial"],"stopScope":note["candidate_result"]["stop_scope"],"unattemptedState":note["candidate_result"]["unattempted_state"],"attemptedRanges":note["candidate_result"].get("total_attempted").unwrap_or(&note["candidate_result"]["attempted"]),"grantedWindowMs":note["candidate_result"]["granted_window_ms"],"setupElapsedMs":note["candidate_result"]["setup_elapsed_ms"]},
+        "candidateCoverage":candidate_coverage,
         "analysisScope":"producer metadata only; payload bytes not read or verified by this page"});
     if serde_json::to_vec(&result)
         .map_err(|e| e.to_string())?

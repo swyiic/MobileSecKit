@@ -47,6 +47,19 @@ pub(super) fn producer_time_for_scope(
 ) -> Result<u64, String> {
     producer_time_ms(remaining_ms, if fixed_scope { 0 } else { preflight_ms })
 }
+
+pub(super) fn runtime_copy_argument(
+    copy_ms: Option<u64>,
+    has_parent: bool,
+) -> Result<String, String> {
+    match copy_ms {
+        None => Ok(String::new()),
+        Some(value) if has_parent && (1..=3_600_000).contains(&value) => {
+            Ok(format!(" --runtime-copy-ms {value}"))
+        }
+        _ => Err("有效复制时限缺少可信v6父阶段或数值无效；未启动".into()),
+    }
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -102,6 +115,17 @@ mod tests {
             231_000
         );
         assert!(producer_time_for_scope(10_000, 0, true).is_err());
+    }
+    #[test]
+    fn exact_copy_argument_keeps_user_ms_separate_from_hard_phase_closeout() {
+        assert_eq!(
+            runtime_copy_argument(Some(180000), true).unwrap(),
+            " --runtime-copy-ms 180000"
+        );
+        assert_eq!(producer_time_for_scope(250000, 0, true).unwrap(), 240000);
+        assert_eq!(runtime_copy_argument(None, true).unwrap(), "");
+        assert!(runtime_copy_argument(Some(180000), false).is_err());
+        assert!(runtime_copy_argument(Some(0), true).is_err());
     }
     #[test]
     fn contradictory_policy_is_rejected() {

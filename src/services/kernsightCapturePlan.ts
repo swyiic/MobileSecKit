@@ -13,6 +13,21 @@ export interface AutoStageReceipt {
   succeeded: boolean
 }
 
+/** Observation windows are not copy/transfer deadlines. Finishing a phase early
+ * releases its wait; these limits must never be used as mandatory sleeps. */
+export function automaticTimingPreset(profile: 'quick' | 'standard' | 'extended' = 'standard') {
+  const windows = { quick: [15, 30, 15], standard: [15, 90, 15], extended: [30, 240, 30] }[profile]
+  const [autoL0Seconds, autoL1Seconds, autoLinkerSeconds] = windows
+  const observationSeconds = autoL0Seconds! + autoL1Seconds! + autoLinkerSeconds!
+  // Keep the proven copy allowance; do not trade missing mappings for speed.
+  const l2MaxSeconds = 180
+  const captureMaxSeconds = Math.ceil((observationSeconds + 3 * 55 + l2MaxSeconds + 70) / 30) * 30
+  const transferMaxSeconds = 600, archiveMaxSeconds = 120, importMaxSeconds = 120
+  return { autoL0Seconds: autoL0Seconds!, autoL1Seconds: autoL1Seconds!, autoLinkerSeconds: autoLinkerSeconds!,
+    captureMaxSeconds, l2MaxSeconds, transferMaxSeconds, archiveMaxSeconds, importMaxSeconds,
+    maxSessionSeconds: captureMaxSeconds + transferMaxSeconds + archiveMaxSeconds + importMaxSeconds + 5 }
+}
+
 export function buildAutoCaptureStages(l0: number, l1: number, linker: number, startupReplay = false): AutoCaptureStage[] {
   if (![l0, l1, linker].every(n => Number.isInteger(n) && n >= 1 && n <= 300)) {
     throw new Error('每阶段时长必须是 1–300 秒的整数')
@@ -160,7 +175,37 @@ export function captureGroupIPC(request: Pick<KernSightCaptureRequest, 'runtimeP
   return request.runtimePaths ? 'begin_kernsight_isolated_group' : 'begin_kernsight_group'
 }
 
-/** Admission preview mirrors the new-parent backend time contract, not coverage. */
+/** New v6 parents grant the configured copy window only after phone readiness.
+ * Preparation and closeout have separate finite allowances; nothing is clipped. */
+export function effectiveCopyTimeAllocation(
+  durations: { l0: number; l1: number; linker: number },
+  captureSeconds: number,
+  copySeconds: number,
+  separate: boolean,
+) {
+  buildAutoCaptureStages(durations.l0, durations.l1, durations.linker)
+  if (!Number.isInteger(captureSeconds) || captureSeconds < 30 || captureSeconds > 3600
+      || !Number.isInteger(copySeconds) || copySeconds < 1 || copySeconds > 3600) {
+    throw new Error('总采集须为30–3600秒、有效复制须为1–3600秒整数')
+  }
+  const observationPreparationSeconds = 30, observationCloseoutSeconds = 15, observationHostSeconds = 10
+  const observationOverheadSeconds = observationPreparationSeconds + observationCloseoutSeconds + observationHostSeconds
+  const producer = separate
+    ? [{ key: 'L0', seconds: durations.l0 + observationOverheadSeconds }, { key: 'L1', seconds: durations.l1 + observationOverheadSeconds }, { key: 'Linker', seconds: durations.linker + observationOverheadSeconds }]
+    : [{ key: '统一 session', seconds: durations.l0 + durations.l1 + durations.linker + 3 * observationOverheadSeconds }]
+  const preparationSeconds = 20, agentCloseoutSeconds = 40, hostCloseoutSeconds = 10
+  const overheadSeconds = preparationSeconds + agentCloseoutSeconds + hostCloseoutSeconds
+  const producerSeconds = producer.reduce((sum, phase) => sum + phase.seconds, 0)
+  const dumpHardSeconds = copySeconds + overheadSeconds
+  const minimumCaptureSeconds = producerSeconds + dumpHardSeconds
+  return { schema: 'mobilee.session-time-plan/v6' as const, producer, producerSeconds, copySeconds,
+    observationPreparationSeconds, observationCloseoutSeconds, observationHostSeconds, observationOverheadSeconds,
+    preparationSeconds, agentCloseoutSeconds, hostCloseoutSeconds, overheadSeconds, dumpHardSeconds,
+    minimumCaptureSeconds, maximumCopySeconds: captureSeconds - producerSeconds - overheadSeconds,
+    valid: captureSeconds >= minimumCaptureSeconds }
+}
+
+/** Legacy implicit-parent preview. Retained v1-v4 timing is never reinterpreted as v6. */
 export function captureTimeAllocation(durations: { l0: number; l1: number; linker: number }, totalSeconds: number, separate: boolean) {
   buildAutoCaptureStages(durations.l0, durations.l1, durations.linker)
   if (!Number.isInteger(totalSeconds) || totalSeconds < 30 || totalSeconds > 3600) throw new Error('总期限必须是 30–3600 秒的整数')
@@ -187,4 +232,16 @@ export function captureTimeAllocation(durations: { l0: number; l1: number; linke
     ? longMinimumSeconds : shortMinimumSeconds)
   return { producer, dumpSeconds, archiveSeconds, importSeconds, terminalSeconds: 5,
     finalSeconds, transferSeconds, minimumSeconds, longPlan, valid: transferSeconds >= 30 }
+}
+
+
+/** Upper bound before L0/L1 charges; matches the v6 backend byte reservations. */
+export function captureByteAllocation(totalMiB: number, separate: boolean) {
+  const total = Math.floor(totalMiB * 1048576)
+  if (!Number.isSafeInteger(total) || total < 4 * 1048576 || total > 16384 * 1048576) return null
+  const eachExport = Math.floor(total / 4)
+  const linker = separate ? Math.min(Math.floor(total / 16), 8 * 1048576) : 0
+  const captureRemaining = Math.max(0, total - 3 * eachExport - linker - 2 * 1048576)
+  const payloadBound = Math.max(0, eachExport - (64 + 4 + 24 + 1) * 1048576)
+  return { total, eachExport, linker, dumpUpperBound: Math.min(captureRemaining, payloadBound) }
 }

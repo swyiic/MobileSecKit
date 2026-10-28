@@ -6,11 +6,68 @@ import { build } from 'esbuild'
 
 const source = readFileSync(new URL('../src/services/kernsightBoundSourcePage.ts', import.meta.url), 'utf8')
 const js = ts.transpileModule(source, { compilerOptions: { module: ts.ModuleKind.ESNext, target: ts.ScriptTarget.ES2020 } }).outputText
-const { boundSourceReports, validateBoundSourcePage, boundSourceLocalAnalysis, boundSourceInspection, boundSourceAnalysisLabel, runtimeCoverageSummary, runtimeRangeCounts } = await import(`data:text/javascript;base64,${Buffer.from(js).toString('base64')}`)
+const { boundSourceReports, validateBoundSourcePage, boundSourceLocalAnalysis, boundSourceInspection, boundSourceAnalysisLabel, runtimeCoverageSummary, runtimeRangeCounts, candidateCoverageSummary } = await import(`data:text/javascript;base64,${Buffer.from(js).toString('base64')}`)
 const sourceReport = 'runtime/bound-source-test.json', sourceSha256 = 'a'.repeat(64), rangeHash = 'b'.repeat(64)
 const producer = () => ({ raw_evidence:'bound-example.code', source:{package:'org.example.fixture',pid:7,uid:10234,birth_ns:123456789,exec_id:2,boot_id:'fixture-boot'}, mapping:{start:100,end:200,path:'/fixture/libexample.so'}, read:{sha256:rangeHash,actual_length:100,requested_length:100,read_status:'complete',write_status:'complete',read_error:null,write_error:null} })
 const makePage = (offset=0, totalRecords=1390, size=100) => ({schema:'mobilee.bound-source-page/v1',sourceReport,sourceSha256,offset,limit:100,totalRecords,nextOffset:offset+Math.min(size,totalRecords-offset)<totalRecords ? offset+Math.min(size,totalRecords-offset):null,records:Array.from({length:Math.min(size,totalRecords-offset)},(_,index)=>({sourceRecordIndex:offset+index,producerRecord:producer()}))})
 const local = row => ({schema:'mobilee.bound-runtime-range/v1',inventory_role:'lightweight_range_ledger',source_report:sourceReport,source_report_sha256:sourceSha256,source_record_index:row.sourceRecordIndex,relative_path:'runtime/bound-example.code',source:row.producerRecord.source,mapping:row.producerRecord.mapping,read:row.producerRecord.read,local_content_status:'complete_range_hash_verified',inspection_status:'inspected',inspection_ref:0,inspection_content_key:rangeHash+':100'})
+const candidateCoverage = () => ({status:'available',scope:'initial_main_process_candidate_snapshot',metadataOnly:true,candidateManifest:'bound-candidates-7-aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee',eligibleRanges:1368,eligibleBytes:473456640,attemptedRanges:1127,sourceShardCount:1,currentSourceRecords:1127,globalAttemptedRanges:1127,admittedRanges:1126,admittedBytes:456220672,excludedRanges:1,rejectedRanges:0,unattemptedRanges:241,unattemptedBytes:17227776,remainingBytes:17235968,appInstall:{eligibleRanges:18,admittedRanges:18,remainingRanges:0,remainingBytes:0}})
+
+test('initial candidate counts separate unread, excluded, retained bytes and installation ranges without upgrading partial',()=>{
+  const coverage=candidateCoverage(),page={...makePage(0,1127),candidateCoverage:coverage,producerStatus:{partial:true,stopScope:'local_copy_window'}}
+  const validated=validateBoundSourcePage(page,sourceReport,0,null)
+  assert.deepEqual(validated.candidateCoverage,coverage)
+  assert.equal(validated.producerStatus.partial,true)
+  assert.equal(validated.candidateCoverage.unattemptedRanges,241)
+  assert.equal(validated.candidateCoverage.excludedRanges,1)
+  assert.equal(validated.candidateCoverage.remainingBytes,17235968)
+  assert.equal(validated.candidateCoverage.appInstall.remainingRanges,0)
+  assert.equal(validated.candidateCoverage.metadataOnly,true)
+  assert.equal(Object.hasOwn(validated.candidateCoverage,'complete'),false)
+  const measured={...coverage,eligibleRanges:1,eligibleBytes:100,attemptedRanges:1,currentSourceRecords:1,globalAttemptedRanges:1,admittedRanges:1,admittedBytes:100,excludedRanges:0,rejectedRanges:0,unattemptedRanges:0,unattemptedBytes:0,remainingBytes:0,appInstall:null}
+  const stillPartial=validateBoundSourcePage({...makePage(0,1),candidateCoverage:measured,producerStatus:{partial:true}},sourceReport,0,null)
+  assert.equal(stillPartial.candidateCoverage.status,'available')
+  assert.equal(stillPartial.producerStatus.partial,true)
+  assert.equal(stillPartial.candidateCoverage.appInstall,null)
+})
+
+test('verified multi-shard coverage keeps global totals distinct from the current document page',()=>{
+  const coverage={...candidateCoverage(),sourceShardCount:2,currentSourceRecords:600}
+  const page={...makePage(0,600),candidateCoverage:coverage,producerStatus:{partial:true}}
+  const validated=validateBoundSourcePage(page,sourceReport,0,null)
+  assert.equal(validated.candidateCoverage.status,'available')
+  assert.equal(validated.candidateCoverage.attemptedRanges,1127)
+  assert.equal(validated.candidateCoverage.currentSourceRecords,600)
+  assert.equal(validated.candidateCoverage.admittedRanges,1126)
+  assert.equal(validated.totalRecords,600)
+  assert.equal(validated.producerStatus.partial,true)
+  for(const changed of [
+    {...coverage,currentSourceRecords:601},
+    {...coverage,globalAttemptedRanges:1126},
+    {...coverage,currentSourceRecords:1128},
+    {...coverage,sourceShardCount:1},
+  ]) assert.equal(validateBoundSourcePage({...page,candidateCoverage:changed},sourceReport,0,null).candidateCoverage.status,'unknown')
+})
+
+test('missing or unverifiable candidate metadata stays unknown with no invented zero totals',()=>{
+  for(const coverage of [undefined,null,{status:'unknown',reason:'candidate_shard_missing'},
+    {...candidateCoverage(),eligibleRanges:1367},
+    {...candidateCoverage(),rejectedRanges:1},
+    {...candidateCoverage(),remainingBytes:0},
+    {...candidateCoverage(),eligibleBytes:Number.MAX_SAFE_INTEGER+1},
+    {...candidateCoverage(),metadataOnly:false},
+    {...candidateCoverage(),candidateManifest:'bound-candidates-before-static-7-aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee'},
+    {...candidateCoverage(),appInstall:{eligibleRanges:18,admittedRanges:18,remainingRanges:1,remainingBytes:0}},
+  ]) {
+    const summary=candidateCoverageSummary(coverage)
+    assert.equal(summary.status,'unknown')
+    assert.equal(Object.hasOwn(summary,'eligibleRanges'),false)
+    assert.equal(Object.hasOwn(summary,'remainingBytes'),false)
+  }
+  const mismatched=validateBoundSourcePage({...makePage(0,1),candidateCoverage:candidateCoverage()},sourceReport,0,null)
+  assert.equal(mismatched.candidateCoverage.status,'unknown')
+  assert.match(mismatched.candidateCoverage.reason,/记录数不一致/)
+})
 
 test('a byte-bounded short page uses its actual next cursor and the tail remains addressable',()=>{
   const short=makePage(0,1390,17);assert.equal(validateBoundSourcePage(short,sourceReport,0,null).nextOffset,17)

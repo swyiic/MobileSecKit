@@ -4,6 +4,7 @@ use std::sync::{Mutex, OnceLock};
 use tauri::Manager;
 
 mod coverage_continuation;
+pub mod delete;
 mod diagnostics;
 pub mod purge;
 mod purge_device;
@@ -104,12 +105,12 @@ impl Group {
                         .unwrap_or(0)
                 });
                 plan.validate_observations(!self.unified, &durations)?;
-                if plan.schema != "mobilee.session-time-plan/v5"
+                if !plan.explicit()
                     && (!self.base["captureTime"].is_null() || !self.base["saveTime"].is_null())
                 {
                     return Err("旧父时间合同不能附加新采集时限；未续期".into());
                 }
-                if plan.schema == "mobilee.session-time-plan/v5" {
+                if plan.explicit() {
                     let request: KernSightCaptureRequest =
                         serde_json::from_value(self.base.clone()).map_err(|e| e.to_string())?;
                     b.validate_explicit_configuration(
@@ -347,21 +348,9 @@ impl Group {
                 && self.stages[..i]
                     .last()
                     .is_some_and(|s| coverage_continuation::verified(self, s));
-            let saved_dump = previous.key == "dump"
-                && next.key == "linker"
-                && i + 1 == index
-                && previous.attempts.last().is_some_and(|attempt| {
-                    attempt.state == "partial"
-                        && attempt.remote_artifact_root.is_some()
-                        && attempt.remote_lifecycle.as_ref().is_some_and(|note| {
-                            note["collection_returned"] == true
-                                && note["collection_status"] == "partial"
-                        })
-                });
             if !(self.quota_partial_closed(previous) && (independent || replaced))
                 && !(coverage && (independent || (next.key == "dump" && i + 1 == index)))
                 && !source_absent
-                && !saved_dump
             {
                 return Err("前置必需阶段未成功或依赖/清理未确认".into());
             }
@@ -699,7 +688,7 @@ fn begin_group_at(
     base.as_object_mut().unwrap().remove("captureRelations");
     let limits = request.session_budget.clone().unwrap_or_default();
     let budget = match (request.capture_time.clone(), request.save_time.clone()) {
-        (Some(capture), Some(save)) => session_budget::Contract::new_explicit_with_time(
+        (Some(capture), Some(save)) => session_budget::Contract::new_exact_copy_with_time(
             limits,
             now_millis(),
             startup_replay,
@@ -820,6 +809,42 @@ fn retain_capture_diagnostic(attempt: &mut Attempt, result: Option<&KernSightCap
     }
 }
 
+/// A settled partial proves retained bytes, not complete coverage or safe
+/// continuation. Only the matched lifecycle/coverage policy may advance it.
+fn retain_settled_partial(
+    group: &mut Group,
+    relation: &Relation,
+    note: &Value,
+    settled: bool,
+    remaining_ms: u64,
+    original_error: Option<&str>,
+) -> Option<String> {
+    if !settled || note["partial"] != true {
+        return None;
+    }
+    if let Some(attempt) = group
+        .stages
+        .iter_mut()
+        .flat_map(|stage| stage.attempts.iter_mut())
+        .find(|attempt| attempt.relation == *relation)
+    {
+        attempt.state = "partial".into();
+        attempt.error = Some(diagnostics::partial_stage_error(
+            &relation.stage_key,
+            note["reason"]
+                .as_str()
+                .or_else(|| note["host_time_fence"].as_str())
+                .unwrap_or("原因未确认"),
+            remaining_ms,
+            original_error,
+        ));
+    }
+    group.refresh();
+    let admitted = note["admitted_write_bytes"].as_u64().unwrap_or(0);
+    (note["reason"] == "bound_code_copy_partial" && admitted > 0)
+        .then(|| format!("代码快照未拷完：已写入 {admitted} 字节。已保存的文件可以分析。"))
+}
+
 #[tauri::command]
 pub async fn run_kernsight_group_stage(
     app: tauri::AppHandle,
@@ -889,6 +914,7 @@ async fn run_group_stage_at(
 
         let mut request: KernSightCaptureRequest =
             serde_json::from_value(g.base.clone()).map_err(|e| e.to_string())?;
+        request.ready_timing_v6=g.budget.as_ref().and_then(|b|b.time_plan.as_ref()).is_some_and(|p|p.schema=="mobilee.session-time-plan/v6");
         request.capture_relation = Some(r.clone());
 
         let(n,t)=reserve_attempt(&root,&mut g,r.attempt_id.to_string(),&stage.key)?;request.output_budget_bytes=Some(n-65536);request.output_budget_ms=Some(t);
@@ -904,7 +930,9 @@ async fn run_group_stage_at(
         request.inspect_linker = stage.key == "linker";
         request.inspect_adapter = (stage.key == "l1").then(|| "binder_userspace".into());
         request.inspect_stages = None;
+        request.runtime_copy_ms = None;
         if stage.key == "dump" {
+            request.runtime_copy_ms=g.budget.as_ref().and_then(|b|b.time_plan.as_ref()).and_then(|p|p.runtime_copy_ms());
             let previous=g.stages[..g.stages.iter().position(|s|s.key=="dump").unwrap_or(0)].iter().rev().find_map(|s|s.attempts.last().and_then(|a|a.remote_lifecycle.as_ref()));
             request.expected_code_sources=Some(super::qualified_dump_sources(previous,&g.package)?);
             if g.stages.iter().find(|s| s.key == "l1").is_some_and(|s| coverage_continuation::verified(&g,s))
@@ -992,13 +1020,11 @@ async fn run_group_stage_at(
         .as_deref()
         .is_some_and(|text| text.contains("未确认成功"))
     {
-        let cause = result.as_ref().and_then(|item| {
-            item.stderr
-                .lines()
-                .rev()
-                .find(|line| line.starts_with("Error:") || line.starts_with("Caused by:"))
-                .map(str::to_owned)
-        });
+        // Preserve the bounded primary error and its cause chain. Selecting the
+        // last "Caused by:" line alone hides why a live source became partial.
+        let cause = result
+            .as_ref()
+            .and_then(|item| diagnostics::error_excerpt("stderr", &item.stderr).0);
         error = Some(match cause {
             Some(cause) => {
                 format!("remote_collection_partial：producer已返回，采集未完成；{cause}")
@@ -1050,6 +1076,12 @@ async fn run_group_stage_at(
             Some("无子会话进程实例证据；dump 实例见原报告".into()),
         )
     };
+    if let Some(report_error) = observation_error
+        .as_deref()
+        .filter(|error| error.contains("session_report_parser_failed"))
+    {
+        merge_phase_failure(&mut error, Some(report_error.to_owned()));
+    }
     let artifact = dump_artifact_reference(&g, &r, result.is_some(), dump_sources_absent)?;
     if stage.key == "dump" && explicit_time_group(&g) && result.is_none() && !dump_sources_absent {
         merge_phase_failure(&mut error, Some("dump_artifact_unconfirmed: 本attempt Dump产物未确认；设备可能保留原件，自动保存仅纳入已确认子会话".into()));
@@ -1112,26 +1144,6 @@ async fn run_group_stage_at(
                 let settlement = b.settle(&r.attempt_id.to_string(), &note);
                 let settled = settlement.is_ok();
                 continuation_phase_safe &= settled;
-                let kept_copy = settled
-                    && note["partial"] == true
-                    && note["reason"].as_str() == Some("bound_code_copy_partial")
-                    && note["admitted_write_bytes"].as_u64().unwrap_or(0) > 0;
-                if kept_copy {
-                    if let Some(reservation) = b
-                        .reservations
-                        .iter_mut()
-                        .find(|item| item.id == r.attempt_id.to_string())
-                    {
-                        reservation.status = "admitted_plus_terminal_reserve".into();
-                    }
-                    let admitted = note["admitted_write_bytes"].as_u64().unwrap_or(0);
-                    saved_copy_note = Some(format!(
-                        "代码快照未拷完：已写入 {admitted} 字节。已保存的文件可以分析。"
-                    ));
-                    // The runner stops the parent when this error is set, even if
-                    // the attempt itself was accepted. Linker must still run.
-                    error = None;
-                }
                 if let Err(e) = settlement {
                     if let Some(a) = g
                         .stages
@@ -1144,31 +1156,14 @@ async fn run_group_stage_at(
                     }
                     g.refresh();
                 }
-                if note["partial"] == true && settled {
-                    if let Some(a) = g
-                        .stages
-                        .iter_mut()
-                        .flat_map(|s| s.attempts.iter_mut())
-                        .find(|a| a.relation == r)
-                    {
-                        if kept_copy {
-                            a.state = "succeeded".into();
-                            a.error = None;
-                        } else {
-                            a.state = "partial".into();
-                            a.error = Some(diagnostics::partial_stage_error(
-                                &stage.key,
-                                note["reason"]
-                                    .as_str()
-                                    .or_else(|| note["host_time_fence"].as_str())
-                                    .unwrap_or("原因未确认"),
-                                deadline.remaining_ms().unwrap_or(0),
-                                error.as_deref(),
-                            ));
-                        }
-                    }
-                    g.refresh();
-                }
+                saved_copy_note = retain_settled_partial(
+                    &mut g,
+                    &r,
+                    &note,
+                    settled,
+                    deadline.remaining_ms().unwrap_or(0),
+                    error.as_deref(),
+                );
             }
         }
         let attempt = g
@@ -1500,6 +1495,84 @@ mod tests {
         g.finish(&r, Some(Uuid::new_v4()), None, None).unwrap();
         assert_eq!(g.stages[2].attempts[0].state, "partial");
         assert_eq!(g.state, "partial");
+    }
+    #[test]
+    fn retained_copy_notice_keeps_partial_and_requires_matched_continuation() {
+        let mut g = coverage_partial_dump_group();
+        let relation = g.stages[2].attempts[0].relation.clone();
+        let note = serde_json::json!({"admitted_write_bytes":1000,"partial":true,"reason":"bound_code_copy_partial"});
+        let message = retain_settled_partial(
+            &mut g,
+            &relation,
+            &note,
+            true,
+            10000,
+            Some("remote_collection_partial: original cause"),
+        );
+        assert!(message.unwrap().contains("1000"));
+        assert_eq!(g.stages[2].attempts[0].state, "partial");
+        assert!(g.stages[2].attempts[0]
+            .error
+            .as_deref()
+            .unwrap()
+            .contains("original cause"));
+        assert_eq!(
+            g.budget
+                .as_ref()
+                .unwrap()
+                .reservations
+                .iter()
+                .find(|r| { r.id == relation.attempt_id.to_string() })
+                .unwrap()
+                .status,
+            "partial"
+        );
+        assert!(g.continue_after_partial("dump"));
+        let next = g.start("linker", epoch()).unwrap();
+        g.finish(&next, Some(Uuid::new_v4()), None, None).unwrap();
+        assert_eq!(g.state, "partial");
+        assert_eq!(g.stages[2].attempts[0].state, "partial");
+    }
+    #[test]
+    fn retained_bytes_alone_never_authorize_linker() {
+        let output = serde_json::json!({"admitted_write_bytes":1000,"partial":true,"reason":"bound_code_copy_partial"});
+        for (field, value) in [
+            ("dump_coverage", Value::Null),
+            ("agent_exited_confirmed", serde_json::json!(false)),
+            ("relation", Value::Null),
+        ] {
+            let mut g = coverage_partial_dump_group();
+            let relation = g.stages[2].attempts[0].relation.clone();
+            g.stages[2].attempts[0].remote_lifecycle.as_mut().unwrap()[field] = value;
+            assert!(retain_settled_partial(
+                &mut g,
+                &relation,
+                &output,
+                true,
+                10000,
+                Some("remote_collection_partial")
+            )
+            .is_some());
+            assert_eq!(g.stages[2].attempts[0].state, "partial");
+            assert!(g.stages[2].attempts[0].error.is_some());
+            assert!(!g.continue_after_partial("dump"), "{field}");
+            assert!(g.start("linker", epoch()).is_err(), "{field}");
+        }
+    }
+    #[test]
+    fn untrusted_partial_receipt_cannot_replace_settlement_failure() {
+        let mut g = coverage_partial_dump_group();
+        let relation = g.stages[2].attempts[0].relation.clone();
+        g.stages[2].attempts[0].state = "failed".into();
+        g.stages[2].attempts[0].error = Some("预算收据不可信".into());
+        let output = serde_json::json!({"admitted_write_bytes":1000,"partial":true,"reason":"bound_code_copy_partial"});
+        assert!(retain_settled_partial(&mut g, &relation, &output, false, 10000, None).is_none());
+        assert_eq!(g.stages[2].attempts[0].state, "failed");
+        assert_eq!(
+            g.stages[2].attempts[0].error.as_deref(),
+            Some("预算收据不可信")
+        );
+        assert!(!g.continue_after_partial("dump"));
     }
     #[test]
     fn static_child_quota_proof_allows_only_owned_independent_linker() {
@@ -2383,6 +2456,7 @@ pub async fn run_kernsight_unified_group(
         let busy=run_device_root_script(&g.serial,r#"for p in $(pidof ksightd 2>/dev/null); do c=$(tr '\0' ' ' < /proc/$p/cmdline); case "$c" in *ksightd*\ capture*) echo capture_busy; exit 73;; esac; done"#).await?;
         if busy.code!=Some(0){return Err("设备已有采集或状态未知；未启动/重试".into());}
         let mut request:KernSightCaptureRequest=serde_json::from_value(g.base.clone()).map_err(|e|e.to_string())?;
+        request.ready_timing_v6=g.budget.as_ref().and_then(|b|b.time_plan.as_ref()).is_some_and(|p|p.schema=="mobilee.session-time-plan/v6");
 
         let(n,t)=reserve_attempt(&root,&mut g,relations[0].attempt_id.to_string(),"unified")?;request.output_budget_bytes=Some(n-65536);request.output_budget_ms=Some(t);
         let phase_deadline = g.budget.as_ref().ok_or("缺统一阶段期限")?.phase_deadline("unified")?;
@@ -3414,6 +3488,9 @@ fn ensure_previous_shutdown(
 mod approved_device_acceptance;
 
 #[cfg(test)]
+mod connected_package_acceptance;
+
+#[cfg(test)]
 mod missing_child_report_tests {
     use super::*;
     #[test]
@@ -3638,7 +3715,7 @@ fn explicit_time_group(g: &Group) -> bool {
     g.budget
         .as_ref()
         .and_then(|b| b.time_plan.as_ref())
-        .is_some_and(|p| p.schema == "mobilee.session-time-plan/v5")
+        .is_some_and(|p| p.explicit())
 }
 
 /// The relation retains the exact planned path, even when the producer never
@@ -3673,7 +3750,7 @@ fn finish_attempt_time(root: &Path, g: &mut Group, kind: &str) -> Result<(), Str
         .budget
         .as_ref()
         .and_then(|b| b.time_plan.as_ref())
-        .is_some_and(|p| p.schema == "mobilee.session-time-plan/v5")
+        .is_some_and(|p| p.explicit())
     {
         return Ok(());
     }
@@ -3704,8 +3781,76 @@ fn retained_owned_session(note: &Value, relation: &Relation) -> Result<Option<Uu
 }
 
 #[cfg(test)]
+mod exact_time_v6_parent {
+    use super::*;
+    #[test]
+    fn new_parent_uses_v6_and_ignores_untrusted_runtime_copy_field() {
+        let root = std::env::temp_dir().join(format!("me-exact-v6-parent-{}", Uuid::new_v4()));
+        let raw = serde_json::json!({"serial":"synthetic","package":"org.example.fixture","durationSeconds":25,
+            "runtimeCopyMs":1,"readyTimingV6":true,"sessionBudget":{"totalBytes":8589934592u64,"maxSeconds":1565},
+            "captureTime":{"maxSeconds":600,"l2MaxSeconds":180},
+            "saveTime":{"transferMaxSeconds":600,"archiveMaxSeconds":180,"importMaxSeconds":180}});
+        let request: KernSightCaptureRequest = serde_json::from_value(raw.clone()).unwrap();
+        assert_eq!(request.runtime_copy_ms, None);
+        assert!(!request.ready_timing_v6);
+        let group = begin_group_at(root.clone(), request, vec![25, 30, 20], true).unwrap();
+        let plan = group.budget.as_ref().unwrap().time_plan.as_ref().unwrap();
+        assert_eq!(plan.schema, "mobilee.session-time-plan/v6");
+        assert_eq!(plan.runtime_copy_ms(), Some(180000));
+        assert!(group.base.get("runtimeCopyMs").is_none());
+        group.validate().unwrap();
+        let rejected_root = root.join("rejected");
+        let mut short = raw;
+        short["captureTime"]["maxSeconds"] = serde_json::json!(489);
+        short["sessionBudget"]["maxSeconds"] = serde_json::json!(1454);
+        let error = begin_group_at(
+            rejected_root.clone(),
+            serde_json::from_value(short).unwrap(),
+            vec![25, 30, 20],
+            true,
+        )
+        .err()
+        .unwrap();
+        assert!(error.contains("490"));
+        assert!(!rejected_root.exists());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[cfg(test)]
 mod manual_time_v5_parent {
     use super::*;
+    fn legacy_group_at(
+        root: PathBuf,
+        request: KernSightCaptureRequest,
+        durations: Vec<u64>,
+    ) -> Result<Group, String> {
+        let budget = session_budget::Contract::new_explicit_with_time(
+            request.session_budget.clone().ok_or("缺旧fixture预算")?,
+            now_millis(),
+            true,
+            &durations,
+            request.capture_time.clone().ok_or("缺旧采集时限")?,
+            request.save_time.clone().ok_or("缺旧保存时限")?,
+        )?;
+        let mut group = tests::group();
+        group.serial = request.serial.clone();
+        group.package = request.package.clone().ok_or("缺包名")?;
+        group.created_unix_ms = now_millis();
+        group.base = serde_json::to_value(request).map_err(|e| e.to_string())?;
+        group.budget = Some(budget);
+        for stage in &mut group.stages {
+            stage.duration_seconds = match stage.key.as_str() {
+                "l0" => durations[0],
+                "l1" => durations[1],
+                "linker" => durations[2],
+                _ => 0,
+            };
+            stage.launch_after_attach = stage.key != "dump";
+        }
+        save(&root, &group)?;
+        Ok(group)
+    }
     fn request() -> KernSightCaptureRequest {
         serde_json::from_value(
             serde_json::json!({"serial":"synthetic","package":"org.example.fixture",
@@ -3718,7 +3863,7 @@ mod manual_time_v5_parent {
     #[test]
     fn explicit_parent_keeps_requested_observation_even_when_capture_cap_is_shorter() {
         let root = std::env::temp_dir().join(format!("me-manual-v5-{}", Uuid::new_v4()));
-        let mut g = begin_group_at(root.clone(), request(), vec![15, 90, 15], true).unwrap();
+        let mut g = legacy_group_at(root.clone(), request(), vec![15, 90, 15]).unwrap();
         assert_eq!(
             g.stages
                 .iter()
@@ -3772,7 +3917,7 @@ mod manual_time_v5_parent {
     #[test]
     fn failed_archive_without_byte_receipt_records_time_without_completion() {
         let root = std::env::temp_dir().join(format!("me-v5-archive-time-{}", Uuid::new_v4()));
-        let mut g = begin_group_at(root.clone(), request(), vec![15, 90, 15], true).unwrap();
+        let mut g = legacy_group_at(root.clone(), request(), vec![15, 90, 15]).unwrap();
         let output = root.join("synthetic-never-written.mee");
         reserve_export_at(&root, &mut g, &output).unwrap();
         begin_export_time_at(&root, &mut g, "archive").unwrap();
@@ -3830,7 +3975,7 @@ mod manual_time_v5_parent {
         let root = std::env::temp_dir().join(format!("me-v5-preflight-{}", Uuid::new_v4()));
         let mut req = request();
         req.capture_time.as_mut().unwrap().l2_max_seconds = 1;
-        let mut g = begin_group_at(root.clone(), req, vec![15, 90, 15], true).unwrap();
+        let mut g = legacy_group_at(root.clone(), req, vec![15, 90, 15]).unwrap();
         let mut ids = Vec::new();
         for kind in ["l0", "l1"] {
             let r = g.start(kind, epoch()).unwrap();
@@ -3903,7 +4048,7 @@ mod manual_time_v5_parent {
     #[test]
     fn returned_dump_path_is_retained_and_legacy_unreturned_path_is_unchanged() {
         let root = std::env::temp_dir().join(format!("me-v5-root-policy-{}", Uuid::new_v4()));
-        let mut g = begin_group_at(root.clone(), request(), vec![15, 90, 15], true).unwrap();
+        let mut g = legacy_group_at(root.clone(), request(), vec![15, 90, 15]).unwrap();
         let r = Relation {
             parent_id: g.id,
             stage_id: g.stages.iter().find(|s| s.key == "dump").unwrap().id,

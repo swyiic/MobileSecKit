@@ -847,11 +847,23 @@ impl Contract {
             return Ok((r.reserved_bytes, allowance));
         }
         if self.planned_allocation {
+            let unused_capture = self.remaining();
+            let grow_linker = kind == "linker"
+                && self
+                    .time_plan
+                    .as_ref()
+                    .is_some_and(|plan| plan.schema == "mobilee.session-time-plan/v6");
             if let Some(slot) = self
                 .reservations
                 .iter_mut()
                 .find(|r| r.kind == kind && r.status == "planned")
             {
+                if grow_linker {
+                    slot.reserved_bytes = slot
+                        .reserved_bytes
+                        .saturating_add(unused_capture)
+                        .min(self.limits.total_bytes / 16);
+                }
                 slot.id = id;
                 slot.status = "reserved".into();
                 return Ok((slot.reserved_bytes, allowance));
@@ -1548,7 +1560,7 @@ fn planned_dump_ms(total_ms: u64) -> u64 {
 
 impl TimePlan {
     fn validate(&self, total_ms: u64) -> Result<(), String> {
-        if self.schema == "mobilee.session-time-plan/v5" {
+        if self.explicit() {
             return self.validate_explicit(total_ms);
         }
         if self.capture_max_ms.is_some()
@@ -1763,6 +1775,7 @@ impl Contract {
                 .ok_or("phase_time_exhausted: 不重置原阶段期限".into());
         }
         if plan.explicit() {
+            let exact_copy = plan.schema == "mobilee.session-time-plan/v6";
             let held = if collection_kind(kind) {
                 plan.capture_stop_at_parent_remaining_ms
                     .ok_or("采集截止点缺失")?
@@ -1784,11 +1797,14 @@ impl Contract {
                     .map(|p| p.cap_ms)
                     .sum()
             };
-            let grant = remaining
+            let available = remaining
                 .checked_sub(held)
                 .filter(|n| *n > 0)
-                .ok_or("parent_deadline_exhausted: capture or later save boundary")?
-                .min(plan.phases[index].cap_ms);
+                .ok_or("parent_deadline_exhausted: capture or later save boundary")?;
+            if exact_copy && collection_kind(kind) && available < plan.phases[index].cap_ms {
+                return Err(format!("phase_time_insufficient_for_exact_copy: {kind} 剩余 {available}ms 无法完整授予 {}ms；未缩短用户时长，阶段未启动",plan.phases[index].cap_ms));
+            }
+            let grant = available.min(plan.phases[index].cap_ms);
             let phase = &mut plan.phases[index];
             phase.stop_at_parent_remaining_ms = Some(remaining - grant);
             phase.started_at_parent_remaining_ms = Some(remaining);
@@ -2200,16 +2216,11 @@ impl TimePlan {
             return Err("时间计划观察窗口缺失".into());
         }
         if self.explicit() {
-            let padding = if durations[1] > 30 { 15 } else { 10 };
-            let caps = if separate {
-                vec![
-                    ("l0", (durations[0] + 10) * 1000),
-                    ("l1", (durations[1] + padding) * 1000),
-                    ("linker", (durations[2] + 10) * 1000),
-                ]
-            } else {
-                vec![("unified", (durations.iter().sum::<u64>() + 15) * 1000)]
-            };
+            let caps = explicit_observation_caps(
+                separate,
+                durations,
+                self.schema == "mobilee.session-time-plan/v6",
+            );
             if caps.iter().any(|(kind, cap)| {
                 !self
                     .phases
@@ -2630,9 +2641,42 @@ mod coordinated_export_tests {
 fn collection_kind(kind: &str) -> bool {
     matches!(kind, "l0" | "l1" | "linker" | "unified" | "dump")
 }
+fn explicit_observation_caps(
+    separate: bool,
+    durations: &[u64],
+    exact: bool,
+) -> Vec<(&'static str, u64)> {
+    if separate {
+        let padding = if durations[1] > 30 { 15 } else { 10 };
+        vec![
+            ("l0", (durations[0] + if exact { 55 } else { 10 }) * 1000),
+            (
+                "l1",
+                (durations[1] + if exact { 55 } else { padding }) * 1000,
+            ),
+            (
+                "linker",
+                (durations[2] + if exact { 55 } else { 10 }) * 1000,
+            ),
+        ]
+    } else {
+        vec![(
+            "unified",
+            (durations.iter().sum::<u64>() + if exact { 165 } else { 15 }) * 1000,
+        )]
+    }
+}
 impl TimePlan {
-    fn explicit(&self) -> bool {
-        self.schema == "mobilee.session-time-plan/v5"
+    pub(super) fn explicit(&self) -> bool {
+        matches!(
+            self.schema.as_str(),
+            "mobilee.session-time-plan/v5" | "mobilee.session-time-plan/v6"
+        )
+    }
+    pub(super) fn runtime_copy_ms(&self) -> Option<u64> {
+        (self.schema == "mobilee.session-time-plan/v6")
+            .then_some(self.l2_max_ms)
+            .flatten()
     }
     fn validate_explicit(&self, total_ms: u64) -> Result<(), String> {
         let capture = self.capture_max_ms.ok_or("缺显式采集时限")?;
@@ -2690,8 +2734,26 @@ impl TimePlan {
         let import = cap("import")?;
         let terminal = cap("terminal")?;
         let post = transfer + archive + import + terminal;
+        let exact_copy = self.schema == "mobilee.session-time-plan/v6";
+        let dump_cap = l2
+            .checked_add(if exact_copy { 70_000 } else { 0 })
+            .ok_or("L2阶段时限溢出")?;
+        if exact_copy
+            && self
+                .phases
+                .iter()
+                .filter(|p| collection_kind(&p.kind))
+                .map(|p| p.cap_ms)
+                .sum::<u64>()
+                > capture
+        {
+            return Err(
+                "v6总采集时限不足以容纳全部观察阶段、有效复制及准备/收尾；未缩短用户复制时长"
+                    .into(),
+            );
+        }
         if terminal != 5000
-            || cap("dump")? != l2
+            || cap("dump")? != dump_cap
             || capture + post != total_ms
             || self.capture_stop_at_parent_remaining_ms != Some(post)
             || self.final_reserve_ms != archive + import + terminal
@@ -2702,6 +2764,63 @@ impl TimePlan {
     }
 }
 impl Contract {
+    /// New parents keep the user's ready-to-copy window intact. Legacy v5
+    /// contracts retain their original L2 whole-stage interpretation.
+    pub fn new_exact_copy_with_time(
+        limits: Limits,
+        now: u64,
+        separate: bool,
+        durations: &[u64],
+        capture: CaptureTime,
+        save: SaveTime,
+    ) -> Result<Self, String> {
+        capture.validate()?;
+        if durations.len() != 3 || durations.iter().any(|n| !(1..=300).contains(n)) {
+            return Err("无效观察时间配置".into());
+        }
+        let observation_caps = explicit_observation_caps(separate, durations, true);
+        let observation = observation_caps.iter().map(|(_, cap)| *cap).sum::<u64>() / 1000;
+        let required = observation + capture.l2_max_seconds + 70;
+        if capture.max_seconds < required {
+            return Err(format!("总采集时限至少需要 {required} 秒：观察阶段 {observation} + 有效复制 {} + 准备 20 + 设备收尾 40 + 主机收尾 10；当前 {} 秒。未启动，未缩短有效复制时长",capture.l2_max_seconds,capture.max_seconds));
+        }
+        let copy_ms = capture.l2_max_seconds * 1000;
+        let mut contract =
+            Self::new_explicit_with_time(limits, now, separate, durations, capture, save)?;
+        // Reserve a bounded event-spool floor for the later Linker phase.
+        // Reserving 1/16 of a large total here stranded hundreds of MiB while
+        // static extraction failed. Linker may borrow unused capture capacity
+        // when it actually starts, never from the protected export slots.
+        if let Some(linker) = contract
+            .reservations
+            .iter_mut()
+            .find(|r| r.id == "planned:linker")
+        {
+            linker.reserved_bytes = linker.reserved_bytes.min(8 * 1024 * 1024);
+        }
+        let plan = contract.time_plan.as_mut().ok_or("缺时间计划")?;
+        plan.schema = "mobilee.session-time-plan/v6".into();
+        for (kind, cap) in observation_caps {
+            plan.phases
+                .iter_mut()
+                .find(|p| p.kind == kind)
+                .ok_or("缺观察阶段")?
+                .cap_ms = cap;
+        }
+        plan.phases
+            .iter_mut()
+            .find(|p| p.kind == "dump")
+            .ok_or("缺L2阶段")?
+            .cap_ms = copy_ms + 70_000;
+        contract.validate()?;
+        contract
+            .time_plan
+            .as_ref()
+            .ok_or("缺时间计划")?
+            .validate_observations(separate, durations)?;
+        Ok(contract)
+    }
+
     pub fn new_explicit_with_time(
         limits: Limits,
         now: u64,
@@ -2861,6 +2980,120 @@ impl Contract {
             return Err("原请求与显式时间计划不一致".into());
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod exact_time_v6 {
+    use super::*;
+    fn plan(capture: u64, separate: bool) -> Result<Contract, String> {
+        Contract::new_exact_copy_with_time(
+            Limits {
+                total_bytes: 8589934592,
+                max_seconds: capture + 965,
+            },
+            super::super::now_millis(),
+            separate,
+            &[25, 30, 20],
+            CaptureTime {
+                max_seconds: capture,
+                l2_max_seconds: 180,
+            },
+            SaveTime {
+                transfer_max_seconds: 600,
+                archive_max_seconds: 180,
+                import_max_seconds: 180,
+            },
+        )
+    }
+    #[test]
+    fn ready_copy_and_observations_keep_user_windows_separate_from_hard_caps() {
+        for separate in [true, false] {
+            let c = plan(600, separate).unwrap();
+            let p = c.time_plan.as_ref().unwrap();
+            assert_eq!(p.schema, "mobilee.session-time-plan/v6");
+            assert_eq!(p.runtime_copy_ms(), Some(180000));
+            assert_eq!(p.l2_max_ms, Some(180000));
+            assert_eq!(
+                p.phases.iter().find(|p| p.kind == "dump").unwrap().cap_ms,
+                250000
+            );
+            assert_eq!(
+                p.phases
+                    .iter()
+                    .filter(|p| collection_kind(&p.kind))
+                    .map(|p| p.cap_ms)
+                    .sum::<u64>(),
+                490000
+            );
+            p.validate_observations(separate, &[25, 30, 20]).unwrap();
+            let restored: Contract =
+                serde_json::from_value(serde_json::to_value(&c).unwrap()).unwrap();
+            restored.validate().unwrap();
+            assert_eq!(restored.time_plan.unwrap().runtime_copy_ms(), Some(180000));
+        }
+        assert!(plan(489, true).err().unwrap().contains("490"));
+        assert!(plan(489, false).is_err());
+    }
+    #[test]
+    fn insufficient_live_hard_grant_refuses_instead_of_clipping_effective_copy() {
+        let mut c = plan(600, true).unwrap();
+        c.deadline_token = Some(super::super::session_deadline::Deadline::register(
+            Duration::from_millis(965000 + 249000),
+        ));
+        let error = c
+            .begin_time_phase("dump", super::super::now_millis())
+            .err()
+            .unwrap();
+        assert!(error.contains("phase_time_insufficient_for_exact_copy"));
+        assert_eq!(
+            c.time_plan.as_ref().unwrap().runtime_copy_ms(),
+            Some(180000)
+        );
+        assert!(c
+            .time_plan
+            .as_ref()
+            .unwrap()
+            .phases
+            .iter()
+            .find(|p| p.kind == "dump")
+            .unwrap()
+            .started_unix_ms
+            .is_none());
+    }
+    #[test]
+    fn v5_retains_original_caps_and_never_acquires_runtime_copy_argument() {
+        let c = Contract::new_explicit_with_time(
+            Limits {
+                total_bytes: 4294967296,
+                max_seconds: 38,
+            },
+            super::super::now_millis(),
+            true,
+            &[15, 90, 15],
+            CaptureTime {
+                max_seconds: 30,
+                l2_max_seconds: 1,
+            },
+            SaveTime {
+                transfer_max_seconds: 1,
+                archive_max_seconds: 1,
+                import_max_seconds: 1,
+            },
+        )
+        .unwrap();
+        let p = c.time_plan.as_ref().unwrap();
+        assert_eq!(p.schema, "mobilee.session-time-plan/v5");
+        assert_eq!(
+            p.phases.iter().find(|p| p.kind == "dump").unwrap().cap_ms,
+            1000
+        );
+        assert_eq!(
+            p.phases.iter().find(|p| p.kind == "l1").unwrap().cap_ms,
+            105000
+        );
+        assert_eq!(p.runtime_copy_ms(), None);
+        c.validate().unwrap();
     }
 }
 
@@ -3205,5 +3438,64 @@ mod cooperative_read_deadline_tests {
         assert!(result.unwrap_err().contains("parent_deadline_exhausted"));
         assert_eq!(calls.load(Ordering::SeqCst), 1);
         assert!(parent.check().is_ok());
+    }
+}
+
+#[cfg(test)]
+mod capture_byte_allocation_regressions {
+    use super::*;
+
+    #[test]
+    fn exact_copy_does_not_strand_large_linker_reservation() {
+        let mut c = Contract::new_exact_copy_with_time(
+            Limits {
+                total_bytes: 8 * 1024 * 1024 * 1024,
+                max_seconds: 1565,
+            },
+            1,
+            true,
+            &[25, 30, 20],
+            CaptureTime {
+                max_seconds: 600,
+                l2_max_seconds: 180,
+            },
+            SaveTime {
+                transfer_max_seconds: 600,
+                archive_max_seconds: 180,
+                import_max_seconds: 180,
+            },
+        )
+        .unwrap();
+        let before = c.remaining();
+        assert_eq!(
+            c.reservations
+                .iter()
+                .find(|r| r.kind == "linker")
+                .unwrap()
+                .reserved_bytes,
+            8 * 1024 * 1024
+        );
+        assert!(before > 1900 * 1024 * 1024);
+        let (dump, _) = c.reserve("dump-test".into(), "dump", 2).unwrap();
+        assert!(dump > 1900 * 1024 * 1024);
+        assert!(dump <= super::super::planned_transfer_payload_limit(2 << 30, 2 << 30, 2 << 30));
+        let export_before: Vec<_> = c
+            .reservations
+            .iter()
+            .filter(|r| export_kind(&r.kind))
+            .map(|r| r.reserved_bytes)
+            .collect();
+        let (linker, _) = c.reserve("linker-test".into(), "linker", 3).unwrap();
+        assert!(linker >= 8 * 1024 * 1024);
+        assert!(linker <= 512 * 1024 * 1024);
+        assert_eq!(
+            export_before,
+            c.reservations
+                .iter()
+                .filter(|r| export_kind(&r.kind))
+                .map(|r| r.reserved_bytes)
+                .collect::<Vec<_>>()
+        );
+        c.validate().unwrap();
     }
 }

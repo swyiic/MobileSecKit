@@ -132,7 +132,7 @@ fn runtime_root(group: &Group) -> Result<String, String> {
 /// those bytes escaped. Our allowlisted paths contain none of those bytes, so
 /// equality/ancestor checks stay literal, while descendants match before any
 /// escaped component. No mount-derived text is evaluated or passed as a command.
-fn mount_checks(path: &str) -> Result<String, String> {
+pub(super) fn mount_checks(path: &str) -> Result<String, String> {
     if !clean_path(path) {
         return Err("设备 mount 检查路径不在规范 allowlist 内".into());
     }
@@ -174,7 +174,7 @@ unset me_mountinfo
     ))
 }
 
-fn canonical_checks(path: &str, allow_absent_leaf: bool) -> Result<String, String> {
+pub(super) fn canonical_checks(path: &str, allow_absent_leaf: bool) -> Result<String, String> {
     if !clean_path(path) {
         return Err("设备清理路径不在规范 allowlist 内".into());
     }

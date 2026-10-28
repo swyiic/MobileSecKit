@@ -229,6 +229,9 @@ pub fn initialize_host_environment(directory: Option<&Path>) -> Result<String, S
     ] {
         push_path(&mut paths, path);
     }
+    for directory in crate::analyzer_tools::android_build_tool_directories() {
+        push_path(&mut paths, directory);
+    }
     let home = std::env::var_os("HOME")
         .or_else(|| std::env::var_os("USERPROFILE"))
         .map(PathBuf::from);
@@ -745,16 +748,15 @@ async fn run_configured_static_tool(
     } else {
         vec![
             "-q".into(),
+            "--no-res".into(),
+            "--threads-count".into(),
+            "4".into(),
             "-d".into(),
             output_dir.to_string_lossy().into_owned(),
             apk.into(),
         ]
     };
-    let output = run_explicit_program(&cli, &args).await?;
-    if output.code != Some(0) {
-        let _ = fs::remove_dir_all(&output_dir);
-        return Err(output_text(&output));
-    }
+    let output = run_explicit_program(&cli, &args).await;
     let rule_set = rules::load_rules(None)?;
     let mut result = scan_decoded_directory(&output_dir, kind, &rule_set);
     let manifest_candidates = if kind == "apktool" {
@@ -768,7 +770,32 @@ async fn run_configured_static_tool(
     result.manifest_xml = manifest_candidates
         .into_iter()
         .find_map(|candidate| fs::read_to_string(candidate).ok());
+    let failure = match output {
+        Ok(output) if output.code != Some(0) => Some(format!(
+            "{}exit={:?}: {}",
+            if kind == "jadx" && output.code == Some(3) {
+                "反编译已结束，但存在反编译错误；"
+            } else {
+                ""
+            },
+            output.code,
+            output_text(&output).chars().take(2000).collect::<String>()
+        )),
+        Err(error) => Some(error),
+        _ => None,
+    };
     let _ = fs::remove_dir_all(&output_dir);
+    if let Some(error) = failure {
+        if result.sensitive_items.is_empty()
+            && result.code_insights.is_empty()
+            && result.manifest_xml.is_none()
+        {
+            return Err(error);
+        }
+        result.warnings.push(format!(
+            "{kind} 返回部分结果，已分析生成的源码；完整性未确认：{error}"
+        ));
+    }
     Ok(result)
 }
 
@@ -840,13 +867,22 @@ async fn run_explicit_program(program: &Path, args: &[String]) -> Result<RawOutp
     if !program.is_file() {
         return Err(format!("工具路径不存在：{}", program.display()));
     }
+    let java_home = crate::analyzer_tools::java_home();
     let mut command = if program.extension().and_then(|value| value.to_str()) == Some("jar") {
-        let mut command = Command::new("java");
+        let mut command = Command::new(
+            java_home
+                .as_ref()
+                .map(|home| home.join("bin/java"))
+                .unwrap_or_else(|| PathBuf::from("java")),
+        );
         command.arg("-jar").arg(program);
         command
     } else {
         Command::new(program)
     };
+    if let Some(home) = java_home {
+        command.env("JAVA_HOME", home);
+    }
     command.args(args);
     configure_background_command(&mut command);
     let output = timeout(Duration::from_secs(600), command.output())
@@ -858,6 +894,50 @@ async fn run_explicit_program(program: &Path, args: &[String]) -> Result<RawOutp
         stderr: String::from_utf8_lossy(&output.stderr).trim().to_string(),
         code: output.status.code(),
     })
+}
+
+enum ApkSignerFailure {
+    Missing,
+    Spawn(String),
+    Timeout,
+}
+
+async fn run_apksigner_verify(apk: &str) -> Result<RawOutput, ApkSignerFailure> {
+    let program = crate::analyzer_tools::discover_android_build_tool("apksigner", None)
+        .ok_or(ApkSignerFailure::Missing)?;
+    let mut command = Command::new(program);
+    command.args(["verify", "--verbose", "--print-certs", apk]);
+    if let Some(home) = crate::analyzer_tools::java_home() {
+        command.env("JAVA_HOME", home);
+    }
+    configure_background_command(&mut command);
+    let output = timeout(ADB_TIMEOUT, command.output())
+        .await
+        .map_err(|_| ApkSignerFailure::Timeout)?
+        .map_err(|error| ApkSignerFailure::Spawn(error.to_string()))?;
+    Ok(RawOutput {
+        stdout: String::from_utf8_lossy(&output.stdout).trim().to_owned(),
+        stderr: String::from_utf8_lossy(&output.stderr).trim().to_owned(),
+        code: output.status.code(),
+    })
+}
+
+fn verified_apksigner_output(
+    result: Result<RawOutput, ApkSignerFailure>,
+) -> Result<RawOutput, String> {
+    let output = result.map_err(|failure| match failure {
+        ApkSignerFailure::Missing => "未找到 apksigner（Android SDK build-tools）：请配置主机工具目录或安装 SDK build-tools；签名验证未执行".into(),
+        ApkSignerFailure::Spawn(error) => format!("apksigner 启动失败：{error}；签名未验证"),
+        ApkSignerFailure::Timeout => "apksigner 签名验证超时，已停止子进程；签名未验证".into(),
+    })?;
+    if output.code != Some(0) {
+        return Err(format!(
+            "apksigner 签名验证未通过或未完成（exit={:?}）；未将签名标记为已验证：{}",
+            output.code,
+            output_text(&output).chars().take(2000).collect::<String>()
+        ));
+    }
+    Ok(output)
 }
 
 async fn run_host_at(
@@ -5161,8 +5241,10 @@ pub async fn analyze_app(request: AnalyzeAppRequest) -> Result<AppAnalysis, Stri
         .apktool_path
         .filter(|value| !value.trim().is_empty())
         .or_else(|| executable_path("apktool"));
-    let jadx_path = request
-        .jadx_path
+    let configured_jadx = request.jadx_path.unwrap_or_default();
+    let jadx_path = crate::analyzer_tools::discover_jadx_cli(&configured_jadx, "")
+        .map(|path| path.to_string_lossy().into_owned())
+        .or(Some(configured_jadx))
         .filter(|value| !value.trim().is_empty())
         .or_else(|| executable_path("jadx"))
         .or_else(|| executable_path("jadx-cli"));
@@ -5325,48 +5407,38 @@ pub async fn analyze_app(request: AnalyzeAppRequest) -> Result<AppAnalysis, Stri
                 analysis.tools_used.push("aapt".into());
             }
         }
-        if let Ok(output) = run_host(
-            "apksigner",
-            &[
-                "verify".into(),
-                "--verbose".into(),
-                "--print-certs".into(),
-                path.clone(),
-            ],
-        )
-        .await
-        {
-            let signature_lines: Vec<_> = output
-                .stdout
-                .lines()
-                .filter(|line| {
-                    line.contains("Signer #")
-                        || line.contains("Verified using v")
-                        || line.contains("Number of signers")
-                })
-                .take(20)
-                .map(str::to_string)
-                .collect();
-            analysis.signature = (!signature_lines.is_empty()).then(|| signature_lines.join("\n"));
-            if output.stdout.to_ascii_lowercase().contains("android debug") {
-                analysis.findings.push(AppFinding {
-                    severity: "high".into(),
-                    title: "APK 使用调试证书".into(),
-                    detail: "签名主题包含 Android Debug，请勿用于正式发布。".into(),
-                });
+        match verified_apksigner_output(run_apksigner_verify(&path).await) {
+            Ok(output) => {
+                let signature_lines: Vec<_> = output
+                    .stdout
+                    .lines()
+                    .filter(|line| {
+                        line.contains("Signer #")
+                            || line.contains("Verified using v")
+                            || line.contains("Number of signers")
+                    })
+                    .take(20)
+                    .map(str::to_string)
+                    .collect();
+                analysis.signature =
+                    (!signature_lines.is_empty()).then(|| signature_lines.join("\n"));
+                if output.stdout.to_ascii_lowercase().contains("android debug") {
+                    analysis.findings.push(AppFinding {
+                        severity: "high".into(),
+                        title: "APK 使用调试证书".into(),
+                        detail: "签名主题包含 Android Debug，请勿用于正式发布。".into(),
+                    });
+                }
+                if output.stdout.contains("SHA1withRSA") || output.stdout.contains("MD5withRSA") {
+                    analysis.findings.push(AppFinding {
+                        severity: "high".into(),
+                        title: "APK 使用弱签名算法".into(),
+                        detail: "检测到 SHA1withRSA/MD5withRSA，建议升级签名算法。".into(),
+                    });
+                }
+                analysis.tools_used.push("apksigner".into());
             }
-            if output.stdout.contains("SHA1withRSA") || output.stdout.contains("MD5withRSA") {
-                analysis.findings.push(AppFinding {
-                    severity: "high".into(),
-                    title: "APK 使用弱签名算法".into(),
-                    detail: "检测到 SHA1withRSA/MD5withRSA，建议升级签名算法。".into(),
-                });
-            }
-            analysis.tools_used.push("apksigner".into());
-        } else {
-            analysis
-                .missing_dependencies
-                .push("未找到 apksigner（Android SDK build-tools）：可在全局设置的“主机工具目录”中配置 build-tools 目录，或安装 Android SDK build-tools 后重新分析；当前暂不能验证 V1/V2/V3 签名与证书摘要".into());
+            Err(error) => analysis.missing_dependencies.push(error),
         }
         for (configured, kind, label) in [
             (apktool_path.as_deref(), "apktool", "Apktool"),
@@ -5401,7 +5473,9 @@ pub async fn analyze_app(request: AnalyzeAppRequest) -> Result<AppAnalysis, Stri
                         sensitive_items,
                         code_insights,
                         manifest_xml,
+                        warnings,
                     } = result;
+                    analysis.missing_dependencies.extend(warnings);
                     analysis.sensitive_items.extend(sensitive_items);
                     analysis.code_insights.extend(code_insights);
                     if analysis.manifest_xml.is_none() {

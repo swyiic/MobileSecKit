@@ -113,19 +113,29 @@
         <label><span>采样 1 / N</span><input v-model.number="captureForm.sampleOneIn" :disabled="captureRunning" type="number" min="1" max="10000" /></label>
         <label><span>L1 Inspect 组合{{ captureForm.plan === 'auto' ? '（L1 阶段固定组合）' : '' }}</span><select v-model="captureForm.inspectMode" :disabled="captureRunning || captureForm.plan === 'auto'"><option value="none">关闭（仅 L0）</option><option value="tls">TLS plaintext</option><option value="jni_plaintext">JNI plaintext</option><option value="binder_userspace">Binder userspace</option><option value="tls_jni">TLS + JNI</option><option value="binder_jni">Binder + JNI</option><option value="tls_binder">TLS + Binder</option><option value="tls_binder_jni">TLS + Binder + JNI</option><option value="linker_so_load">Linker SO load（独占）</option></select></label>
         <label><span>明文/命中上限</span><select v-model.number="captureForm.inspectMaxBytes" :disabled="captureRunning"><option :value="256">256 B</option><option :value="1024">1 KiB</option><option :value="4096">4 KiB</option><option :value="16384">16 KiB</option><option :value="65536">64 KiB</option></select></label>
+        <div v-if="captureForm.plan === 'auto'" class="wide ks-auto-time-summary">
+          <strong>自动观察 {{ autoObservationSeconds }} 秒，随后复制、拉取并解析</strong>
+          <div class="ks-timing-presets">
+            <button v-for="preset in autoTimingChoices" :key="preset.key" :disabled="captureRunning" :aria-pressed="selectedTimingPreset === preset.key" @click="applyAutomaticTiming(preset.key)">{{ preset.label }}</button>
+          </div>
+          <small>默认无需配置。完成即进入下一步；文件多时保存较久。自动采集不会代替登录或进入直播、购物等业务。</small>
+        </div>
+        <details v-if="captureForm.plan === 'auto'" class="wide ks-advanced-capture"><summary>高级时间设置 · 观察窗口与超时保护</summary><div class="ks-capture-form">
         <label v-if="captureForm.plan === 'auto'"><span>L0 主干（秒）</span><input v-model.number="captureForm.autoL0Seconds" :disabled="captureRunning" type="number" min="1" max="300" /></label>
         <label v-if="captureForm.plan === 'auto'"><span>L0+L1 观察窗（秒）</span><input v-model.number="captureForm.autoL1Seconds" :disabled="captureRunning" type="number" min="1" max="300" /></label>
         <label v-if="captureForm.plan === 'auto'"><span>Linker（秒）</span><input v-model.number="captureForm.autoLinkerSeconds" :disabled="captureRunning" type="number" min="1" max="300" /></label>
         <p v-if="captureForm.plan === 'auto'" class="ks-form-help wide">{{ captureClockText }}</p>
-        <div v-if="captureForm.plan === 'auto'" class="wide ks-manual-timing">
-          <label><span>总采集时限（秒）</span><input v-model.number="captureForm.captureMaxSeconds" :disabled="captureRunning" type="number" min="30" max="3600" step="1" /><small>L0、L1、Linker、L2 共用，含启动与挂载；到限停止采集并保留已有证据。</small></label>
-          <label><span>L2 快照上限（秒）</span><input v-model.number="captureForm.l2MaxSeconds" :disabled="captureRunning" type="number" min="1" :max="captureForm.captureMaxSeconds" step="1" /><small>占用总采集时限，不额外增加总等待。</small></label>
+        <div class="wide ks-manual-timing">
+          <label><span>采集流程保护上限（秒）</span><input v-model.number="captureForm.captureMaxSeconds" :disabled="captureRunning" type="number" min="30" max="3600" step="1" /><small>包含观察、复制、准备和收尾。须容纳全部有效时长；不足时拒绝启动。</small></label>
+          <label><span>L2 有效复制上限（秒）</span><input v-model.number="captureForm.l2MaxSeconds" :disabled="captureRunning" type="number" min="1" :max="Math.max(1, autoTimeAllocation.copyPlan?.maximumCopySeconds ?? captureForm.captureMaxSeconds)" step="1" /><small>手机 ready 后开始计时；准备与收尾另预留 70 秒，不占用此复制预算。</small></label>
           <label><span>保存传输上限（秒）</span><input v-model.number="captureForm.transferMaxSeconds" :disabled="captureRunning" type="number" min="1" max="3600" step="1" /><small>采集结束后拉取已保留的产物。</small></label>
           <label><span>归档上限（秒）</span><input v-model.number="captureForm.archiveMaxSeconds" :disabled="captureRunning" type="number" min="1" max="3600" step="1" /><small>将已收到的证据封装归档。</small></label>
           <label><span>导入上限（秒）</span><input v-model.number="captureForm.importMaxSeconds" :disabled="captureRunning" type="number" min="1" max="3600" step="1" /><small>校验并导入本地证据。</small></label>
-          <p class="ks-form-help wide ks-whole-wait" role="status">整体等待上限 {{ captureForm.maxSessionSeconds }} 秒 = 采集 {{ captureForm.captureMaxSeconds }} + 传输 {{ captureForm.transferMaxSeconds }} + 归档 {{ captureForm.archiveMaxSeconds }} + 导入 {{ captureForm.importMaxSeconds }} + 终态 5。保存计时与采集分开；各阶段可能提前结束，实际耗时以原记录为准。</p>
-          <p class="ks-form-help wide">写入预算 {{ captureForm.totalBudgetMiB }} MiB。{{ autoTimeAllocation?.valid ? '时间设置有效；各观察窗是请求值，共用总采集时限，到限可提前结束并标为 partial。' : '时间设置无效：采集必须为30–3600秒、L2与保存各项为1–3600秒整数，L2不能大于采集，总等待不能超过3600秒。' }}缩短时间会缩小覆盖；不消除丢样或补齐缺失证据。</p>
+          <p class="ks-form-help wide ks-whole-wait" role="status">异常超时保护 {{ captureForm.maxSessionSeconds }} 秒（不是预计耗时） = 采集流程保护 {{ captureForm.captureMaxSeconds }} + 传输 {{ captureForm.transferMaxSeconds }} + 归档 {{ captureForm.archiveMaxSeconds }} + 导入 {{ captureForm.importMaxSeconds }} + 终态 5。保存计时与采集分开；实际耗时以原记录为准。</p>
+          <p v-if="captureBytePlan" class="ks-form-help wide">累计写入预算 {{ captureForm.totalBudgetMiB }} MiB；包产物写入上限约 {{ formatBytes(captureBytePlan.dumpUpperBound) }}（还需扣除 L0/L1 实际写入）。传输、归档、导入各预留 {{ formatBytes(captureBytePlan.eachExport) }}。容量不足应调整写入预算；延长采集时间不能补足容量。</p>
+          <p class="ks-form-help wide">{{ autoTimeAllocation.valid ? '时间设置有效；已完整预留观察阶段与有效复制预算，源退出、错误或额度到限仍可能留下 partial。' : `时间设置无效：${autoTimeAllocation.error}` }}观察时间只影响时间窗；未进入的业务、未登录页面和不支持的采集能力不会因等待而补齐。</p>
         </div>
+        </div></details>
       </div>
       <div class="ks-sensor-switches">
         <label><input v-model="captureForm.files" :disabled="captureRunning" type="checkbox" />File open</label>
@@ -209,27 +219,31 @@
       <p v-if="trashMessage" class="ks-trash-message" role="status">{{ trashMessage }}</p>
       <p v-if="purgeMessage" class="ks-trash-message" role="status">{{ purgeMessage }}</p>
       <KernSightGroupPurge v-if="purgeTarget && !visibleCaptureGroups.some(g => g.id === purgeTarget?.parentId) && !trashedCaptureGroups.some(e => e.group.id === purgeTarget?.parentId)" :target="purgeTarget" :busy="purgeBusy" :active="active && workspaceMode === 'evidence'" @close="closePurgePreview" @executing="purgeExecuting = $event" @complete="completePurge" @uncertain="loadPurgeReports" />
-      <details v-if="trashedCaptureGroups.length" class="ks-group-trash">
-        <summary>主会话回收站 · {{ trashedCaptureGroups.length }}</summary>
+      <details v-if="recoverableCaptureGroups.length" class="ks-group-trash">
+        <summary>主会话回收站 · {{ recoverableCaptureGroups.length }}</summary>
         <p>这里只移除会话列表记录，可恢复。原始证据、导入目录与设备文件保留，不释放磁盘空间。</p>
-        <article v-for="entry in trashedCaptureGroups" :key="entry.group.id">
+        <article v-for="entry in recoverableCaptureGroups" :key="entry.group.id">
           <span>{{ entry.group.package }} · {{ shortSession(entry.group.id) }} · {{ captureGroupStateLabel(entry.group) }} · {{ formatDate(entry.trashedUnixMs) }}</span>
           <button class="ghost-button" :disabled="Boolean(changingTrashGroup)" @click="restoreCaptureGroup(entry)">{{ changingTrashGroup === entry.group.id ? '处理中…' : '恢复主会话' }}</button>
-          <button class="ghost-button danger-button" :disabled="!canPurgeCaptureGroup(entry.group)" @click="openPurgePreview(entry.group)">永久清理本地与手机</button>
+          <button class="ghost-button danger-button" :disabled="!canPurgeCaptureGroup(entry.group)" @click="deleteCaptureGroup(entry.group)">永久清理本地与手机</button>
           <OperationError :message="operationErrors[`restore:${entry.group.id}`]" />
           <KernSightGroupPurge v-if="purgeTarget?.parentId === entry.group.id" :target="purgeTarget" :busy="purgeBusy" :active="active && workspaceMode === 'evidence'" @close="closePurgePreview" @executing="purgeExecuting = $event" @complete="completePurge" @uncertain="loadPurgeReports" />
         </article>
       </details>
+      <div v-if="pendingDeletions.length" class="ks-group-trash" role="status">
+        <p>会话已移除，正在后台释放空间；设备断开时自动等待重连。</p>
+        <p v-for="entry in pendingDeletions" :key="entry.group.id">{{ entry.group.package }} · {{ shortSession(entry.group.id) }} · 本地{{ entry.deletion?.localDone ? '已清理' : '待清理' }} / 手机{{ entry.deletion?.deviceDone ? '已清理' : '待清理' }}<small v-if="entry.deletion?.error"> · {{ entry.deletion.error }}</small></p>
+      </div>
       <div class="ks-session-list">
         <details v-for="group in visibleCaptureGroups" :key="group.id" class="ks-session-row ks-capture-group" :open="selectedCaptureGroup===group.id">
           <summary @click.prevent="toggleCaptureGroup(group.id)"><strong>{{ group.package }}</strong><b :class="`state-${group.state}`">{{ runningCaptureGroup === group.id ? '自动执行中' : captureGroupStateLabel(group) }}</b><div class="ks-group-meta"><FullValue class="ks-session-id" label="主会话 ID" :value="group.id" :display-value="shortSession(group.id)" monospace /><time :datetime="isoDate(group.createdUnixMs)" :title="formatDate(group.createdUnixMs)">{{ formatDate(group.createdUnixMs) }}</time><span>{{ group.unified ? '统一阶段' : '启动重采' }} · 主会话</span><span>{{ group.serial }}</span></div></summary>
           <template v-if="selectedCaptureGroup === group.id">
           <div class="ks-group-information">
           <details class="ks-group-budget"><summary>预算与采集边界</summary>
-          <p class="muted">{{ group.budget?.timePlan ? `L2 上限 ${phaseSeconds(group, 'dump')}s。` : '' }}{{ group.budget ? `会话写入预算 ${formatBytes(group.budget.limits.totalBytes)} · 期限 ${group.budget.limits.maxSeconds}s · 预留 ${group.budget.reservations.length} 个输出操作；计量为写入准入 + 终态预留，物理占用见本地统计` : '旧会话预算 / 采集范围未知，不视为完整或受限成功' }}</p>
+          <p class="muted">{{ group.budget?.timePlan ? `${group.budget.timePlan.schema === 'mobilee.session-time-plan/v6' ? 'L2 阶段硬上限（含准备与收尾）' : 'L2 上限'} ${phaseSeconds(group, 'dump')}s。` : '' }}{{ group.budget ? `会话写入预算 ${formatBytes(group.budget.limits.totalBytes)} · 期限 ${group.budget.limits.maxSeconds}s · 预留 ${group.budget.reservations.length} 个输出操作；计量为写入准入 + 终态预留，物理占用见本地统计` : '旧会话预算 / 采集范围未知，不视为完整或受限成功' }}</p>
           <div class="ks-time-ledger">
             <p><strong>已记录观察窗：</strong>{{ groupObservationPlan(group) }}。不含准备、快照和保存。</p>
-            <template v-if="group.budget?.timePlan"><p><strong>原任务时间计划：</strong>{{ group.budget.timePlan.schema }} · 来自该主会话原记录；上限与实际耗时分开，整体父期限不是 L2 独立时限。</p><p v-if="group.budget.timePlan.captureMaxMs != null">总采集上限 {{ formatElapsedSeconds(group.budget.timePlan.captureMaxMs) }}s · L2 上限 {{ formatElapsedSeconds(group.budget.timePlan.l2MaxMs) }}s（共用采集时限）· 整体等待 {{ group.budget.limits.maxSeconds }}s；保存各阶段独立计时。</p><dl><div v-for="phase in group.budget.timePlan.phases" :key="phase.kind"><dt>{{ timePhaseLabel(phase.kind) }}</dt><dd><span>配置上限 {{ formatElapsedSeconds(phase.capMs) }}s</span><span>{{ phaseActualLabel(phase, group.budget.timePlan.schema) }}</span><small v-if="phase.startedUnixMs != null">开始 {{ formatDate(phase.startedUnixMs) }}{{ phase.finishedUnixMs == null ? '' : ` · 结束 ${formatDate(phase.finishedUnixMs)}` }}</small></dd></div></dl></template>
+            <template v-if="group.budget?.timePlan"><p><strong>原任务时间计划：</strong>{{ group.budget.timePlan.schema }} · 来自该主会话原记录；上限与实际耗时分开，整体父期限不是 L2 独立时限。</p><p v-if="group.budget.timePlan.captureMaxMs != null">{{ group.budget.timePlan.schema === 'mobilee.session-time-plan/v6' ? '采集流程保护上限' : '总采集上限' }} {{ formatElapsedSeconds(group.budget.timePlan.captureMaxMs) }}s · <template v-if="group.budget.timePlan.schema === 'mobilee.session-time-plan/v6'">L2 有效复制上限 {{ formatElapsedSeconds(group.budget.timePlan.l2MaxMs) }}s（手机 ready 后计时，准备与收尾另列入阶段硬上限）</template><template v-else>L2 上限 {{ formatElapsedSeconds(group.budget.timePlan.l2MaxMs) }}s（旧合同共用采集时限，包含准备与收尾；不会按当前有效复制语义重解释）</template>· 整体等待 {{ group.budget.limits.maxSeconds }}s；保存各阶段独立计时。</p><dl><div v-for="phase in group.budget.timePlan.phases" :key="phase.kind"><dt>{{ phase.kind === 'dump' && group.budget.timePlan.schema === 'mobilee.session-time-plan/v6' ? 'L2 阶段（含准备与收尾）' : timePhaseLabel(phase.kind) }}</dt><dd><span>配置上限 {{ formatElapsedSeconds(phase.capMs) }}s</span><span>{{ phaseActualLabel(phase, group.budget.timePlan.schema) }}</span><small v-if="phase.startedUnixMs != null">开始 {{ formatDate(phase.startedUnixMs) }}{{ phase.finishedUnixMs == null ? '' : ` · 结束 ${formatDate(phase.finishedUnixMs)}` }}</small></dd></div></dl></template>
             <p v-else>旧记录未保存分阶段时间计划；不会用当前设置反推旧任务上限。</p>
             <p><strong title="系统时钟调整会影响原记录开始、结束时间之差；实际耗时以阶段计时记录为准。">记录时间间隔：</strong>由原记录的开始和结束时间计算；实际耗时见上方阶段计时。</p>
             <dl><template v-for="stage in group.stages" :key="stage.id"><div v-for="attempt in stage.attempts" :key="attempt.relation.attemptId"><dt>{{ timePhaseLabel(stage.key) }} · 第 {{ attempt.relation.attempt }} 次</dt><dd>{{ attempt.finishedUnixMs == null ? '终态未知' : `${formatElapsedSeconds(attempt.finishedUnixMs - attempt.startedUnixMs)}s` }}</dd></div></template></dl>
@@ -270,10 +284,8 @@
           <div v-if="!group.cancelRequested && (runningCaptureGroup === group.id || group.state === 'running') && captureGroups.some(item => item.id === group.id && item.serial === device?.serial)" class="ks-operation-slot"><button class="ghost-button" @click="cancelCaptureGroup(group)">请求取消（当前阶段封存后停止）</button><OperationError :message="operationErrors[`cancel:${group.id}`]" @dismiss="dismissOperation(`cancel:${group.id}`)" /></div><span v-if="group.cancelRequested && runningCaptureGroup === group.id" class="ks-form-help" role="status">已请求取消，正在等待当前阶段封存</span>
           <div v-if="(group.stages.some(s=>s.attempts.some(a=>Boolean(a.sessionId))) || group.stages.some(s=>s.key==='dump'&&['succeeded','partial','failed'].includes(s.attempts[s.attempts.length-1]?.state||''))) && captureGroups.some(g=>g.id===group.id && g.serial===device?.serial)" class="ks-operation-slot"><button class="ghost-button" :disabled="pullingPackage || purgeExecuting" @click="pullCaptureGroup(group)">拉取本次主会话已确认信息</button><OperationError :message="operationErrors[`pull:${group.id}`]" @dismiss="dismissOperation(`pull:${group.id}`)" /><p v-if="operationMessages[`pull:${group.id}`]" class="ks-operation-message" role="status">{{ operationMessages[`pull:${group.id}`] }}<button @click="operationMessages[`pull:${group.id}`] = ''">关闭</button></p></div>
           <div class="ks-operation-slot">
-          <template v-if="pendingTrashGroup === group.id"><p class="ks-trash-confirm">将此主会话及已打开的同次导入记录移入回收站？子会话归属与原始证据保留，可恢复；不会释放设备或本地空间。</p><div class="ks-title-actions"><button class="ghost-button" :disabled="Boolean(changingTrashGroup)" @click="pendingTrashGroup = ''">取消移除</button><button class="ghost-button danger-button" :disabled="!canTrashCaptureGroup(group)" @click="confirmTrashCaptureGroup(group)">确认移入回收站</button></div></template>
-          <button v-else class="ghost-button danger-button" :disabled="!canTrashCaptureGroup(group)" :title="canTrashCaptureGroup(group) ? '移除列表记录，可从回收站恢复；不释放磁盘空间' : '采集或拉取期间不可移除，请等待封存'" @click="pendingTrashGroup = group.id">移入回收站</button><OperationError :message="operationErrors[`trash:${group.id}`]" @dismiss="dismissOperation(`trash:${group.id}`)" />
+          <button class="ghost-button danger-button" :disabled="!canPurgeCaptureGroup(group)" title="删除本次主会话及全部子会话，本地与手机文件在后台清理" @click="deleteCaptureGroup(group)">删除会话及全部子会话</button><OperationError :message="operationErrors[`delete:${group.id}`]" />
           </div>
-          <div class="ks-operation-slot"><button class="ghost-button danger-button" :disabled="!canPurgeCaptureGroup(group)" @click="openPurgePreview(group)">永久清理本地与手机</button></div>
           <div v-if="operationErrors[`save:${group.id}`] || operationMessages[`save:${group.id}`]" class="ks-group-save-feedback"><strong>自动保存</strong><OperationError :message="operationErrors[`save:${group.id}`]" @dismiss="dismissOperation(`save:${group.id}`)" /><p v-if="operationMessages[`save:${group.id}`]" class="ks-operation-message" role="status">{{ operationMessages[`save:${group.id}`] }}<button @click="operationMessages[`save:${group.id}`] = ''">关闭</button></p></div>
           <OperationError :message="operationErrors[`capture:${group.id}`]" @dismiss="dismissOperation(`capture:${group.id}`)" />
           <KernSightGroupPurge v-if="purgeTarget?.parentId === group.id" :target="purgeTarget" :busy="purgeBusy" :active="active && workspaceMode === 'evidence'" @close="closePurgePreview" @executing="purgeExecuting = $event" @complete="completePurge" @uncertain="loadPurgeReports" />
@@ -475,6 +487,12 @@
       <div class="ks-selected-package-bar"><button v-if="device && selectedEvidenceSource === 'device'" class="primary-button" :disabled="pullingPackage || purgeExecuting" @click="pullSelectedPackageEvidence()">{{ pullingPackage ? '正在拉取并解析…' : '拉取全部信息' }}</button><button v-else-if="selectedLocalBundle" class="ghost-button" :disabled="pullingPackage || purgeExecuting" @click="exportSelectedEvidenceArchive">{{ pullingPackage ? '正在封装…' : '导出 .mee' }}</button><b :class="`source-${selectedEvidenceSource}`">{{ selectedEvidenceSource === 'local' ? '本地证据' : '手机端证据' }}</b><span>Dump {{ selectedPackageDump.dump_id || 'legacy' }}</span><span v-if="selectedPackageDump.local_storage_accounting">本地逻辑 {{ formatMaybeBytes(selectedPackageDump.local_storage_accounting.logical_file_bytes) }} · 分配 {{ allocatedEvidenceLabel(selectedPackageDump.local_storage_accounting.allocated_bytes) }} · 已验证代码重复 {{ formatMaybeBytes(selectedPackageDump.local_storage_accounting.verified_code_duplicate_bytes) }}（账面，非物理节省）</span><span>{{ selectedPackageDump.launched === true ? '已执行 launch harvest' : selectedPackageDump.launched === false ? '未执行 launch harvest' : 'launch harvest 状态未知' }}</span><span>物理 {{ allocatedEvidenceLabel(selectedPackageDump.local_storage_accounting?.allocated_bytes ?? selectedPackageDump.physical_bytes) }}</span><span v-if="selectedPackageDump.storage_accounting === 'kernsight.inode-accounting/v1'">硬链接共享逻辑字节 {{ formatBytes(Number(selectedPackageDump.deduplicated_bytes ?? 0)) }}</span></div>
       <OperationError :message="operationErrors[`pull:${device?.serial}:${selectedPackage}`]" @dismiss="dismissOperation(`pull:${device?.serial}:${selectedPackage}`)" />
       <OperationError :message="operationErrors[`export:${selectedLocalBundle?.root}`]" @dismiss="dismissOperation(`export:${selectedLocalBundle?.root}`)" />
+      <div v-if="selectedLocalBundle" class="ks-group-actions">
+        <button class="ghost-button" :disabled="pullingPackage || purgeExecuting" @click="exportAnalysisDirectory">导出可分析目录</button>
+        <button class="ghost-button" @click="openLocalEvidenceDirectory">打开原始文件夹</button>
+      </div>
+      <p v-if="selectedLocalBundle && operationMessages[`analysis-export:${selectedLocalBundle.root}`]">{{ operationMessages[`analysis-export:${selectedLocalBundle.root}`] }}</p>
+      <OperationError :message="operationErrors[`analysis-export:${selectedLocalBundle?.root}`]" @dismiss="dismissOperation(`analysis-export:${selectedLocalBundle?.root}`)" />
       <OperationError :message="operationErrors['evidence-copy']" @dismiss="dismissOperation('evidence-copy')" />
       <section v-if="evidenceMessage" class="notice ks-pull-notice" role="status"><span class="material-symbols-outlined">info</span><div><span>{{ evidenceMessage.startsWith('本次主会话已保存：') ? '证据已保存 · 覆盖 partial / 未知，见原报告' : evidenceMessage }}</span><details v-if="evidenceMessage.startsWith('本次主会话已保存：')"><summary>保存位置与完整说明</summary><button class="ks-copy-path" :title="evidenceMessage" @click="copyEvidencePath(evidenceMessage)">{{ evidenceMessage }}</button></details></div><button @click="evidenceMessage = ''">关闭</button></section>
       <label v-if="selectedEvidenceSource === 'local' && selectedPackageBundles.length > 1" class="ks-local-capture-picker"><span>本地采集记录（{{ selectedPackageBundles.length }}）</span><select :value="selectedLocalBundle?.root || ''" @change="selectLocalEvidenceRoot(($event.target as HTMLSelectElement).value)"><option v-if="!selectedLocalBundle" value="" disabled>当前记录尚未加载，请选择有效采集记录</option><option v-for="bundle in selectedPackageBundles" :key="bundle.root" :value="bundle.root">{{ bundleSessionId(bundle) }} · {{ bundle.dumpReport.dump_id || 'legacy dump' }} · {{ bundle.root }}</option></select><small>列表统计、文件、导出与分析关联均使用此记录；不会按包名合并不同采集。</small></label>
@@ -560,10 +578,11 @@ import OperationError from '@/components/OperationError.vue'
 import KernSightGroupPurge from '@/components/KernSightGroupPurge.vue'
 import { bundleRemovedByPurge, purgeReportLabel, type PurgeTarget } from '@/services/kernsightGroupPurge'
 import { verifiedDexObjectCount, indexedElfModuleCount, indexedDexCount, runtimeDexClassMatches, projectDexEvidence, matchesReadableDexEvidence, elfLoadCoverageLabel, codeEvidenceLabel, allocatedEvidenceLabel, ownershipEvidenceEntries, codeNoiseLayers, archiveCoverageLabel, dexScanSummary, dexScanSummaryForObject, fileScanLabel } from '../services/kernsightCodeEvidence'
-import { buildAutoCaptureStages, captureCodeOnlyChoice, startupEvidenceLabel, qualifiedSourceLabel, type AutoStageReceipt } from '@/services/kernsightCapturePlan'
+import { buildAutoCaptureStages, automaticTimingPreset, captureByteAllocation, captureCodeOnlyChoice, effectiveCopyTimeAllocation, startupEvidenceLabel, qualifiedSourceLabel, type AutoStageReceipt } from '@/services/kernsightCapturePlan'
 import { computed, markRaw, nextTick, onErrorCaptured, onBeforeUnmount, onMounted, reactive, ref, shallowRef, watch } from 'vue'
 import { listen } from '@tauri-apps/api/event'
-import { save } from '@tauri-apps/plugin-dialog'
+import { save, open } from '@tauri-apps/plugin-dialog'
+import { revealItemInDir } from '@tauri-apps/plugin-opener'
 import { monitoringBackend, readableError } from '@/services/backend'
 import { useKernSightEvidence } from '@/composables/useKernSightEvidence'
 import { buildAnalysisFlow, buildAnalysisPath, classifyDex, classifyPrivate, classifySo } from '@/services/kernsightPath'
@@ -595,7 +614,9 @@ const selectedCaptureGroup=ref('')
 const runningCaptureGroup=ref('')
 const captureGroupTrash = ref<KernSightCaptureGroupTrash[]>([])
 const trashedCaptureGroups = computed(() => captureGroupTrash.value.filter(entry => entry.trashed !== false))
-const pendingTrashGroup = ref('')
+const recoverableCaptureGroups = computed(() => trashedCaptureGroups.value.filter(entry => !entry.deletion))
+const pendingDeletions = computed(() => trashedCaptureGroups.value.filter(entry => entry.deletion && !(entry.deletion.localDone && entry.deletion.deviceDone)))
+let deletionPoll: ReturnType<typeof setInterval> | undefined
 const changingTrashGroup = ref('')
 const trashMessage = ref('')
 const purgeTarget = shallowRef<PurgeTarget | null>(null)
@@ -717,16 +738,23 @@ const captureForm = reactive({
   plan: 'auto' as 'capture' | 'dump' | 'auto',
   codeOnly:false,
   isolatedRoot:"",isolatedAgent:"",isolatedSha256:"",
-  totalBudgetMiB:8192,
-  maxSessionSeconds:320,
-  captureMaxSeconds:190, l2MaxSeconds:60,
-  transferMaxSeconds:90, archiveMaxSeconds:20, importMaxSeconds:15,
+  totalBudgetMiB:16384,
+  ...automaticTimingPreset(),
   collectKeys:false,collectPrivate:false,collectMemoryWindows:false,
   autoSessionMode: 'startup_replay' as 'startup_replay' | 'unified',
-  autoL0Seconds: 25,
-  autoL1Seconds: 30,
-  autoLinkerSeconds: 20,
+
 })
+const autoTimingChoices = [
+  { key: 'quick', label: '快速 · 60 秒' },
+  { key: 'standard', label: '标准 · 120 秒（推荐）' },
+  { key: 'extended', label: '延长 · 300 秒' },
+] as const
+const autoObservationSeconds = computed(() => Number(captureForm.autoL0Seconds) + Number(captureForm.autoL1Seconds) + Number(captureForm.autoLinkerSeconds))
+const selectedTimingPreset = computed(() => autoTimingChoices.find(({ key }) =>
+  Object.entries(automaticTimingPreset(key)).every(([field, value]) => captureForm[field as keyof ReturnType<typeof automaticTimingPreset>] === value))?.key || 'custom')
+function applyAutomaticTiming(profile: 'quick' | 'standard' | 'extended') {
+  if (!captureRunning.value) Object.assign(captureForm, automaticTimingPreset(profile))
+}
 const capturePhase = ref('')
 const unifiedSessionAwaiting = ref(false)
 const autoStageReceipts = ref<(AutoStageReceipt & { stateLabel: string })[]>([])
@@ -743,9 +771,10 @@ function loadAutoDurations() {
     const raw = localStorage.getItem(AUTO_DURATION_KEY)
     if (!raw) return
     const parsed = JSON.parse(raw) as Record<string, unknown>
-    captureForm.autoL0Seconds = clampCaptureSeconds(parsed.autoL0Seconds, 25)
-    captureForm.autoL1Seconds = clampCaptureSeconds(parsed.autoL1Seconds, 30)
-    captureForm.autoLinkerSeconds = clampCaptureSeconds(parsed.autoLinkerSeconds, 20)
+    if (parsed.autoL0Seconds === 25 && parsed.autoL1Seconds === 30 && parsed.autoLinkerSeconds === 20) return
+    captureForm.autoL0Seconds = clampCaptureSeconds(parsed.autoL0Seconds, 15)
+    captureForm.autoL1Seconds = clampCaptureSeconds(parsed.autoL1Seconds, 90)
+    captureForm.autoLinkerSeconds = clampCaptureSeconds(parsed.autoLinkerSeconds, 15)
   } catch { /* keep defaults */ }
 }
 loadAutoDurations()
@@ -753,9 +782,9 @@ watch(
   () => [captureForm.autoL0Seconds, captureForm.autoL1Seconds, captureForm.autoLinkerSeconds],
   ([l0, l1, linker]) => {
     const next = {
-      autoL0Seconds: clampCaptureSeconds(l0, 25),
-      autoL1Seconds: clampCaptureSeconds(l1, 30),
-      autoLinkerSeconds: clampCaptureSeconds(linker, 20),
+      autoL0Seconds: clampCaptureSeconds(l0, 15),
+      autoL1Seconds: clampCaptureSeconds(l1, 90),
+      autoLinkerSeconds: clampCaptureSeconds(linker, 15),
     }
     if (captureForm.autoL0Seconds !== next.autoL0Seconds) captureForm.autoL0Seconds = next.autoL0Seconds
     if (captureForm.autoL1Seconds !== next.autoL1Seconds) captureForm.autoL1Seconds = next.autoL1Seconds
@@ -766,12 +795,21 @@ watch(
 
 // Separate acquisition from saving. The legacy parent limit retains its whole-flow meaning.
 const MANUAL_TIMING_KEY = 'mobilee.kernsightManualTiming/v3'
-const manualTimingDefaults = { captureMaxSeconds:190, l2MaxSeconds:60, transferMaxSeconds:90, archiveMaxSeconds:20, importMaxSeconds:15 }
+const manualTimingDefaults = { captureMaxSeconds:540, l2MaxSeconds:180, transferMaxSeconds:600, archiveMaxSeconds:120, importMaxSeconds:120 }
+const legacyTimingDefaults = [
+  { captureMaxSeconds:600, l2MaxSeconds:180, transferMaxSeconds:600, archiveMaxSeconds:180, importMaxSeconds:180 },
+  { captureMaxSeconds:190, l2MaxSeconds:60, transferMaxSeconds:90, archiveMaxSeconds:20, importMaxSeconds:15 },
+  { captureMaxSeconds:360, l2MaxSeconds:180, transferMaxSeconds:180, archiveMaxSeconds:60, importMaxSeconds:60 },
+  { captureMaxSeconds:360, l2MaxSeconds:180, transferMaxSeconds:600, archiveMaxSeconds:180, importMaxSeconds:180 },
+]
 try {
   const saved = JSON.parse(localStorage.getItem(MANUAL_TIMING_KEY) || 'null')
   if (saved && Object.entries(manualTimingDefaults).every(([key]) => Number.isInteger(saved[key]) && saved[key] >= (key === 'captureMaxSeconds' ? 30 : 1) && saved[key] <= 3600)
       && saved.l2MaxSeconds <= saved.captureMaxSeconds && saved.captureMaxSeconds + saved.transferMaxSeconds + saved.archiveMaxSeconds + saved.importMaxSeconds + 5 <= 3600) {
-    Object.assign(captureForm, Object.fromEntries(Object.keys(manualTimingDefaults).map(key => [key, saved[key]])))
+    // Upgrade only previous unchanged presets. Preserve custom user limits
+    // and never alter the contracts of historical/running capture groups.
+    const unchangedPreset = legacyTimingDefaults.some(preset => Object.entries(preset).every(([key, value]) => saved[key] === value))
+    Object.assign(captureForm, unchangedPreset ? manualTimingDefaults : Object.fromEntries(Object.keys(manualTimingDefaults).map(key => [key, saved[key]])))
   }
 } catch { /* Keep the explicit defaults; corrupt saved settings are not applied. */ }
 watch(() => [captureForm.captureMaxSeconds, captureForm.l2MaxSeconds, captureForm.transferMaxSeconds, captureForm.archiveMaxSeconds, captureForm.importMaxSeconds], () => {
@@ -1325,27 +1363,27 @@ const captureCommandPreview = computed(() => {
   return captureKsightctlLine({ duration: captureForm.durationSeconds, inspectMode: captureForm.inspectMode })
 })
 const captureClockText = computed(() => {
-  const l0 = Number(captureForm.autoL0Seconds)
-  const l1 = Number(captureForm.autoL1Seconds)
-  const linker = Number(captureForm.autoLinkerSeconds)
-  const l1Slack = l1 > 30 ? 15 : 10
-  const slack = 10 + l1Slack + 10
-  const observe = l0 + l1 + linker
-  const phase = observe + slack
-  const capture = Number(captureForm.captureMaxSeconds)
-  const l2 = Number(captureForm.l2MaxSeconds)
-  const transfer = Number(captureForm.transferMaxSeconds)
-  const archive = Number(captureForm.archiveMaxSeconds)
-  const importing = Number(captureForm.importMaxSeconds)
-  const leftover = capture - phase - l2
-  return `上面三格是观察请求：L0 ${l0}s + L0+L1 ${l1}s + Linker ${linker}s = ${observe}s。执行时还会加挂载余量 L0 +10、L1 +${l1Slack}、Linker +10，阶段上限变成 ${l0 + 10}s / ${l1 + l1Slack}s / ${linker + 10}s。这三段和 L2 ${l2}s 都从总采集 ${capture}s 里扣，合计占用 ${phase + l2}s，剩余 ${leftover}s；不是加在 ${capture}s 外面。总等待 ${captureForm.maxSessionSeconds}s = 采集 ${capture} + 传输 ${transfer} + 归档 ${archive} + 导入 ${importing} + 终态 5。传输、归档、导入从采集结束才开始计时。`
+  const plan = autoTimeAllocation.value.copyPlan
+  if (!plan) return autoTimeAllocation.value.error
+  return `观察时长从手机 ready 后计时，每段另留准备 ${plan.observationPreparationSeconds}s、手机收尾 ${plan.observationCloseoutSeconds}s、主机收尾 ${plan.observationHostSeconds}s；观察阶段硬上限：${plan.producer.map(phase => `${phase.key} ${phase.seconds}s`).join(' + ')} = ${plan.producerSeconds}s。L2：手机 ready 后有效复制 ${plan.copySeconds}s + 准备 ${plan.preparationSeconds}s + 手机收尾 ${plan.agentCloseoutSeconds}s + 主机收尾 ${plan.hostCloseoutSeconds}s = 阶段硬上限 ${plan.dumpHardSeconds}s。流程保护至少 ${plan.minimumCaptureSeconds}s，当前配置 ${captureForm.captureMaxSeconds}s；不足会拒绝启动，不会缩短有效观察或复制时间。`
 })
+const captureBytePlan = computed(() => captureByteAllocation(Number(captureForm.totalBudgetMiB), captureForm.autoSessionMode === 'startup_replay'))
+
 const autoTimeAllocation = computed(() => {
   const { captureMaxSeconds, l2MaxSeconds, transferMaxSeconds, archiveMaxSeconds, importMaxSeconds, maxSessionSeconds } = captureForm
   const save = [transferMaxSeconds, archiveMaxSeconds, importMaxSeconds]
-  return { valid: Number.isInteger(captureMaxSeconds) && captureMaxSeconds >= 30 && captureMaxSeconds <= 3600
-    && [l2MaxSeconds, ...save].every(value => Number.isInteger(value) && value >= 1 && value <= 3600)
-    && l2MaxSeconds <= captureMaxSeconds && maxSessionSeconds <= 3600 }
+  let copyPlan: ReturnType<typeof effectiveCopyTimeAllocation> | null = null
+  try {
+    copyPlan = effectiveCopyTimeAllocation(
+      { l0:captureForm.autoL0Seconds, l1:captureForm.autoL1Seconds, linker:captureForm.autoLinkerSeconds },
+      captureMaxSeconds, l2MaxSeconds, captureForm.autoSessionMode === 'startup_replay',
+    )
+  } catch (error) { return { valid:false, copyPlan, error:readableError(error) } }
+  if (!copyPlan.valid) return { valid:false, copyPlan, error:`采集流程保护上限至少需要 ${copyPlan.minimumCaptureSeconds} 秒，含完整有效观察、复制预算和准备收尾；未缩短用户配置。` }
+  if (!save.every(value => Number.isInteger(value) && value >= 1 && value <= 3600) || maxSessionSeconds > 3600) {
+    return { valid:false, copyPlan, error:'保存各项须为1–3600秒整数，整体等待不能超过3600秒。' }
+  }
+  return { valid:true, copyPlan, error:'' }
 })
 const captureValid = computed(() => {
   const packageValid = !captureForm.package || /^[A-Za-z0-9._]+$/.test(captureForm.package)
@@ -1354,7 +1392,7 @@ const captureValid = computed(() => {
   return packageValid && inspectValid && autoOk && captureForm.durationSeconds >= 1 && captureForm.durationSeconds <= 300 && captureForm.sampleOneIn >= 1
 })
 const capturePolicyHint = computed(() => {
-  if (captureForm.plan === 'auto' && !autoTimeAllocation.value.valid) return '采集时限或保存上限无效：L2不能大于总采集时限，各项必须为整数，整体等待最多3600秒；未启动。'
+  if (captureForm.plan === 'auto' && !autoTimeAllocation.value.valid) return `${autoTimeAllocation.value.error}未启动。`
   if (!captureValid.value) return 'Inspect / Sched / Dump / 自动采集必须填写包名；时长 1–300 秒；父会话不支持额外密钥、私有存储、通用内存窗口或 Hide debug。'
   if (captureForm.plan === 'dump') return 'L2 dump --launch：force-stop 后由 dump 自己拉起 App，SIGSTOP 拷堆 DEX/SO/CE·DE。不是 eBPF 会话，不要同时挂 Inspect。'
   if (captureForm.plan === 'auto' && captureForm.autoSessionMode === 'startup_replay') return '启动重采保留各能力自己的启动窗口：L0 → 重启 L1 → 该实例快照 → 重启 Linker。三个 session 不能冒充同一进程生命周期。已确认生产者退出、封存、身份和预算结算的覆盖 partial 可继续独立快照；丢样和未读尾部仍保留为缺口，快照会重新核验原实例；原来源已消失时标为不可执行，再检查独立 Linker。缺证明、取消、清理未知或其它失败停止；已有证据仍尝试在原期限内保存，父流程保留 partial。'
@@ -1546,6 +1584,7 @@ async function importEvidenceDirectory(path?: string) {
 }
 
 onMounted(() => {
+  deletionPoll = setInterval(() => { void refreshDeletionProgress() }, 1500)
   void loadLocalCaptureGroups()
   let started = false
   void listen<string>('me-import-directory', (event) => {
@@ -1592,7 +1631,7 @@ async function pullSelectedPackageEvidence(parentId?:string) {
   pullingPackage.value = true
   probeError.value = ''
   evidenceError.value = ''
-  evidenceMessage.value = `正在拉取并封装 ME v2 内容引用归档 ${packageName}${expectedBytes ? `（约 ${formatBytes(expectedBytes)}）` : ''}。目标旁会先出现 .part 文件，完成后原子替换为：${archivePath}`
+  evidenceMessage.value = `正在拉取 ${packageName}${expectedBytes ? `（约 ${formatBytes(expectedBytes)}）` : ''}，按原始目录封装到：${archivePath}。完成后可用解压工具打开 .mee，或导出可分析目录。`
     const bundle = await monitoringBackend.pullKernSightPackageArchive(serial, packageName, archivePath, typeof parentId==='string'?parentId:undefined)
     upsertBundle(bundle)
     selectPackage(bundle.package)
@@ -1631,6 +1670,34 @@ async function exportSelectedEvidenceArchive() {
   } finally {
     pullingPackage.value = false
   }
+}
+
+async function exportAnalysisDirectory() {
+  const bundle = selectedLocalBundle.value
+  if (!bundle || pullingPackage.value || purgeExecuting.value) return
+  const key = `analysis-export:${bundle.root}`
+  const ticket = beginOperation(key)
+  pullingPackage.value = true
+  try {
+    const parent = await open({ directory: true, multiple: false, title: '选择可分析目录的存放位置' })
+    if (typeof parent !== 'string') return
+    const outputPath = `${parent}/${bundle.package}-analysis-${Date.now()}`
+    operationMessages[key] = `正在导出独立的原始文件副本：${outputPath}`
+    const saved = await monitoringBackend.exportKernSightAnalysisDirectory(bundle.root, outputPath)
+    operationMessages[key] = `可分析目录已导出：${saved}。DEX、SO、文本和原始内存窗口保留文件名、来源报告及 SHA-256。`
+    try { await revealItemInDir(saved) }
+    catch (error) { operationMessages[key] += ` 未能在 Finder 中定位目录：${readableError(error)}。文件已导出，可手动打开上述路径。` }
+  } catch (error) { failOperation(key, ticket, error) }
+  finally { pullingPackage.value = false }
+}
+
+async function openLocalEvidenceDirectory() {
+  const bundle = selectedLocalBundle.value
+  if (!bundle) return
+  const key = `analysis-export:${bundle.root}`
+  const ticket = beginOperation(key)
+  try { await revealItemInDir(bundle.root) }
+  catch (error) { failOperation(key, ticket, new Error(`未能在 Finder 中定位原始文件夹：${readableError(error)}。证据仍保存在：${bundle.root}`)) }
 }
 
 function selectPackage(packageName: string) {
@@ -1738,13 +1805,6 @@ function closePurgePreview() {
 function canPurgeCaptureGroup(group: KernSightCaptureGroup) {
   return localOwnershipConfirmed.value && captureGroupCanTrash(group, runningCaptureGroup.value, purgeBusy.value || purgeExecuting.value)
 }
-function openPurgePreview(group: KernSightCaptureGroup) {
-  if (!props.active || !canPurgeCaptureGroup(group)) return
-  pendingTrashGroup.value = ''
-  const importedRoots = importedCaptureGroups.value.filter(item => item.group.id === group.id && item.group.serial === group.serial && item.group.package === group.package).map(item => item.bundle.root)
-  purgeTarget.value = { parentId: group.id, serial: group.serial, package: group.package, importedRoots: [...new Set(importedRoots)] }
-  purgeMessage.value = ''
-}
 async function loadPurgeReports() {
   const ticket = purgeRequests.begin()
   try {
@@ -1793,31 +1853,50 @@ async function completePurge(report: KernSightGroupPurgeReport, plan: KernSightG
 }
 watch(() => [props.active, props.device?.serial, props.device?.status, workspaceMode.value], closePurgePreview, { flush: 'sync' })
 
-function canTrashCaptureGroup(group: KernSightCaptureGroup) {
-  return captureGroupCanTrash(group, runningCaptureGroup.value, captureRunning.value || pullingPackage.value || Boolean(changingTrashGroup.value) || purgeExecuting.value)
+async function deleteCaptureGroup(group: KernSightCaptureGroup) {
+  if (!canPurgeCaptureGroup(group)) return
+  const key = `delete:${group.id}`
+  const ticket = beginOperation(key)
+  const roots = importedCaptureGroups.value.filter(item => item.group.id === group.id && item.group.serial === group.serial && item.group.package === group.package).map(item => item.bundle.root)
+  const previous = captureGroupTrash.value.find(item => item.group.id === group.id)
+  // Immediately collapse the entire family; backend acknowledgment makes it durable.
+  const optimistic: KernSightCaptureGroupTrash = {
+    schema: 'mobilee.capture-group-trash/v1', group, trashedUnixMs: Date.now(), managed: true,
+    trashed: true, retainedSessionIds: [...groupSessionIds([group])], importedRoots: roots,
+    deletion: { localDone: false, deviceDone: false },
+  }
+  localGroupsRequests.invalidate()
+  captureGroupTrash.value = [...captureGroupTrash.value.filter(item => item.group.id !== group.id), optimistic]
+  changingTrashGroup.value = group.id
+  reconcileTrashedSelection()
+  trashMessage.value = `正在删除 ${shortSession(group.id)} 及全部子会话…`
+  try {
+    const entry = await monitoringBackend.deleteKernSightGroup(group.id, roots)
+    captureGroupTrash.value = [...captureGroupTrash.value.filter(item => item.group.id !== group.id), entry]
+    trashMessage.value = `已移除 ${shortSession(group.id)} 及全部子会话；后台清理本地与手机文件。`
+  } catch (error) {
+    captureGroupTrash.value = captureGroupTrash.value.filter(item => item.group.id !== group.id)
+    if (previous) captureGroupTrash.value.push(previous)
+    failOperation(key, ticket, error)
+    trashMessage.value = `删除未受理：${readableError(error)}`
+  } finally { changingTrashGroup.value = '' }
 }
 
-async function confirmTrashCaptureGroup(group: KernSightCaptureGroup) {
-  if (pendingTrashGroup.value !== group.id || !canTrashCaptureGroup(group)) return
-  const operationKey = `trash:${group.id}`; const operationTicket = beginOperation(operationKey)
-  pendingTrashGroup.value = ''
-  changingTrashGroup.value = group.id
-  localGroupsRequests.invalidate()
-  probeError.value = ''
+async function refreshDeletionProgress() {
+  if (changingTrashGroup.value || !pendingDeletions.value.length) return
   try {
-    const roots = visibleImportedCaptureGroups.value.filter(item => item.group.id === group.id).map(item => item.bundle.root)
-    const entry = await monitoringBackend.trashKernSightGroup(group.id, roots)
-    localGroupsRequests.invalidate()
-    captureGroupTrash.value = [...captureGroupTrash.value.filter(item => item.group.id !== group.id), entry]
-    if (entry.managed) captureGroups.value = captureGroups.value.filter(item => item.id !== group.id)
-    reconcileTrashedSelection()
-    trashMessage.value = `主会话 ${shortSession(group.id)} 已移入回收站，可恢复；原始文件与设备空间未清理。`
-  } catch (error) {
-    if (failOperation(operationKey, operationTicket, error)) {
-      await loadLocalCaptureGroups()
-      failOperation(operationKey, operationTicket, error)
-    }
-  } finally { changingTrashGroup.value = '' }
+    const entries = await monitoringBackend.listKernSightGroupTrash()
+    if (changingTrashGroup.value) return
+    captureGroupTrash.value = entries
+    const removedRoots = new Set(entries.filter(entry => entry.deletion?.localDone).flatMap(entry => entry.importedRoots))
+    if (removedRoots.has(sessionSourceRoot.value)) clearCurrentSession()
+    if (selectedLocalBundle.value && removedRoots.has(selectedLocalBundle.value.root)) closeEvidencePreview()
+    localEvidenceBundles.value = localEvidenceBundles.value.filter(bundle => !removedRoots.has(bundle.root))
+    const roots = { ...selectedRoots.value }
+    for (const [packageName, root] of Object.entries(roots)) if (removedRoots.has(root)) delete roots[packageName]
+    selectedRoots.value = roots
+    if (!pendingDeletions.value.length) trashMessage.value = '会话及全部子会话的本地与手机文件已清理完成。'
+  } catch (error) { trashMessage.value = `删除状态暂不可读：${readableError(error)}` }
 }
 
 async function restoreCaptureGroup(entry: KernSightCaptureGroupTrash) {
@@ -2034,8 +2113,9 @@ function resetCaptureRun() {
   autoStageReceipts.value = []
   probeError.value = ''
   if (captureTimer) clearInterval(captureTimer)
+  const startedAt = performance.now()
   captureTimer = setInterval(() => {
-    captureElapsed.value += 1
+    captureElapsed.value = Math.floor((performance.now() - startedAt) / 1000)
     if (unifiedSessionAwaiting.value) capturePhase.value = '统一阶段执行中（实际进度以 agent 阶段记录为准）'
   }, 1000)
 }
@@ -2126,7 +2206,7 @@ function formatElapsedSeconds(milliseconds: unknown): string {
 function phaseActualLabel(phase: NonNullable<NonNullable<KernSightCaptureGroup['budget']>['timePlan']>['phases'][number], schema: string): string {
   if (typeof phase.elapsedMs === 'number' && Number.isFinite(phase.elapsedMs) && phase.elapsedMs >= 0) return `实际耗时 ${formatElapsedSeconds(phase.elapsedMs)}s`
   if (phase.startedUnixMs != null && phase.finishedUnixMs == null) return '计时中（尚未记录完成耗时）'
-  return schema === 'mobilee.session-time-plan/v5' && !phase.completed && phase.startedUnixMs == null ? '尚未开始' : '实际耗时未知（原记录无字段）'
+  return ['mobilee.session-time-plan/v5', 'mobilee.session-time-plan/v6'].includes(schema) && !phase.completed && phase.startedUnixMs == null ? '尚未开始' : '实际耗时未知（原记录无字段）'
 }
 function evidenceArrayCount(value: unknown): number | string { return Array.isArray(value) ? value.length : '未知' }
 function evidenceArrayState(value: unknown, label: string): string {
@@ -2137,7 +2217,7 @@ function evidenceArrayState(value: unknown, label: string): string {
 function phaseSeconds(group: KernSightCaptureGroup, kind: string): string {
   const plan = group.budget?.timePlan
   const cap = plan?.phases.find(phase => phase.kind === kind)?.capMs
-  return formatElapsedSeconds(cap ?? (kind === 'dump' ? plan?.l2MaxMs : undefined))
+  return formatElapsedSeconds(cap ?? (kind === 'dump' && plan?.schema !== 'mobilee.session-time-plan/v6' ? plan?.l2MaxMs : undefined))
 }
 function timePhaseLabel(kind: string): string {
   return ({ l0: 'L0', l1: 'L1', linker: 'Linker', dump: 'L2 快照', transfer: '保存传输', archive: '归档', import: '导入', terminal: '终态', session: '统一观察' } as Record<string, string>)[kind] || kind
@@ -2603,7 +2683,6 @@ watch(() => [selectedPackage.value, selectedEvidenceSource.value, selectedLocalB
 watch(() => props.device?.serial, () => {
   overviewRequests.invalidate()
   loadingKernSight.value = false
-  pendingTrashGroup.value = ''
   void loadLocalCaptureGroups()
   selectedCaptureGroup.value = ''
   capabilityProbe.value = null
@@ -2630,6 +2709,7 @@ watch(requestedPackage, packageName => {
 }, { immediate: true })
 
 onBeforeUnmount(() => {
+  if (deletionPoll) clearInterval(deletionPoll)
   purgeRequests.invalidate()
   purgeTarget.value = null
   sessionRequests.invalidate()
@@ -3153,4 +3233,12 @@ details.ks-session-row pre { max-height: 360px; overflow: auto; white-space: pre
 .agent-build-details summary { cursor:pointer; font-size:10px; color:var(--primary); overflow-wrap:anywhere; }
 .agent-build-details p { color:var(--muted); font-size:10px; line-height:1.6; overflow-wrap:anywhere; }
 .runtime-device-strip > div > strong, .runtime-device-strip > div > small { overflow:visible; white-space:normal; overflow-wrap:anywhere; }
+</style>
+
+<style scoped>
+.ks-auto-time-summary { padding:12px; border:1px solid var(--line); border-radius:8px; }
+.ks-auto-time-summary small { display:block; margin-top:8px; color:var(--muted); line-height:1.5; }
+.ks-timing-presets { display:flex; flex-wrap:wrap; gap:8px; margin-top:10px; }
+.ks-timing-presets button { padding:7px 12px; border:1px solid var(--line); border-radius:6px; background:var(--surface); color:var(--text); }
+.ks-timing-presets button[aria-pressed="true"] { border-color:var(--primary); background:var(--primary-soft); }
 </style>

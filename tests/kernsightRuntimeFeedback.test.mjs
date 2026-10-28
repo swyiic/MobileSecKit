@@ -23,6 +23,7 @@ const compiled = await build({
     b.onLoad({filter: /.*/,namespace:'test-mock'}, args => ({contents: args.path==='backend'
       ? 'export const monitoringBackend = globalThis.__runtimeFeedbackBackend; export function readableError(error) { return String(error?.message || error) }'
       : args.path.endsWith('/event') ? 'export async function listen(){return ()=>{}}'
+      : args.path.endsWith('/plugin-opener') ? 'export async function revealItemInDir(path){globalThis.__runtimeFeedbackOpenedPath=path; if(globalThis.__runtimeFeedbackRevealError)throw new Error(globalThis.__runtimeFeedbackRevealError)}'
       : 'export async function open(args){return globalThis.__runtimeFeedbackDialog(args)}; export async function save(args){return globalThis.__runtimeFeedbackDialog(args)}',loader:'js'}))
     b.onLoad({filter: /\.vue$/}, args => {
       const {descriptor}=parse(readFileSync(args.path,'utf8'),{filename:args.path})
@@ -53,8 +54,10 @@ globalThis.localStorage={getItem:()=>null,setItem:()=>{}}
 const backendCalls=[]
 let readMode='success', resolvePending
 const group=(id)=>({schema:'mobilee.capture-group/v1',id,serial:'mock-only-no-device',package:'org.example.app',createdUnixMs:1791500000000,state:'partial',cancelRequested:false,unified:false,base:{},budget:{limits:{maxSeconds:900,totalBytes:8589934592},reservations:[],timePlan:{schema:'mobilee.session-time-plan/v4',phases:[{kind:'l0',capMs:25000},{kind:'l1',capMs:105000},{kind:'linker',capMs:25000},{kind:'dump',capMs:245000},{kind:'transfer',capMs:255000},{kind:'archive',capMs:120000},{kind:'import',capMs:120000},{kind:'terminal',capMs:5000}]}},stages:[{id:`stage-${id}`,key:'l1',mode:'tls',durationSeconds:90,launchAfterAttach:false,required:true,attempts:[{relation:{parentId:id,stageId:`stage-${id}`,attemptId:`attempt-${id}`,attempt:1,stageKey:'l1'},state:'partial',startedUnixMs:1791500000000,finishedUnixMs:1791500090000,sessionId:`session-${id}`,error:'real loss preserved'}]}]})
-const groups=[group('parent-a'),group('parent-b')]
+const groups=[group('parent-a'),group('parent-b'),group('parent-c')]
 groups[1].budget.timePlan={schema:'mobilee.session-time-plan/v5',captureMaxMs:400000,l2MaxMs:245000,captureStopAtParentRemainingMs:500000,phases:[{kind:'transfer',capMs:255000,startedUnixMs:1791500100000,finishedUnixMs:1791500112500,elapsedMs:12500,completed:true},{kind:'archive',capMs:120000,completed:false},{kind:'import',capMs:120000,startedUnixMs:1791500112500,completed:false}]}
+groups[2].budget.timePlan={schema:'mobilee.session-time-plan/v6',captureMaxMs:600000,l2MaxMs:180000,phases:[{kind:'dump',capMs:250000,completed:false}]}
+groups[2].budget.limits.maxSeconds=1565
 const report=id=>({sessionId:`session-${id}`,reportSchema:'fixture',report:{session_id:`session-${id}`,execution_complete:true,mode_counts:{observe:5,inspect:2},quality:{lost_records:17},processes:[],limitations:['fixture coverage remains partial']}})
 globalThis.__runtimeFeedbackBackend=new Proxy({
   listKernSightGroups:async()=>groups,
@@ -69,7 +72,7 @@ const warnings=[];app.config.warnHandler=m=>warnings.push(m)
 app.mount(tree)
 async function settle(){for(let i=0;i<5;i++){await Promise.resolve();await nextTick()}}
 const click=async(n)=>{assert.ok(n,'expected rendered control');await n.props.onClick?.({preventDefault(){},stopPropagation(){}});await settle()}
-const row=id=>find(n=>hasClass(n,'ks-capture-group')&&text(n).includes(id==='parent-a'?'parent-a':'parent-b'))
+const row=id=>find(n=>hasClass(n,'ks-capture-group')&&text(n).includes(id))
 const summary=id=>row(id).children.find(n=>n.tag==='summary')
 const childButton=id=>find(n=>n.tag==='button'&&n.props['aria-controls']===`ks-child-${id}-attempt-${id}`,row(id))
 await settle()
@@ -138,6 +141,17 @@ test('v5 recorded actual timing stays distinct from caps and not-started or runn
   await click(summary('parent-a'))
 })
 
+test('v6 history distinguishes ready-time copy from the whole L2 hard cap',async()=>{
+  await click(summary('parent-c'))
+  const ledger=find(n=>hasClass(n,'ks-time-ledger'),row('parent-c'))
+  assert.match(text(ledger),/采集流程保护上限 600s/)
+  assert.match(text(ledger),/L2 有效复制上限 180s（手机 ready 后计时/)
+  assert.match(text(ledger),/L2 阶段（含准备与收尾）配置上限 250s尚未开始/)
+  assert.doesNotMatch(text(ledger),/旧合同共用采集时限/)
+  assert.match(text(row('parent-c')),/覆盖不足（partial）/)
+  await click(summary('parent-a'))
+})
+
 test('child read failure remains by its button and preserved loss is never converted to complete coverage',async()=>{
   readMode='error';await click(childButton('parent-a'))
   const error=find(n=>hasClass(n,'operation-error'),row('parent-a'))
@@ -148,5 +162,53 @@ test('child read failure remains by its button and preserved loss is never conve
   readMode='success'
   assert.equal(warnings.length,0,warnings.join('\n'))
   assert.deepEqual([...new Set(backendCalls)],['parent-a','parent-b'])
+})
+
+test('Finder failure preserves successful export and original-folder errors identify the saved evidence',async()=>{
+  const bundle={root:'/fixture/original',package:'org.example.app',fileCount:0,totalBytes:0,files:[],captureText:'',sessionReport:null,dumpReport:{package:'org.example.app',schema_version:'fixture',artifacts:[]}}
+  globalThis.__runtimeFeedbackBackend.importKernSightEvidenceDirectory=async()=>bundle
+  globalThis.__runtimeFeedbackBackend.exportKernSightAnalysisDirectory=async()=>'/fixture/exported'
+  globalThis.__runtimeFeedbackDialog=async()=>'/fixture'
+  await click(find(n=>n.tag==='button'&&text(n).includes('导入本地证据')))
+  globalThis.__runtimeFeedbackRevealError='fixture Finder unavailable'
+  await click(find(n=>n.tag==='button'&&text(n)==='导出可分析目录'))
+  assert.equal(globalThis.__runtimeFeedbackOpenedPath,'/fixture/exported')
+  const success=find(n=>n.tag==='p'&&text(n).includes('可分析目录已导出'))
+  assert.match(text(success),/文件已导出，可手动打开上述路径/)
+  const evidencePanel=find(n=>hasClass(n,'ks-package-evidence-panel'))
+  assert.equal(all(n=>hasClass(n,'operation-error'),evidencePanel).length,0)
+  await click(find(n=>n.tag==='button'&&text(n)==='打开原始文件夹'))
+  assert.equal(globalThis.__runtimeFeedbackOpenedPath,'/fixture/original')
+  const failure=find(n=>hasClass(n,'operation-error'),evidencePanel)
+  assert.match(text(failure),/未能在 Finder 中定位原始文件夹/)
+  assert.match(text(failure),/证据仍保存在：\/fixture\/original/)
+  globalThis.__runtimeFeedbackRevealError=''
   app.unmount()
+})
+
+test('timing defaults migrate only complete legacy presets and preserve custom and retained contracts',async()=>{
+  const key='mobilee.kernsightManualTiming/v3'
+  const defaults={captureMaxSeconds:540,l2MaxSeconds:180,transferMaxSeconds:600,archiveMaxSeconds:120,importMaxSeconds:120}
+  const priorDefault={captureMaxSeconds:600,l2MaxSeconds:180,transferMaxSeconds:600,archiveMaxSeconds:180,importMaxSeconds:180}
+  const oldest={captureMaxSeconds:190,l2MaxSeconds:60,transferMaxSeconds:90,archiveMaxSeconds:20,importMaxSeconds:15}
+  const previous={captureMaxSeconds:360,l2MaxSeconds:180,transferMaxSeconds:180,archiveMaxSeconds:60,importMaxSeconds:60}
+  const recent={captureMaxSeconds:360,l2MaxSeconds:180,transferMaxSeconds:600,archiveMaxSeconds:180,importMaxSeconds:180}
+  const custom={...previous,transferMaxSeconds:181}
+  const retainedBefore=JSON.stringify(groups)
+  const originalStorage=globalThis.localStorage
+  try {
+    for(const [saved,expected] of [[null,defaults],[oldest,defaults],[previous,defaults],[recent,defaults],[priorDefault,defaults],[custom,custom],[{...oldest,l2MaxSeconds:61},{...oldest,l2MaxSeconds:61}]]) {
+      const writes=new Map()
+      globalThis.localStorage={getItem:name=>name===key&&saved?JSON.stringify(saved):null,setItem:(name,value)=>writes.set(name,value)}
+      const fresh=renderer.createApp(RuntimeView,{active:false,details:null})
+      fresh.config.warnHandler=message=>{throw new Error(message)}
+      fresh.mount(node('timing-root'))
+      try {
+        await settle()
+        assert.deepEqual(JSON.parse(writes.get(key)),expected)
+        assert.equal(JSON.stringify(groups),retainedBefore,'historical/running backend contracts stay unchanged')
+        if(expected===defaults)assert.equal(expected.captureMaxSeconds+expected.transferMaxSeconds+expected.archiveMaxSeconds+expected.importMaxSeconds+5,1385)
+      } finally { fresh.unmount() }
+    }
+  } finally {globalThis.localStorage=originalStorage}
 })

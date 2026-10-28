@@ -96,8 +96,8 @@ function matchingTerminal(value: unknown, note: JsonRecord | null, scope: string
 }
 function retainedCoverageRecords(values: unknown): JsonRecord[] {
   return Array.isArray(values) ? values.map(object).filter((value): value is JsonRecord => Boolean(value
-    && ['kernsight.capture-drain/v1', 'kernsight.perf-poll-budget/v1', 'kernsight.output-budget/v1'].includes(String(value.schema))
-    && new TextEncoder().encode(JSON.stringify(value)).length <= (value.schema === 'kernsight.output-budget/v1' ? 20 * 1024 : 4096))).slice(0, 3) : []
+    && ['kernsight.capture-drain/v1', 'kernsight.perf-poll-budget/v1', 'kernsight.output-budget/v1', 'kernsight.observation-window/v1', 'kernsight.file-enrichment/v1', 'kernsight.slow-event-step/v1', 'kernsight.static-budget-stop/v1'].includes(String(value.schema))
+    && new TextEncoder().encode(JSON.stringify(value)).length <= (value.schema === 'kernsight.output-budget/v1' ? 20 * 1024 : 4096))).slice(0, 7) : []
 }
 function boolLabel(value: unknown): string {
   return value === true ? '已确认退出' : value === false ? '未确认退出（false）' : '未知（缺少确认）'
@@ -127,7 +127,16 @@ export function captureAttemptDiagnostics(group: KernSightCaptureGroup, attempt:
   const rawTail = text(attempt.diagnosticTail)
   if (diagnostic?.terminalRecord != null && !terminal) warnings.push('结构化终态未匹配当前生命周期、token、父会话与原始终态字段；原记录保留，未用于确认本次终态。')
   if (terminal?.dumpCoverageOmitted === true) warnings.push('dump 覆盖证明超过终态摘要额度，详情未复制到摘要；原记录仍在生命周期 JSON 中。这里只确认基础终态，不证明完整覆盖，也不能授权继续采集。')
-  if (coverage.length) warnings.push('输出预算、drain 与 poll 记录是分析用的计数。采集进程已经返回时，这些数字不把本次采集判成失败。')
+  if (coverage.length) warnings.push('采集进程返回和证据完整性分别判断；预算、drain 与 poll 原始计数保留，不能用进程已退出证明覆盖完整。')
+  for (const record of coverage) {
+    if (record.schema !== 'kernsight.output-budget/v1') continue
+    const reasons = [record.reason, ...(Array.isArray(record.failure_reasons) ? record.failure_reasons : [])]
+    if (!reasons.some(reason => ['static_output_budget_exhausted', 'output_budget_exhausted'].includes(String(reason)))) continue
+    const bytes = (value: unknown) => typeof value === 'number' && Number.isFinite(value) ? `${(value / 1048576).toFixed(1)} MiB` : '未知'
+    const stop = coverage.find(item => item.schema === 'kernsight.static-budget-stop/v1')
+    const capacity = reasons.includes('output_budget_exhausted') || stop?.limit_kind === 'bytes'
+    warnings.push(`${capacity ? '产物写入额度到限' : '静态产物预算到限（容量或收尾期限）'}：本阶段额度 ${bytes(record.limit_bytes)}，已计量 ${bytes(record.admitted_write_bytes)}。${capacity ? '这不是有效复制时间不足；延长时长不能恢复未保存文件。新采集请提高累计写入预算。' : '请核对原始 limit_kind；有效复制时长与静态收尾期限分别判断，不能只靠延长观察时间。'}原会话继续保留 partial。`)
+  }
   const rawTailTruncated = diagnostic?.rawTailTruncated === true || /\[(?:stderr|stdout) tail; earlier output omitted\]/.test(rawTail || '')
   if ((note?.qualification_failure != null && !savedReceipt) || (diagnostic?.source === 'remote_lifecycle' && diagnostic.record != null && !retainedReceipt)) {
     warnings.push('结构化失败回执格式无效，或身份未匹配当前生命周期、token 与父会话；未将其用作本次失败原因，原记录保留在诊断 JSON 中。')

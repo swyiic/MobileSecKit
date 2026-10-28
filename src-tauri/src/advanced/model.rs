@@ -310,6 +310,7 @@ pub(super) struct StaticToolAnalysis {
     pub(super) sensitive_items: Vec<SensitiveItem>,
     pub(super) code_insights: Vec<CodeInsight>,
     pub(super) manifest_xml: Option<String>,
+    pub(super) warnings: Vec<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]

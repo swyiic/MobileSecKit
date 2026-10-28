@@ -402,3 +402,13 @@ test('retained partial coverage is distinct from failure without altering raw ca
   // A concrete qualification failure must still be shown as a failure.
   assert.equal(fixture({ state: 'partial' }).view().title, '失败诊断')
 })
+
+
+test('static capacity failure is explicit and never recommends a longer observation window', () => {
+  const budget = { schema: 'kernsight.output-budget/v1', limit_bytes: 1603871746, admitted_write_bytes: 1595481459,
+    partial: true, reason: 'code_evidence_output_failed', failure_reasons: ['static_output_budget_exhausted'] }
+  const f = fixture({ remoteLifecycle: null, captureDiagnostic: diagnostic({ source: null, record: null, coverageRecords: [budget, {schema:'kernsight.static-budget-stop/v1', limit_kind:'bytes'}] }) })
+  assert.ok(f.view().warnings.some(warning => warning.includes('产物写入额度到限') && warning.includes('1529.6 MiB')))
+  assert.ok(f.view().warnings.some(warning => warning.includes('延长时长不能恢复')))
+  assert.equal(f.attempt.state, 'failed')
+})

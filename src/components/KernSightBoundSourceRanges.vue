@@ -8,7 +8,28 @@
     <p v-if="loading" role="status">正在读取原始范围页…</p>
     <div v-if="error" class="ks-bound-source-error" role="alert"><p>{{ error }}</p><p v-if="page">当前仍展示上次成功读取的页，未混入本次失败回执。</p><button v-if="!unsupported" type="button" @click="loadPage(retryOffset, retryBackwards)">重试读取</button></div>
     <template v-if="page">
+      <section class="ks-candidate-coverage" aria-label="初始候选采集覆盖" :data-coverage-status="coverage.status">
+        <header><strong>初始候选采集覆盖</strong><b v-if="page.producerStatus?.partial === true">覆盖不足（partial）</b></header>
+        <template v-if="coverage.status === 'available'">
+          <p v-if="coverage.sourceShardCount > 1">跨 {{ coverage.sourceShardCount }} 份同源报告汇总；当前来源报告 {{ coverage.currentSourceRecords.toLocaleString() }} 条记录，分页只显示本份报告。</p>
+          <dl>
+            <div><dt>初始候选</dt><dd>{{ coverage.eligibleRanges.toLocaleString() }} 范围 <small :title="`${coverage.eligibleBytes} B`">{{ formatBytes(coverage.eligibleBytes) }}</small></dd></div>
+            <div><dt>生产者已保留</dt><dd>{{ coverage.admittedRanges.toLocaleString() }} 范围 <small :title="`${coverage.admittedBytes} B`">{{ formatBytes(coverage.admittedBytes) }}</small></dd></div>
+            <div><dt>未尝试</dt><dd>{{ coverage.unattemptedRanges.toLocaleString() }} 范围 <small :title="`${coverage.unattemptedBytes} B`">{{ formatBytes(coverage.unattemptedBytes) }}</small></dd></div>
+            <div><dt>到时排除</dt><dd>{{ coverage.excludedRanges.toLocaleString() }} 范围</dd></div>
+            <div><dt>其他未收</dt><dd>{{ coverage.rejectedRanges.toLocaleString() }} 范围</dd></div>
+            <div><dt>剩余未保留字节</dt><dd :title="`${coverage.remainingBytes} B`">{{ formatBytes(coverage.remainingBytes) }}</dd></div>
+          </dl>
+          <p v-if="coverage.appInstall">安装目录候选：已保留 {{ coverage.appInstall.admittedRanges.toLocaleString() }} / {{ coverage.appInstall.eligibleRanges.toLocaleString() }} 范围；未保留 {{ coverage.appInstall.remainingRanges.toLocaleString() }} 范围，剩余 <span :title="`${coverage.appInstall.remainingBytes} B`">{{ formatBytes(coverage.appInstall.remainingBytes) }}</span>。</p>
+          <p v-else>安装目录候选归类未知，不能按 0 个缺口理解。</p>
+        </template>
+        <p v-else>初始候选覆盖未知：{{ coverage.reason }}。已显示的原始记录仍可单独查看；缺失统计不按 0 处理。</p>
+        <small>仅统计本次主进程的初始候选快照，不包含之后新增的映射，也不代表整个 App。生产者已保留不等于本地 hash 已验证，原始范围不是已重建的完整 DEX / SO；流程结束不会将 partial 改成完整。</small>
+      </section>
       <p class="ks-bound-source-page-count">原始记录共 {{ page.totalRecords }} 条 · 当前 {{ page.records.length ? `${page.offset}–${page.offset + page.records.length - 1}` : '无记录' }} · 序号从 0 开始</p>
+      <p v-if="stopScope === 'local_copy_window'" role="status">内存复制窗口已耗尽，生产者尝试了 {{ coverage.status === 'available' ? coverage.attemptedRanges : page.producerStatus?.attemptedRanges ?? '未知' }} 个范围。已保留文件可以分析，未读范围仍是采集缺口。</p>
+      <p v-else-if="stopScope === 'runtime_metadata_reserve'" role="status">运行时数据额度已触及元数据预留，生产者停止继续读取；尚未保留的范围仍列为缺口。</p>
+      <small v-if="typeof page.producerStatus?.grantedWindowMs === 'number'">复制窗口 {{ page.producerStatus.grantedWindowMs }} ms · 前置准备 {{ page.producerStatus.setupElapsedMs ?? '未知' }} ms</small>
       <p class="ks-bound-source-digest">来源 SHA-256：{{ page.sourceSha256 }}</p>
       <form v-if="page.totalRecords" class="ks-bound-source-jump" @submit.prevent="jump"><label>转到记录序号<input v-model="targetIndex" type="number" min="0" :max="page.totalRecords - 1" step="1" :disabled="loading" /></label><button type="submit" :disabled="loading || !canJump">转到记录</button></form>
       <div v-if="page.totalRecords" class="ks-bound-source-navigation"><button type="button" :disabled="loading || !history.length" @click="previous">上一页范围</button><button type="button" :disabled="loading || page.nextOffset === null" @click="loadPage(page.nextOffset ?? 0)">下一页范围</button></div>
@@ -31,7 +52,7 @@
 <script setup lang="ts">
 import { computed, ref, shallowRef, watch } from 'vue'
 import { monitoringBackend, readableError } from '@/services/backend'
-import { boundSourceAnalysisLabel, boundSourceInspection, boundSourceLocalAnalysis, boundSourceReports, validateBoundSourcePage } from '@/services/kernsightBoundSourcePage'
+import { boundSourceAnalysisLabel, boundSourceInspection, boundSourceLocalAnalysis, boundSourceReports, candidateCoverageSummary, validateBoundSourcePage } from '@/services/kernsightBoundSourcePage'
 import type { KernSightBoundSourcePage } from '@/types/monitoring'
 
 const props = defineProps<{ root: string; packageName: string; ledger?: Record<string, any> }>()
@@ -49,6 +70,10 @@ const opened = ref(false)
 let requestRevision = 0
 let pinnedSha: string | null = null
 const history = ref<number[]>([])
+const coverage = computed(() => candidateCoverageSummary(page.value?.candidateCoverage))
+const stopScope = computed(() => coverage.value.status === 'available'
+  ? coverage.value.terminalStopScope ?? page.value?.producerStatus?.stopScope
+  : page.value?.producerStatus?.stopScope)
 const entries = computed(() => page.value?.records.map(row => {
   const local = boundSourceLocalAnalysis(props.ledger, page.value!, row)
   return { row, local, inspection: boundSourceInspection(props.ledger, local) }
@@ -56,6 +81,12 @@ const entries = computed(() => page.value?.records.map(row => {
 const canJump = computed(() => page.value && Number.isSafeInteger(Number(targetIndex.value)) && Number(targetIndex.value) >= 0 && Number(targetIndex.value) < page.value.totalRecords && String(targetIndex.value).trim() !== '')
 const pretty = (value: unknown) => JSON.stringify(value, null, 2)
 const producerPath = (value: any) => value?.raw_evidence || value?.mapping?.path || '范围路径未提供'
+function formatBytes(bytes: number) {
+  if (bytes < 1024) return `${bytes.toLocaleString()} B`
+  const units = ['KiB', 'MiB', 'GiB']
+  const power = Math.min(3, Math.floor(Math.log(bytes) / Math.log(1024)))
+  return `${(bytes / 1024 ** power).toFixed(2)} ${units[power - 1]}`
+}
 
 function resetPage() { requestRevision++; page.value = null; pinnedSha = null; loading.value = false; error.value = ''; unsupported.value = false; targetIndex.value = 0; retryOffset.value = 0; history.value = [] }
 watch(() => [props.root, props.packageName, props.ledger], () => { resetPage(); opened.value = false; sourceReport.value = sources.value[0] || ''; revision.value++ }, { flush: 'sync' })
@@ -102,6 +133,15 @@ select { width:100%; }
 button { padding:6px 10px; border:1px solid var(--line-strong); border-radius:6px; color:var(--text); background:var(--surface-soft); }
 button:disabled { opacity:.5; }
 .ks-bound-source-error { color:var(--danger); }
+.ks-candidate-coverage { min-width:0; margin:12px 0; padding:10px; border:1px solid var(--line); border-radius:7px; background:var(--surface-soft); }
+.ks-candidate-coverage header { display:flex; flex-wrap:wrap; justify-content:space-between; gap:8px; }
+.ks-candidate-coverage header b { color:var(--muted); font-size:12px; }
+.ks-candidate-coverage dl { display:grid; grid-template-columns:repeat(auto-fit,minmax(min(100%,165px),1fr)); gap:10px; margin:12px 0; }
+.ks-candidate-coverage dl > div { min-width:0; }
+.ks-candidate-coverage dt { color:var(--muted); font-size:12px; }
+.ks-candidate-coverage dd { margin:3px 0 0; font-variant-numeric:tabular-nums; overflow-wrap:anywhere; }
+.ks-candidate-coverage dd small { display:block; }
+.ks-candidate-coverage > small { display:block; color:var(--muted); line-height:1.6; }
 .ks-bound-source-rows { max-height:60vh; overflow:auto; }
 .ks-bound-source-rows > details { min-width:0; padding:8px 0; border-top:1px solid var(--line); }
 pre { max-width:100%; max-height:320px; overflow:auto; white-space:pre-wrap; overflow-wrap:anywhere; font-size:11px; }

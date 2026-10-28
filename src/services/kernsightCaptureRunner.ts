@@ -109,5 +109,5 @@ export function captureReceiptStateLabel(group: KernSightCaptureGroup, key: stri
 
 /** Saved evidence is usable independently of the source coverage; no state upgrade. */
 export function captureSavedOutcome(group: KernSightCaptureGroup, root: string): string {
-  return `本次主会话证据已保存并导入：${root}；${captureGroupStateLabel(group)}`
+  return `本次主会话证据已保存并导入：${root}；${group.state === 'failed' ? '采集未全部完成；已保存的部分证据仍可分析' : captureGroupStateLabel(group)}`
 }

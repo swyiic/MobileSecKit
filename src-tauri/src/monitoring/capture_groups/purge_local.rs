@@ -256,7 +256,7 @@ fn known_evidence_path(rel: &str, g: &Group) -> bool {
 }
 
 #[cfg(target_os = "linux")]
-fn reject_nested_mounts(root: &Path) -> Result<(), String> {
+pub(super) fn reject_nested_mounts(root: &Path) -> Result<(), String> {
     let text = fs::read_to_string("/proc/self/mountinfo")
         .map_err(|e| format!("无法确认清理目录挂载边界：{e}"))?;
     reject_mountinfo(root, &text)
@@ -284,7 +284,7 @@ fn reject_mountinfo(root: &Path, text: &str) -> Result<(), String> {
     Ok(())
 }
 #[cfg(target_os = "macos")]
-fn reject_nested_mounts(root: &Path) -> Result<(), String> {
+pub(super) fn reject_nested_mounts(root: &Path) -> Result<(), String> {
     use std::os::unix::ffi::OsStrExt;
     // Use an owned snapshot; getmntinfo's shared static buffer can be replaced
     // by another thread and is unsuitable across concurrent preview requests.
@@ -315,7 +315,7 @@ fn reject_nested_mounts(root: &Path) -> Result<(), String> {
     Ok(())
 }
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-fn reject_nested_mounts(_root: &Path) -> Result<(), String> {
+pub(super) fn reject_nested_mounts(_root: &Path) -> Result<(), String> {
     Err("此平台不能核实清理挂载边界".into())
 }
 

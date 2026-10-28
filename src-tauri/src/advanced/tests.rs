@@ -1,6 +1,42 @@
 use super::*;
 
 #[test]
+fn signer_nonzero_or_signal_is_never_accepted_as_verified_even_with_success_text() {
+    for code in [Some(1), Some(2), None] {
+        let output = RawOutput {
+            stdout: "Verified using v2 scheme: true\nSigner #1 certificate SHA-256 digest: fixture"
+                .into(),
+            stderr: "DOES NOT VERIFY: fixture failure".into(),
+            code,
+        };
+        let error = verified_apksigner_output(Ok(output)).err().unwrap();
+        assert!(error.contains("签名验证未通过或未完成"));
+        assert!(error.contains("未将签名标记为已验证"));
+    }
+    assert!(verified_apksigner_output(Ok(RawOutput {
+        stdout: "Verified using v2 scheme: true".into(),
+        stderr: String::new(),
+        code: Some(0),
+    }))
+    .is_ok());
+}
+
+#[test]
+fn signer_missing_spawn_and_timeout_keep_distinct_unverified_causes() {
+    for (failure, expected) in [
+        (ApkSignerFailure::Missing, "未找到 apksigner"),
+        (
+            ApkSignerFailure::Spawn("fixture permission denied".into()),
+            "启动失败",
+        ),
+        (ApkSignerFailure::Timeout, "签名验证超时"),
+    ] {
+        let error = verified_apksigner_output(Err(failure)).err().unwrap();
+        assert!(error.contains(expected), "{error}");
+    }
+}
+
+#[test]
 fn formats_epoch_timestamps_for_people_and_paths() {
     assert_eq!(format_epoch_utc(0), "1970-01-01 00:00:00 UTC");
     assert_eq!(format_epoch_iso_utc(1_786_502_345), "2026-08-12T02:39:05Z");
@@ -436,6 +472,32 @@ fn static_tool_resolver_accepts_tool_directories() {
     let resolved = resolve_static_cli_path(&root, "apktool").expect("resolve apktool cli");
     assert_eq!(resolved, fs::canonicalize(&cli).expect("canonical cli"));
     let _ = fs::remove_dir_all(root);
+}
+
+#[tokio::test]
+#[ignore = "explicit local JADX CLI version and optional self-owned Java fixture only"]
+async fn local_jadx_cli_starts_with_selected_java_and_analyzes_fixture() {
+    let cli = crate::analyzer_tools::discover_jadx_cli("", "").expect("local JADX CLI");
+    let version = run_explicit_program(&cli, &["--version".into()])
+        .await
+        .unwrap();
+    assert_eq!(version.code, Some(0), "{}", output_text(&version));
+    println!(
+        "JADX CLI={} version={} Java={:?}",
+        cli.display(),
+        version.stdout,
+        crate::analyzer_tools::java_home()
+    );
+    if let Ok(fixture) = std::env::var("ME_JADX_FIXTURE") {
+        let result = run_configured_static_tool(&fixture, cli.to_str().unwrap(), "jadx")
+            .await
+            .unwrap();
+        assert!(result.warnings.is_empty(), "{:?}", result.warnings);
+        assert!(
+            !result.code_insights.is_empty(),
+            "self-owned fixture should have class/method context"
+        );
+    }
 }
 
 #[test]

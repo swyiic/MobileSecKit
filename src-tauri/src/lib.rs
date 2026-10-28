@@ -9,6 +9,7 @@ use tokio::{
 };
 
 mod advanced;
+mod analyzer_tools;
 mod config;
 mod monitoring;
 
@@ -1145,6 +1146,7 @@ pub fn run() {
             monitoring::capture_groups::begin_kernsight_isolated_group,
             monitoring::capture_groups::list_kernsight_groups,
             monitoring::capture_groups::trash::trash_kernsight_group,
+            monitoring::capture_groups::delete::delete_kernsight_group,
             monitoring::capture_groups::trash::list_kernsight_group_trash,
             monitoring::capture_groups::trash::restore_kernsight_group,
             monitoring::capture_groups::purge::prepare_kernsight_group_purge,
@@ -1170,6 +1172,7 @@ pub fn run() {
             monitoring::local_kernsight_evidence_present,
             monitoring::import_kernsight_evidence_archive,
             monitoring::export_kernsight_evidence_archive,
+            monitoring::export_kernsight_analysis_directory,
             monitoring::pull_kernsight_package_evidence,
             monitoring::pull_kernsight_package_archive,
             monitoring::save_kernsight_group_evidence,
@@ -1178,6 +1181,7 @@ pub fn run() {
             monitoring::cleanup_kernsight_package_dump,
         ])
         .setup(|app| {
+            monitoring::capture_groups::delete::resume_pending(app.handle().clone());
             // A broken frontend must not leave the native window permanently hidden.
             let fallback_app = app.handle().clone();
             tauri::async_runtime::spawn(async move {

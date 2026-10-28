@@ -29,3 +29,5 @@ Me-Dumps/
 *.njsproj
 *.sln
 *.sw?
+
+/release/

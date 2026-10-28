@@ -1,0 +1,21 @@
+[package]
+name = "ksight-core"
+description = "Deterministic identity, ordering, policy, and correlation logic for KernSight"
+version = "0.2.10"
+edition = "2021"
+rust-version = "1.85"
+authors = ["KernSight Contributors"]
+license = "Apache-2.0"
+
+[dependencies]
+ksight-model = { git = "https://github.com/swyiic/KernSight.git", tag = "v0.2.10" }
+ksight-protocol = { git = "https://github.com/swyiic/KernSight.git", tag = "v0.2.10" }
+flate2 = { version = "1.1", default-features = false, features = ["rust_backend"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+uuid = { version = "1.18", features = ["serde", "v4"] }
+zip = { version = "2.4", default-features = false, features = ["deflate"] }
+
+[lints.rust]
+unsafe_code = "forbid"

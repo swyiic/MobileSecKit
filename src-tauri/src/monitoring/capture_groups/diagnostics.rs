@@ -165,7 +165,7 @@ fn prefix_at_boundary(text: &str, bytes: usize) -> &str {
     &text[..end]
 }
 
-fn error_excerpt(source: &str, text: &str) -> (Option<String>, bool) {
+pub(super) fn error_excerpt(source: &str, text: &str) -> (Option<String>, bool) {
     let lines: Vec<_> = text.lines().collect();
     let primary_error = lines.iter().rposition(|line| {
         let lower = line.trim().to_ascii_lowercase();
@@ -419,6 +419,10 @@ fn coverage_records(result: Option<&KernSightCaptureResult>, omitted: &mut bool)
         "kernsight.capture-drain/v1",
         "kernsight.perf-poll-budget/v1",
         "kernsight.output-budget/v1",
+        "kernsight.observation-window/v1",
+        "kernsight.file-enrichment/v1",
+        "kernsight.slow-event-step/v1",
+        "kernsight.static-budget-stop/v1",
     ] {
         for line in result.into_iter().flat_map(|r| r.stderr.lines()).rev() {
             if !line.contains(schema) {
@@ -796,6 +800,19 @@ mod tests {
             .contains("previous_instances"));
         assert!(diagnostic.raw_tail_truncated);
         assert_eq!(diagnostic.stderr_bytes, Some(stderr.len()));
+    }
+
+    #[test]
+    fn partial_copy_error_keeps_primary_source_change_and_nested_cause() {
+        let (excerpt, truncated) = error_excerpt(
+            "stderr",
+            "{\"schema\":\"kernsight.output-budget/v1\"}\nError: source generation changed before next range\n\nCaused by:\n    live metadata observation empty\n",
+        );
+        let excerpt = excerpt.unwrap();
+        assert!(excerpt.contains("source generation changed before next range"));
+        assert!(excerpt.contains("live metadata observation empty"));
+        assert!(!excerpt.contains("output-budget"));
+        assert!(!truncated);
     }
 
     #[test]
