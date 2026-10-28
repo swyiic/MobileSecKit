@@ -23,13 +23,15 @@ jobs:
           curl --proto '=https' --tlsv1.2 -fsSL https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
       - run: npm ci
-      - run: npm run tauri build
+      - run: npm run check
+      - run: rustup target add aarch64-apple-darwin
+      - run: npm run tauri -- build --target aarch64-apple-darwin
       - name: Check app signature
-        run: codesign --verify --deep --strict src-tauri/target/release/bundle/macos/ME.app
+        run: codesign --verify --deep --strict src-tauri/target/aarch64-apple-darwin/release/bundle/macos/ME.app
       - uses: actions/upload-artifact@v4
         with:
           name: me-macos
-          path: src-tauri/target/release/bundle/dmg/*.dmg
+          path: src-tauri/target/aarch64-apple-darwin/release/bundle/dmg/*.dmg
           if-no-files-found: error
 
   publish:

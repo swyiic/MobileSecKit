@@ -1,6 +1,6 @@
 [package]
 name = "mobilee"
-version = "2.2.3"
+version = "2.2.4"
 description = "Local Android and iOS mobile security assessment workbench"
 authors = ["swyiic"]
 edition = "2021"

@@ -1,0 +1,13 @@
+ME 2.2.4 — macOS Apple Silicon
+
+- Automatic observation presets: quick 60 s, standard 120 s, extended 300 s. Preparation, copying and transfer have separate limits; preset time is not end-to-end time.
+- Discover and persist local JADX CLI; improve SDK tool discovery and partial decompile diagnostics.
+- Portable .mee archives retain logical DEX/SO and other evidence file paths for external analysis. Batched transfer, source range views and incomplete-transfer diagnostics improved.
+- Individual capture-group deletion and UI progress/feedback improvements.
+- Large saved-evidence inventory uses a bounded 120-second verification operation.
+
+Validation: local frontend/Rust tests and macOS build; earlier Pixel 6a runs verified initial qualified main-process mapping snapshots for four installed applications. This does not establish complete runtime/feature/process coverage. One interrupted run and missing historical child sessions were preserved as failures; old missing sessions cannot be recovered by this release. Pair with KernSight 0.2.14, which no longer automatically evicts old sessions.
+
+macOS app is ad hoc signed, not Apple-notarized. Android capture requires a compatible privileged device and adb. CLI analyzers remain external dependencies.
+
+2.2.3 was not published: a deadline regression test assumed the scheduler resumed within 60 ms. The test now also verifies correct rejection when that original boundary has already expired.

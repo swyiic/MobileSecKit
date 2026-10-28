@@ -3217,15 +3217,34 @@ mod manual_time_v5 {
         let stop = c.time_plan.as_ref().unwrap().phases[0].stop_at_parent_remaining_ms;
         let first = c.phase_deadline("l0").unwrap();
         std::thread::sleep(Duration::from_millis(25));
-        let second = c.phase_deadline("l0").unwrap();
-        assert!(second.remaining_ms().unwrap() <= 35);
+        // A busy CI runner can resume after the original 60 ms boundary.
+        // That must refuse the lookup, not grant a fresh lease.
+        let second = match c.phase_deadline("l0") {
+            Ok(deadline) => {
+                if let Ok(remaining) = deadline.remaining_ms() {
+                    assert!(remaining <= 35);
+                } else {
+                    assert!(deadline
+                        .check()
+                        .unwrap_err()
+                        .contains("parent_deadline_exhausted"));
+                }
+                Some(deadline)
+            }
+            Err(error) => {
+                assert!(error.contains("parent_deadline_exhausted"), "{error}");
+                None
+            }
+        };
         assert_eq!(
             stop,
             c.time_plan.as_ref().unwrap().phases[0].stop_at_parent_remaining_ms
         );
         std::thread::sleep(Duration::from_millis(40));
         assert!(first.check().is_err());
-        assert!(second.check().is_err());
+        if let Some(second) = second {
+            assert!(second.check().is_err());
+        }
         assert!(c
             .begin_time_phase("l0", super::super::now_millis())
             .is_err());
